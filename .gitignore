@@ -1,0 +1,53 @@
+# Visual Studio / MSBuild outputs
+.vs/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+
+# Build products
+[Bb]in/
+[Oo]bj/
+x64/
+x86/
+Debug/
+Release/
+msvc/x64/
+msvc/mmts-dsfilter/
+tools/obj/
+tools/*.exe
+
+# Native build artifacts
+*.ax
+*.dll
+*.exe
+*.exp
+*.lib
+*.ilk
+*.iobj
+*.ipdb
+*.pdb
+*.idb
+*.obj
+*.tlog
+*.log
+*.recipe
+*.lastbuildstate
+*.FileListAbsolute.txt
+
+# Local test media and captures
+*.mmts
+*.mmt
+*.tlv
+*.ts
+*.hevc
+*.aac
+*.dump
+
+# Editor / OS noise
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
