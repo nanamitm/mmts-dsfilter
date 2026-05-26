@@ -1,5 +1,5 @@
 // mmts_probe2.cpp
-// Uses dantto4k's actual MmtTlvDemuxer to analyze decode.mmts
+// Uses dantto4k's actual MmtTlvDemuxer to analyze an MMTS file.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -141,8 +141,11 @@ static void demuxChunks(std::ifstream& ifs, MmtTlvDemuxer& demuxer, size_t maxBy
 
 int main(int argc, char* argv[])
 {
-    const char* filename = "C:\\Free Soft Ware\\TVTeset4k8k\\decode.mmts";
-    if (argc > 1) filename = argv[1];
+    if (argc < 2) {
+        printf("Usage: mmts_probe2 <input.mmts>\n");
+        return 1;
+    }
+    const char* filename = argv[1];
 
     printf("=== MMTS File Probe (dantto4k API) ===\n");
     printf("File: %s\n\n", filename);

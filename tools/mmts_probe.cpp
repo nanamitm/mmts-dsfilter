@@ -157,8 +157,11 @@ static bool extractMmtpFromCompIp(const uint8_t* d, size_t sz, MmtpInfo& info)
 
 int main(int argc, char* argv[])
 {
-    const char* filename = "C:\\Free Soft Ware\\TVTeset4k8k\\decode.mmts";
-    if (argc > 1) filename = argv[1];
+    if (argc < 2) {
+        printf("Usage: mmts_probe <input.mmts>\n");
+        return 1;
+    }
+    const char* filename = argv[1];
 
     printf("=== MMTS File Probe ===\n");
     printf("File: %s\n\n", filename);

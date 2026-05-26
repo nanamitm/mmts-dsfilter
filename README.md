@@ -36,7 +36,7 @@ Build outputs are intentionally ignored by Git.
 - `dantto4k` checked out next to this repository:
 
 ```text
-F:\VTemp\codex\
+<workspace>\
   dantto4k\
   mmts-dsfilter\
 ```
