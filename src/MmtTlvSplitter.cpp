@@ -480,7 +480,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_currentPts = 0;
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
-    m_firstSubtitleTime.store(-1, std::memory_order_release);
+    m_subtitleTimeOffset.store(-1, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
 
     LogMsg(L"MMT/TLV Splitter: Load called for %s\n", pszFileName);
@@ -984,18 +984,28 @@ void CMmtTlvSplitter::CreatePins()
             REFERENCE_TIME sampleStart;
             REFERENCE_TIME sampleStop;
             if (cue.hasBegin) {
-                REFERENCE_TIME firstSubtitle = m_firstSubtitleTime.load(std::memory_order_acquire);
-                if (firstSubtitle < 0) {
-                    REFERENCE_TIME expected = -1;
-                    if (m_firstSubtitleTime.compare_exchange_strong(expected, cue.begin, std::memory_order_acq_rel)) {
-                        firstSubtitle = cue.begin;
-                    } else {
-                        firstSubtitle = expected;
+                REFERENCE_TIME subtitleTimeOffset = m_subtitleTimeOffset.load(std::memory_order_acquire);
+                if (subtitleTimeOffset < 0) {
+                    REFERENCE_TIME anchorTime = normPts;
+                    if (anchorTime <= 0) {
+                        anchorTime = m_currentPts.load(std::memory_order_acquire);
                     }
-                    LogMsg(L"SUBTITLE timing base set: firstTtmlBegin=%I64d ms\n", firstSubtitle / 10000);
+                    if (anchorTime < 0)
+                        anchorTime = 0;
+                    REFERENCE_TIME newOffset = cue.begin - anchorTime;
+                    REFERENCE_TIME expected = -1;
+                    if (m_subtitleTimeOffset.compare_exchange_strong(expected, newOffset, std::memory_order_acq_rel)) {
+                        subtitleTimeOffset = newOffset;
+                    } else {
+                        subtitleTimeOffset = expected;
+                    }
+                    LogMsg(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, firstTtmlBegin=%I64d ms\n",
+                           subtitleTimeOffset / 10000,
+                           anchorTime / 10000,
+                           cue.begin / 10000);
                 }
-                sampleStart = cue.begin - firstSubtitle;
-                sampleStop = cue.hasEnd ? (cue.end - firstSubtitle) : (sampleStart + 5 * 10000000LL);
+                sampleStart = cue.begin - subtitleTimeOffset;
+                sampleStop = cue.hasEnd ? (cue.end - subtitleTimeOffset) : (sampleStart + 5 * 10000000LL);
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
                 sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
             } else {
@@ -1159,6 +1169,7 @@ void CMmtTlvSplitter::DemuxLoop()
     REFERENCE_TIME seekTarget = m_seekTarget;
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
+    m_subtitleTimeOffset.store(-1, std::memory_order_release);
     const bool waitForRap = seekTarget > 0;
     m_waitingForVideoRap.store(waitForRap, std::memory_order_release);
     for (auto* pin : m_pins) {

@@ -110,5 +110,5 @@ private:
     REFERENCE_TIME m_segmentStart{0};  // media-time start of the active segment
     std::atomic<bool> m_waitingForVideoRap{false};
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
-    std::atomic<REFERENCE_TIME> m_firstSubtitleTime{-1};
+    std::atomic<REFERENCE_TIME> m_subtitleTimeOffset{-1};
 };
