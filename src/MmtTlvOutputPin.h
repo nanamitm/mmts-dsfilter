@@ -9,10 +9,18 @@ class COutputQueue;
 // The video output pin also implements IMediaSeeking (forwarding to the filter)
 // so that MPC-BE's graph manager can enable seeking without a COM identity
 // violation.  The audio pin returns E_NOINTERFACE for IMediaSeeking.
+enum class MmtTlvPinKind {
+    Video,
+    Audio,
+    Subtitle,
+};
+
 class CMmtTlvOutputPin : public CBaseOutputPin, public IMediaSeeking, public IAMStreamSelect {
 public:
     CMmtTlvOutputPin(bool isVideo, HRESULT* phr, CBaseFilter* pFilter,
                      CCritSec* pLock, LPCWSTR pName, int audioStreamIndex = -1);
+    CMmtTlvOutputPin(MmtTlvPinKind kind, HRESULT* phr, CBaseFilter* pFilter,
+                     CCritSec* pLock, LPCWSTR pName, int streamIndex = -1);
     ~CMmtTlvOutputPin();
 
     // IUnknown (exposes IMediaSeeking only on the video pin)
@@ -36,6 +44,8 @@ public:
     HRESULT DeliverSample(bool keyframe, REFERENCE_TIME pts, REFERENCE_TIME dts,
                           bool isFirstFragment, bool isLastFragment,
                           const uint8_t* data, size_t size);
+    HRESULT DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME stop,
+                              const char* text, size_t size);
     HRESULT DeliverEOS();
 
     // Called by the filter to set stream metadata before connection.
@@ -44,11 +54,15 @@ public:
         { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; }
     void SetHevcExtradata(const std::vector<uint8_t>& extra) { m_hevcExtradata = extra; }
 
-    bool IsVideo() const { return m_isVideo; }
+    bool IsVideo() const { return m_kind == MmtTlvPinKind::Video; }
+    bool IsAudio() const { return m_kind == MmtTlvPinKind::Audio; }
+    bool IsSubtitle() const { return m_kind == MmtTlvPinKind::Subtitle; }
     int AudioStreamIndex() const { return m_audioStreamIndex; }
+    int StreamIndex() const { return m_audioStreamIndex; }
 
     // Reset accumulation state after a seek (called by SeekTo)
     void ResetForSeek();
+    void SetWaitForVideoRap(bool wait);
 
     // IMediaSeeking – all methods forward to the filter's implementation.
     // Only the video pin exposes this; audio pin returns E_NOINTERFACE.
@@ -83,6 +97,7 @@ private:
     CMmtTlvSplitter* Filter() const
         { return reinterpret_cast<CMmtTlvSplitter*>(m_pFilter); }
 
+    MmtTlvPinKind m_kind{MmtTlvPinKind::Audio};
     bool m_isVideo;
     int m_audioStreamIndex{-1};
 
@@ -105,6 +120,10 @@ private:
     bool m_logNextSample{false};
     bool m_waitForVideoRap{false};
     LONG m_droppedUntilRap{0};
+    LONG m_droppedBeforeSegment{0};
+    ULONGLONG m_videoFirstWallMs{0};
+    REFERENCE_TIME m_videoFirstPts{-1};
+    REFERENCE_TIME m_videoLastPts{-1};
 
     COutputQueue* m_pQueue{nullptr};
 };

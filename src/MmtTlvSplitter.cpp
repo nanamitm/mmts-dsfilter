@@ -1,9 +1,15 @@
 #include "MmtTlvSplitter.h"
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
+#include "ttml.h"
 #include <fstream>
 #include <strmif.h>
 #include <cwchar>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <stdexcept>
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 
@@ -46,6 +52,365 @@ static LPWSTR AllocStreamName(const WCHAR* format, int listIndex, const CFilterD
     if (name)
         StringCchCopyW(name, chars, buf);
     return name;
+}
+
+static std::string ExtractTtmlPlainText(const uint8_t* data, size_t size)
+{
+    if (!data || size == 0)
+        return {};
+
+    std::string xml(reinterpret_cast<const char*>(data), size);
+    TTML ttml = TTMLPaser::parse(xml);
+    std::ostringstream text;
+
+    for (const auto& div : ttml.divTags) {
+        for (const auto& p : div.pTags) {
+            bool wroteLine = false;
+            for (const auto& span : p.spanTags) {
+                if (!span.text.empty()) {
+                    text << span.text;
+                    wroteLine = true;
+                }
+            }
+            if (wroteLine)
+                text << "\n";
+        }
+    }
+
+    std::string out = text.str();
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    return out;
+}
+
+struct TtmlDebugStats {
+    size_t divs = 0;
+    size_t paragraphs = 0;
+    size_t spans = 0;
+    size_t textBytes = 0;
+};
+
+struct TtmlTextCue {
+    std::string text;
+    std::string assText;
+    bool hasBegin = false;
+    bool hasEnd = false;
+    REFERENCE_TIME begin = 0;
+    REFERENCE_TIME end = 0;
+};
+
+static std::string EscapeAssText(const std::string& text);
+
+static bool TryGetLength(const TTMLCssValue& value, float& length)
+{
+    try {
+        TTMLCssValueLength v = value.getValue<TTMLCssValueLength>();
+        if (v.unit == "px") {
+            length = v.value;
+            return true;
+        }
+    } catch (const std::bad_variant_access&) {
+    }
+    return false;
+}
+
+static bool TryGetLengthPair(const std::optional<TTMLCssValuePair>& pair, float& first, float& second)
+{
+    if (!pair.has_value())
+        return false;
+    return TryGetLength(pair->first, first) && TryGetLength(pair->second, second);
+}
+
+static std::string FormatAssTag(const char* format, int value)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), format, value);
+    return std::string(buf);
+}
+
+static std::string FormatAssColorTag(const TTMLCssValueColor& color)
+{
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "\\c&H%02X%02X%02X&",
+                  color.b, color.g, color.r);
+    std::string tag(buf);
+    if (color.a != 255) {
+        const int assAlpha = 255 - color.a;
+        std::snprintf(buf, sizeof(buf), "\\alpha&H%02X&", assAlpha);
+        tag += buf;
+    }
+    return tag;
+}
+
+static std::string BuildAssStyleTags(const TTMLSpanTag* span)
+{
+    std::string tags;
+    if (!span)
+        return tags;
+
+    float fontWidth = 0;
+    float fontHeight = 0;
+    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontHeight > 0) {
+        const int assFontSize = (std::max)(1, static_cast<int>(std::lround(fontHeight * 1080.0 / 2160.0)));
+        tags += FormatAssTag("\\fs%d", assFontSize);
+    }
+
+    if (span->style.color.has_value()) {
+        try {
+            tags += FormatAssColorTag(span->style.color->getValue<TTMLCssValueColor>());
+        } catch (const std::bad_variant_access&) {
+        }
+    }
+
+    return tags;
+}
+
+static std::string BuildAssPositionTags(const TTMLPTag& p, bool lowerByOneLine)
+{
+    float originX = 0;
+    float originY = 0;
+    if (TryGetLengthPair(p.region.origin, originX, originY)) {
+        float extentX = 0;
+        float extentY = 0;
+        const bool hasExtent = TryGetLengthPair(p.region.extent, extentX, extentY);
+        const double anchorX = hasExtent ? (originX + extentX / 2.0f) : originX;
+        const int x = static_cast<int>(std::lround(anchorX * 1920.0 / 3840.0));
+        float yOffset = 0;
+        if (lowerByOneLine && !p.spanTags.empty()) {
+            const auto& style = p.spanTags.begin()->style;
+            if (style.lineHeight.has_value()) {
+                TryGetLength(*style.lineHeight, yOffset);
+            }
+            if (yOffset <= 0) {
+                float fontWidth = 0;
+                float fontHeight = 0;
+                if (TryGetLengthPair(style.fontSize, fontWidth, fontHeight))
+                    yOffset = fontHeight;
+            }
+        }
+        const int y = static_cast<int>(std::lround((originY + yOffset) * 1080.0 / 2160.0));
+        return std::string(hasExtent ? "\\an8" : "\\an7") +
+               FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
+    }
+
+    return "\\an2\\pos(960,980)";
+}
+
+static size_t CountSubtitleLines(const TTMLDivTag& div)
+{
+    size_t lines = 0;
+    for (const auto& p : div.pTags) {
+        bool hasText = false;
+        for (const auto& span : p.spanTags) {
+            if (!span.text.empty()) {
+                hasText = true;
+                lines += static_cast<size_t>(std::count(span.text.begin(), span.text.end(), '\n'));
+            }
+        }
+        if (hasText)
+            ++lines;
+    }
+    return lines;
+}
+
+static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats)
+{
+    stats = {};
+    TtmlTextCue cue;
+    if (!data || size == 0)
+        return cue;
+
+    std::string xml(reinterpret_cast<const char*>(data), size);
+    TTML ttml = TTMLPaser::parse(xml);
+    std::ostringstream text;
+    std::ostringstream ass;
+    bool wroteAssParagraph = false;
+
+    for (const auto& div : ttml.divTags) {
+        ++stats.divs;
+        const bool lowerByOneLine = CountSubtitleLines(div) > 1;
+        if (div.begin.has_value()) {
+            const REFERENCE_TIME begin = static_cast<REFERENCE_TIME>(*div.begin) * 10000;
+            cue.begin = cue.hasBegin ? (std::min)(cue.begin, begin) : begin;
+            cue.hasBegin = true;
+        }
+        if (div.end.has_value()) {
+            const REFERENCE_TIME end = static_cast<REFERENCE_TIME>(*div.end) * 10000;
+            cue.end = cue.hasEnd ? (std::max)(cue.end, end) : end;
+            cue.hasEnd = true;
+        }
+        for (const auto& p : div.pTags) {
+            ++stats.paragraphs;
+            bool wroteLine = false;
+            bool wroteAssLine = false;
+            const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+            for (const auto& span : p.spanTags) {
+                ++stats.spans;
+                if (!span.text.empty()) {
+                    text << span.text;
+                    if (!wroteAssParagraph) {
+                        ass << "0,0,Default,,0,0,0,,{"
+                            << BuildAssPositionTags(p, lowerByOneLine)
+                            << BuildAssStyleTags(firstSpan)
+                            << "}";
+                        wroteAssParagraph = true;
+                    } else if (!wroteAssLine) {
+                        ass << "\\N";
+                    }
+                    std::string spanTags = BuildAssStyleTags(&span);
+                    if (!spanTags.empty())
+                        ass << "{" << spanTags << "}";
+                    ass << EscapeAssText(span.text);
+                    stats.textBytes += span.text.size();
+                    wroteLine = true;
+                    wroteAssLine = true;
+                }
+            }
+            if (wroteLine)
+                text << "\n";
+        }
+    }
+
+    std::string out = text.str();
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r'))
+        out.pop_back();
+    cue.text = std::move(out);
+    cue.assText = ass.str();
+    if (cue.assText.empty() && !cue.text.empty())
+        cue.assText = "0,0,Default,,0,0,0,,{\\an2\\pos(960,980)}" + EscapeAssText(cue.text);
+    return cue;
+}
+
+static std::wstring Utf8Preview(const std::string& text, size_t maxBytes = 96)
+{
+    std::string clipped = text.substr(0, maxBytes);
+    int chars = MultiByteToWideChar(CP_UTF8, 0, clipped.c_str(), static_cast<int>(clipped.size()), nullptr, 0);
+    if (chars <= 0)
+        return L"<utf8-convert-failed>";
+
+    std::wstring wide(static_cast<size_t>(chars), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, clipped.c_str(), static_cast<int>(clipped.size()),
+                        wide.data(), chars);
+    return wide;
+}
+
+static std::string EscapeAssText(const std::string& text)
+{
+    std::string escaped;
+    escaped.reserve(text.size() + 16);
+    for (char c : text) {
+        switch (c) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '{':
+            escaped += "\\{";
+            break;
+        case '}':
+            escaped += "\\}";
+            break;
+        case '\r':
+            break;
+        case '\n':
+            escaped += "\\N";
+            break;
+        default:
+            escaped.push_back(c);
+            break;
+        }
+    }
+    return escaped;
+}
+
+class BitReader {
+public:
+    explicit BitReader(const std::vector<uint8_t>& data) : m_data(data) {}
+
+    uint32_t ReadBits(int bits)
+    {
+        uint32_t value = 0;
+        for (int i = 0; i < bits; ++i) {
+            if (m_bitPos >= m_data.size() * 8)
+                throw std::out_of_range("bitstream exhausted");
+            value <<= 1;
+            value |= (m_data[m_bitPos / 8] >> (7 - (m_bitPos % 8))) & 1;
+            ++m_bitPos;
+        }
+        return value;
+    }
+
+    uint32_t ReadBit()
+    {
+        return ReadBits(1);
+    }
+
+    uint32_t ReadUE()
+    {
+        int zeros = 0;
+        while (ReadBit() == 0) {
+            ++zeros;
+            if (zeros > 31)
+                throw std::out_of_range("invalid Exp-Golomb code");
+        }
+        uint32_t suffix = zeros ? ReadBits(zeros) : 0;
+        return (1u << zeros) - 1 + suffix;
+    }
+
+private:
+    const std::vector<uint8_t>& m_data;
+    size_t m_bitPos = 0;
+};
+
+static std::vector<uint8_t> RemoveHevcEmulationPrevention(const uint8_t* data, size_t size)
+{
+    std::vector<uint8_t> rbsp;
+    rbsp.reserve(size);
+    for (size_t i = 0; i < size; ++i) {
+        if (i + 2 < size && data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x03) {
+            rbsp.push_back(0x00);
+            rbsp.push_back(0x00);
+            i += 2;
+            continue;
+        }
+        rbsp.push_back(data[i]);
+    }
+    return rbsp;
+}
+
+static void SkipHevcProfileTierLevel(BitReader& br, int maxSubLayersMinus1)
+{
+    br.ReadBits(2);   // general_profile_space
+    br.ReadBit();     // general_tier_flag
+    br.ReadBits(5);   // general_profile_idc
+    br.ReadBits(32);  // general_profile_compatibility_flags
+    br.ReadBits(4);   // general constraint flags
+    br.ReadBits(32);
+    br.ReadBits(12);  // remaining constraint flags
+    br.ReadBits(8);   // general_level_idc
+
+    bool subLayerProfilePresent[8]{};
+    bool subLayerLevelPresent[8]{};
+    for (int i = 0; i < maxSubLayersMinus1; ++i) {
+        subLayerProfilePresent[i] = br.ReadBit() != 0;
+        subLayerLevelPresent[i] = br.ReadBit() != 0;
+    }
+    if (maxSubLayersMinus1 > 0) {
+        for (int i = maxSubLayersMinus1; i < 8; ++i)
+            br.ReadBits(2);
+    }
+    for (int i = 0; i < maxSubLayersMinus1; ++i) {
+        if (subLayerProfilePresent[i]) {
+            br.ReadBits(2);
+            br.ReadBit();
+            br.ReadBits(5);
+            br.ReadBits(32);
+            br.ReadBits(4);
+            br.ReadBits(32);
+            br.ReadBits(12);
+        }
+        if (subLayerLevelPresent[i])
+            br.ReadBits(8);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,10 +473,14 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_filename = pszFileName;
     m_handler.reset();
     m_handler.resetAudioSelection();
+    m_videoWidth = 3840;
+    m_videoHeight = 2160;
+    m_audioUnsupported = false;
     m_seekTarget = 0;
     m_currentPts = 0;
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
+    m_firstSubtitleTime.store(-1, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
 
     LogMsg(L"MMT/TLV Splitter: Load called for %s\n", pszFileName);
@@ -144,6 +513,8 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
 void CMmtTlvSplitter::PreScanFile()
 {
     m_hevcExtradata.clear();
+    m_videoWidth = 3840;
+    m_videoHeight = 2160;
     m_firstPts  = -1;
     m_duration  = 0;
 
@@ -179,9 +550,10 @@ void CMmtTlvSplitter::PreScanFile()
             accumVideo.insert(accumVideo.end(), data, data + size);
             if (isLast && !accumVideo.empty()) {
                 if (m_hevcExtradata.empty()) {
-                    ExtractHevcParamSets(accumVideo, m_hevcExtradata);
+                    ExtractHevcParamSets(accumVideo, m_hevcExtradata, &m_videoWidth, &m_videoHeight);
                     if (!m_hevcExtradata.empty()) {
-                        LogMsg(L"MMT/TLV Splitter: PreScanFile successfully extracted HEVC Extradata\n");
+                        LogMsg(L"MMT/TLV Splitter: PreScanFile successfully extracted HEVC Extradata, video=%dx%d\n",
+                               m_videoWidth, m_videoHeight);
                     }
                 }
             }
@@ -232,7 +604,24 @@ void CMmtTlvSplitter::PreScanFile()
     if (minPts >= 0) {
         m_firstPts = minPts;
     }
-    m_handler.setKnownAudioStreams(handler.getAudioStreams());
+    {
+        auto discoveredAudioStreams = handler.getAudioStreams();
+        auto convertibleAudioStreams = handler.getAdtsConvertibleAudioStreams();
+        if (!discoveredAudioStreams.empty() && convertibleAudioStreams.empty()) {
+            m_audioUnsupported = true;
+            m_handler.setKnownAudioStreams({});
+            m_handler.setRequireAdtsConvertibleAudio(true);
+            LogMsg(L"MMT/TLV Splitter: audio streams found but no ADTS-convertible stream; audio pins disabled\n");
+        } else if (!convertibleAudioStreams.empty()) {
+            m_handler.setKnownAudioStreams(convertibleAudioStreams);
+            m_handler.setRequireAdtsConvertibleAudio(true);
+        } else {
+            m_handler.setKnownAudioStreams(discoveredAudioStreams);
+            m_handler.setRequireAdtsConvertibleAudio(false);
+        }
+        m_handler.setAudioStreamListLocked(true);
+    }
+    m_handler.setKnownSubtitleStreams(handler.getSubtitleStreams());
     {
         auto streams = m_handler.getAudioStreams();
         LogMsg(L"MMT/TLV Splitter: PreScan audio stream count=%zu\n", streams.size());
@@ -240,6 +629,15 @@ void CMmtTlvSplitter::PreScanFile()
             const auto& info = streams[i];
             LogMsg(L"MMT/TLV Splitter: PreScan audio[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
                    i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
+        }
+    }
+    {
+        auto streams = m_handler.getSubtitleStreams();
+        LogMsg(L"MMT/TLV Splitter: PreScan subtitle stream count=%zu\n", streams.size());
+        for (size_t i = 0; i < streams.size(); ++i) {
+            const auto& info = streams[i];
+            LogMsg(L"MMT/TLV Splitter: PreScan subtitle[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+                   i, info.streamIndex, info.packetId, info.componentTag);
         }
     }
 
@@ -312,7 +710,9 @@ void CMmtTlvSplitter::PreScanFile()
 // Extract VPS(32)+SPS(33)+PPS(34) from AnnexB stream and build
 // 2-byte length-prefix extradata [len_hi][len_lo][NALU] for each parameter set.
 void CMmtTlvSplitter::ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
-                                           std::vector<uint8_t>& out)
+                                           std::vector<uint8_t>& out,
+                                           int* width,
+                                           int* height)
 {
     const uint8_t* p = annexb.data();
     size_t sz = annexb.size();
@@ -349,11 +749,80 @@ void CMmtTlvSplitter::ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
 
     if (vps.empty() || sps.empty() || pps.empty()) return;
 
+    int parsedWidth = 0;
+    int parsedHeight = 0;
+    if (ParseHevcSpsSize(sps, parsedWidth, parsedHeight)) {
+        if (width)
+            *width = parsedWidth;
+        if (height)
+            *height = parsedHeight;
+    }
+
     out.clear();
     const uint8_t startCode[] = {0, 0, 0, 1};
     for (auto* nalu : {&vps, &sps, &pps}) {
         out.insert(out.end(), std::begin(startCode), std::end(startCode));
         out.insert(out.end(), nalu->begin(), nalu->end());
+    }
+}
+
+bool CMmtTlvSplitter::ParseHevcSpsSize(const std::vector<uint8_t>& sps,
+                                       int& width, int& height)
+{
+    if (sps.size() < 4)
+        return false;
+
+    try {
+        std::vector<uint8_t> rbsp = RemoveHevcEmulationPrevention(sps.data() + 2, sps.size() - 2);
+        BitReader br(rbsp);
+
+        br.ReadBits(4); // sps_video_parameter_set_id
+        const int maxSubLayersMinus1 = static_cast<int>(br.ReadBits(3));
+        br.ReadBit(); // sps_temporal_id_nesting_flag
+        SkipHevcProfileTierLevel(br, maxSubLayersMinus1);
+
+        br.ReadUE(); // sps_seq_parameter_set_id
+        const uint32_t chromaFormatIdc = br.ReadUE();
+        bool separateColourPlane = false;
+        if (chromaFormatIdc == 3)
+            separateColourPlane = br.ReadBit() != 0;
+
+        uint32_t picWidth = br.ReadUE();
+        uint32_t picHeight = br.ReadUE();
+
+        uint32_t confWinLeft = 0;
+        uint32_t confWinRight = 0;
+        uint32_t confWinTop = 0;
+        uint32_t confWinBottom = 0;
+        if (br.ReadBit()) {
+            confWinLeft = br.ReadUE();
+            confWinRight = br.ReadUE();
+            confWinTop = br.ReadUE();
+            confWinBottom = br.ReadUE();
+        }
+
+        uint32_t subWidthC = 1;
+        uint32_t subHeightC = 1;
+        if (!separateColourPlane) {
+            if (chromaFormatIdc == 1) {
+                subWidthC = 2;
+                subHeightC = 2;
+            } else if (chromaFormatIdc == 2) {
+                subWidthC = 2;
+                subHeightC = 1;
+            }
+        }
+
+        const uint32_t cropW = subWidthC * (confWinLeft + confWinRight);
+        const uint32_t cropH = subHeightC * (confWinTop + confWinBottom);
+        if (picWidth <= cropW || picHeight <= cropH)
+            return false;
+
+        width = static_cast<int>(picWidth - cropW);
+        height = static_cast<int>(picHeight - cropH);
+        return width > 0 && height > 0;
+    } catch (const std::exception&) {
+        return false;
     }
 }
 
@@ -380,8 +849,12 @@ void CMmtTlvSplitter::CreatePins()
     m_pins.push_back(new CMmtTlvOutputPin(true,  &hr, this, &m_pinLock, L"Video"));
     auto audioStreams = m_handler.getAudioStreams();
     if (audioStreams.empty()) {
-        m_pins.push_back(new CMmtTlvOutputPin(false, &hr, this, &m_pinLock, L"Audio", -1));
-        LogMsg(L"MMT/TLV Splitter: CreatePins created fallback Audio pin\n");
+        if (!m_audioUnsupported) {
+            m_pins.push_back(new CMmtTlvOutputPin(false, &hr, this, &m_pinLock, L"Audio", -1));
+            LogMsg(L"MMT/TLV Splitter: CreatePins created fallback Audio pin\n");
+        } else {
+            LogMsg(L"MMT/TLV Splitter: CreatePins skipped Audio pins because audio is unsupported\n");
+        }
     } else {
         for (size_t i = 0; i < audioStreams.size(); ++i) {
             WCHAR pinName[64];
@@ -398,9 +871,29 @@ void CMmtTlvSplitter::CreatePins()
                    audioStreams[i].componentTag);
         }
     }
+    constexpr bool kEnableSubtitlePins = true;
+    auto subtitleStreams = m_handler.getSubtitleStreams();
+    if (kEnableSubtitlePins) {
+        for (size_t i = 0; i < subtitleStreams.size(); ++i) {
+            WCHAR pinName[64];
+            StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Subtitle %zu", i + 1);
+            auto* pin = new CMmtTlvOutputPin(MmtTlvPinKind::Subtitle, &hr, this, &m_pinLock,
+                                             pinName, subtitleStreams[i].streamIndex);
+            m_pins.push_back(pin);
+            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+                   pinName,
+                   subtitleStreams[i].streamIndex,
+                   subtitleStreams[i].packetId,
+                   subtitleStreams[i].componentTag);
+        }
+    } else if (!subtitleStreams.empty()) {
+        LogMsg(L"MMT/TLV Splitter: subtitle pins disabled for playback timing test, streams=%zu\n",
+               subtitleStreams.size());
+    }
 
     auto videoPin = m_pins[0];
 
+    videoPin->SetVideoInfo(m_videoWidth, m_videoHeight);
     if (!m_hevcExtradata.empty())
         videoPin->SetHevcExtradata(m_hevcExtradata);
 
@@ -427,7 +920,7 @@ void CMmtTlvSplitter::CreatePins()
 
             bool delivered = false;
             for (auto* pin : m_pins) {
-                if (!pin->IsVideo() &&
+                if (pin->IsAudio() &&
                     (pin->AudioStreamIndex() == -1 || pin->AudioStreamIndex() == streamIndex)) {
                     pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
                     delivered = true;
@@ -435,6 +928,92 @@ void CMmtTlvSplitter::CreatePins()
             }
             if (!delivered && last) {
                 LogMsg(L"AUDIO CALLBACK: no pin for streamIndex=%d, pts=%I64d ms\n",
+                       streamIndex, normPts / 10000);
+            }
+        });
+
+    m_handler.setSubtitleCallback(
+        [this](int streamIndex, bool, long long pts, long long,
+               bool, bool, const uint8_t* d, size_t sz) {
+            static volatile LONG s_subtitleCallbacks = 0;
+            LONG callbackNo = InterlockedIncrement(&s_subtitleCallbacks);
+
+            TtmlDebugStats stats;
+            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
+
+            REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+
+            if (callbackNo <= 20 || cue.text.empty()) {
+                std::wstring preview = Utf8Preview(cue.text);
+                LogMsg(L"SUBTITLE CALLBACK #%ld: streamIndex=%d, pts=%I64d ms, ttmlBegin=%s%I64d ms, ttmlEnd=%s%I64d ms, size=%zu, divs=%zu, p=%zu, spans=%zu, textBytes=%zu, text=\"%s\"\n",
+                       callbackNo,
+                       streamIndex,
+                       normPts / 10000,
+                       cue.hasBegin ? L"" : L"none/",
+                       cue.begin / 10000,
+                       cue.hasEnd ? L"" : L"none/",
+                       cue.end / 10000,
+                       sz,
+                       stats.divs,
+                       stats.paragraphs,
+                       stats.spans,
+                       stats.textBytes,
+                       preview.c_str());
+            }
+
+            if (cue.text.empty()) {
+                size_t previewSize = sz < 16 ? sz : 16;
+                WCHAR hex[96]{};
+                WCHAR* cursor = hex;
+                size_t remaining = ARRAYSIZE(hex);
+                for (size_t i = 0; i < previewSize && remaining > 4; ++i) {
+                    HRESULT hr = StringCchPrintfW(cursor, remaining, L"%02X ", d[i]);
+                    if (FAILED(hr))
+                        break;
+                    size_t used = wcslen(cursor);
+                    cursor += used;
+                    remaining -= used;
+                }
+                LogMsg(L"SUBTITLE CALLBACK empty text #%ld: streamIndex=%d, firstBytes=%s\n",
+                       callbackNo, streamIndex, hex);
+                return;
+            }
+
+            std::string sampleText = cue.assText;
+
+            REFERENCE_TIME sampleStart;
+            REFERENCE_TIME sampleStop;
+            if (cue.hasBegin) {
+                REFERENCE_TIME firstSubtitle = m_firstSubtitleTime.load(std::memory_order_acquire);
+                if (firstSubtitle < 0) {
+                    REFERENCE_TIME expected = -1;
+                    if (m_firstSubtitleTime.compare_exchange_strong(expected, cue.begin, std::memory_order_acq_rel)) {
+                        firstSubtitle = cue.begin;
+                    } else {
+                        firstSubtitle = expected;
+                    }
+                    LogMsg(L"SUBTITLE timing base set: firstTtmlBegin=%I64d ms\n", firstSubtitle / 10000);
+                }
+                sampleStart = cue.begin - firstSubtitle;
+                sampleStop = cue.hasEnd ? (cue.end - firstSubtitle) : (sampleStart + 5 * 10000000LL);
+                sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
+                sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
+            } else {
+                sampleStart = ToSegmentTime(normPts, m_segmentStart);
+                sampleStop = sampleStart + 5 * 10000000LL;
+            }
+            if (sampleStop <= sampleStart)
+                sampleStop = sampleStart + 5 * 10000000LL;
+
+            bool delivered = false;
+            for (auto* pin : m_pins) {
+                if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {
+                    pin->DeliverTextSample(sampleStart, sampleStop, sampleText.c_str(), sampleText.size());
+                    delivered = true;
+                }
+            }
+            if (!delivered) {
+                LogMsg(L"SUBTITLE CALLBACK: no pin for streamIndex=%d, pts=%I64d ms\n",
                        streamIndex, normPts / 10000);
             }
         });
@@ -580,7 +1159,12 @@ void CMmtTlvSplitter::DemuxLoop()
     REFERENCE_TIME seekTarget = m_seekTarget;
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
-    m_waitingForVideoRap.store(true, std::memory_order_release);
+    const bool waitForRap = seekTarget > 0;
+    m_waitingForVideoRap.store(waitForRap, std::memory_order_release);
+    for (auto* pin : m_pins) {
+        if (pin->IsVideo())
+            pin->SetWaitForVideoRap(waitForRap);
+    }
     // Clear demuxer state for normal play; seek path already called resetStreams()
     if (seekTarget == 0) {
         m_demuxer.clear();
@@ -916,13 +1500,13 @@ STDMETHODIMP CMmtTlvSplitter::Enable(long lIndex, DWORD dwFlags)
         return E_INVALIDARG;
 
     for (auto* pin : m_pins)
-        if (!pin->IsVideo() && pin->IsConnected())
+        if (pin->IsAudio() && pin->IsConnected())
             pin->DeliverBeginFlush();
 
     bool ok = m_handler.selectAudioStreamByListIndex(static_cast<size_t>(lIndex));
 
     for (auto* pin : m_pins) {
-        if (!pin->IsVideo()) {
+        if (pin->IsAudio()) {
             pin->ResetForSeek();
             if (pin->IsConnected())
                 pin->DeliverEndFlush();

@@ -40,7 +40,17 @@ long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream&
 void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
+    if (m_audioStreamListLocked)
+        return;
+
     int streamIndex = static_cast<int>(stream.getStreamIndex());
+    if (m_requireAdtsConvertibleAudio &&
+        std::find(m_adtsConvertibleAudioStreams.begin(),
+                  m_adtsConvertibleAudioStreams.end(),
+                  streamIndex) == m_adtsConvertibleAudioStreams.end()) {
+        return;
+    }
+
     auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
         [streamIndex](const AudioStreamInfo& info) {
             return info.streamIndex == streamIndex;
@@ -58,9 +68,55 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
            info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
 }
 
+bool CFilterDemuxerHandler::shouldProcessAudioStream(int streamIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    if (!m_requireAdtsConvertibleAudio)
+        return true;
+
+    if (m_primaryAudioStreamIndex != -1)
+        return m_primaryAudioStreamIndex == streamIndex;
+
+    return std::find(m_adtsConvertibleAudioStreams.begin(),
+                     m_adtsConvertibleAudioStreams.end(),
+                     streamIndex) != m_adtsConvertibleAudioStreams.end();
+}
+
+void CFilterDemuxerHandler::rememberAdtsConvertibleAudioStream(int streamIndex)
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    if (std::find(m_adtsConvertibleAudioStreams.begin(),
+                  m_adtsConvertibleAudioStreams.end(),
+                  streamIndex) == m_adtsConvertibleAudioStreams.end()) {
+        m_adtsConvertibleAudioStreams.push_back(streamIndex);
+        LogMsg(L"MMT/TLV Audio ADTS conversion available: streamIndex=%d\n", streamIndex);
+    }
+}
+
+void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stream)
+{
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    int streamIndex = static_cast<int>(stream.getStreamIndex());
+    auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
+        [streamIndex](const SubtitleStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (it != m_subtitleStreams.end())
+        return;
+
+    SubtitleStreamInfo info;
+    info.streamIndex = streamIndex;
+    info.packetId = stream.getPacketId();
+    info.componentTag = stream.getComponentTag();
+    m_subtitleStreams.push_back(info);
+    LogMsg(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+           info.streamIndex, info.packetId, info.componentTag);
+}
+
 void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 {
     std::vector<AudioStreamInfo> discovered;
+    std::vector<SubtitleStreamInfo> discoveredSubtitles;
     int streamIndex = 0;
 
     for (const auto& asset : mpt.assets) {
@@ -109,43 +165,112 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             }
 
             discovered.push_back(info);
+        } else if (asset.assetType == MmtTlv::AssetType::stpp) {
+            SubtitleStreamInfo info;
+            info.streamIndex = streamIndex;
+            info.packetId = packetId;
+
+            for (const auto& descriptor : asset.descriptors.list) {
+                if (descriptor->getDescriptorTag() == MmtTlv::MhStreamIdentificationDescriptor::kDescriptorTag) {
+                    const auto* streamId = static_cast<const MmtTlv::MhStreamIdentificationDescriptor*>(descriptor.get());
+                    info.componentTag = streamId->componentTag;
+                    break;
+                }
+            }
+
+            discoveredSubtitles.push_back(info);
         }
 
         ++streamIndex;
     }
 
-    if (discovered.empty())
-        return;
+    if (!discovered.empty()) {
+        std::lock_guard<std::mutex> lock(m_audioMutex);
+        if (m_requireAdtsConvertibleAudio) {
+            discovered.erase(std::remove_if(discovered.begin(), discovered.end(),
+                [this](const AudioStreamInfo& info) {
+                    return std::find(m_adtsConvertibleAudioStreams.begin(),
+                                     m_adtsConvertibleAudioStreams.end(),
+                                     info.streamIndex) == m_adtsConvertibleAudioStreams.end();
+                }),
+                discovered.end());
+        }
+        if (discovered.empty())
+            return;
 
-    std::lock_guard<std::mutex> lock(m_audioMutex);
-    bool changed = discovered.size() != m_audioStreams.size();
-    if (!changed) {
-        for (size_t i = 0; i < discovered.size(); ++i) {
-            if (discovered[i].streamIndex != m_audioStreams[i].streamIndex ||
-                discovered[i].packetId != m_audioStreams[i].packetId ||
-                discovered[i].componentTag != m_audioStreams[i].componentTag) {
-                changed = true;
-                break;
+        if (m_audioStreamListLocked) {
+            bool missing = false;
+            for (const auto& info : discovered) {
+                auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+                    [&info](const AudioStreamInfo& known) {
+                        return known.streamIndex == info.streamIndex;
+                    });
+                if (it == m_audioStreams.end()) {
+                    missing = true;
+                    break;
+                }
+            }
+            if (missing) {
+                LogMsg(L"MMT/TLV Audio MPT changed after pin creation; keeping PreScan audio list (%zu stream(s))\n",
+                       m_audioStreams.size());
+            }
+            return;
+        }
+
+        bool changed = discovered.size() != m_audioStreams.size();
+        if (!changed) {
+            for (size_t i = 0; i < discovered.size(); ++i) {
+                if (discovered[i].streamIndex != m_audioStreams[i].streamIndex ||
+                    discovered[i].packetId != m_audioStreams[i].packetId ||
+                    discovered[i].componentTag != m_audioStreams[i].componentTag) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        if (changed) {
+            m_audioStreams = discovered;
+            if (m_primaryAudioStreamIndex == -1 && !m_audioStreams.empty()) {
+                m_primaryAudioStreamIndex = m_audioStreams.front().streamIndex;
+            }
+
+            LogMsg(L"MMT/TLV Audio MPT updated: assets=%u, audioStreams=%zu, defaultStreamIndex=%d\n",
+                   static_cast<unsigned>(mpt.assets.size()),
+                   m_audioStreams.size(),
+                   m_primaryAudioStreamIndex);
+            for (size_t i = 0; i < m_audioStreams.size(); ++i) {
+                const auto& info = m_audioStreams[i];
+                LogMsg(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
+                       i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
             }
         }
     }
 
-    if (!changed)
-        return;
+    if (!discoveredSubtitles.empty()) {
+        std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        bool changed = discoveredSubtitles.size() != m_subtitleStreams.size();
+        if (!changed) {
+            for (size_t i = 0; i < discoveredSubtitles.size(); ++i) {
+                if (discoveredSubtitles[i].streamIndex != m_subtitleStreams[i].streamIndex ||
+                    discoveredSubtitles[i].packetId != m_subtitleStreams[i].packetId ||
+                    discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
 
-    m_audioStreams = discovered;
-    if (m_primaryAudioStreamIndex == -1 && !m_audioStreams.empty()) {
-        m_primaryAudioStreamIndex = m_audioStreams.front().streamIndex;
-    }
-
-    LogMsg(L"MMT/TLV Audio MPT updated: assets=%u, audioStreams=%zu, defaultStreamIndex=%d\n",
-           static_cast<unsigned>(mpt.assets.size()),
-           m_audioStreams.size(),
-           m_primaryAudioStreamIndex);
-    for (size_t i = 0; i < m_audioStreams.size(); ++i) {
-        const auto& info = m_audioStreams[i];
-        LogMsg(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
-               i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
+        if (changed) {
+            m_subtitleStreams = discoveredSubtitles;
+            LogMsg(L"MMT/TLV Subtitle MPT updated: assets=%u, subtitleStreams=%zu\n",
+                   static_cast<unsigned>(mpt.assets.size()), m_subtitleStreams.size());
+            for (size_t i = 0; i < m_subtitleStreams.size(); ++i) {
+                const auto& info = m_subtitleStreams[i];
+                LogMsg(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+                       i, info.streamIndex, info.packetId, info.componentTag);
+            }
+        }
     }
 }
 
@@ -155,11 +280,24 @@ std::vector<CFilterDemuxerHandler::AudioStreamInfo> CFilterDemuxerHandler::getAu
     return m_audioStreams;
 }
 
+std::vector<CFilterDemuxerHandler::SubtitleStreamInfo> CFilterDemuxerHandler::getSubtitleStreams() const
+{
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    return m_subtitleStreams;
+}
+
 void CFilterDemuxerHandler::resetAudioSelection()
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
     m_primaryAudioStreamIndex = -1;
     m_audioStreams.clear();
+    m_adtsConvertibleAudioStreams.clear();
+    m_requireAdtsConvertibleAudio = false;
+    m_audioStreamListLocked = false;
+    {
+        std::lock_guard<std::mutex> subLock(m_subtitleMutex);
+        m_subtitleStreams.clear();
+    }
 }
 
 void CFilterDemuxerHandler::setKnownAudioStreams(const std::vector<AudioStreamInfo>& streams)
@@ -170,6 +308,48 @@ void CFilterDemuxerHandler::setKnownAudioStreams(const std::vector<AudioStreamIn
         m_primaryAudioStreamIndex = m_audioStreams.front().streamIndex;
         LogMsg(L"MMT/TLV Audio default streamIndex=%d\n", m_primaryAudioStreamIndex);
     }
+}
+
+void CFilterDemuxerHandler::setRequireAdtsConvertibleAudio(bool require)
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    m_requireAdtsConvertibleAudio = require;
+    if (require) {
+        for (const auto& info : m_audioStreams) {
+            if (std::find(m_adtsConvertibleAudioStreams.begin(),
+                          m_adtsConvertibleAudioStreams.end(),
+                          info.streamIndex) == m_adtsConvertibleAudioStreams.end()) {
+                m_adtsConvertibleAudioStreams.push_back(info.streamIndex);
+            }
+        }
+    }
+}
+
+void CFilterDemuxerHandler::setAudioStreamListLocked(bool locked)
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    m_audioStreamListLocked = locked;
+    LogMsg(L"MMT/TLV Audio stream list %s\n", locked ? L"locked" : L"unlocked");
+}
+
+std::vector<CFilterDemuxerHandler::AudioStreamInfo> CFilterDemuxerHandler::getAdtsConvertibleAudioStreams() const
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    std::vector<AudioStreamInfo> streams;
+    for (const auto& info : m_audioStreams) {
+        if (std::find(m_adtsConvertibleAudioStreams.begin(),
+                      m_adtsConvertibleAudioStreams.end(),
+                      info.streamIndex) != m_adtsConvertibleAudioStreams.end()) {
+            streams.push_back(info);
+        }
+    }
+    return streams;
+}
+
+void CFilterDemuxerHandler::setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams)
+{
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    m_subtitleStreams = streams;
 }
 
 int CFilterDemuxerHandler::getSelectedAudioStreamIndex() const
@@ -209,24 +389,68 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
         return;
 
     rememberAudioStream(stream);
+    const int streamIndex = static_cast<int>(stream.getStreamIndex());
 
     {
         std::lock_guard<std::mutex> lock(m_audioMutex);
         if (m_primaryAudioStreamIndex == -1) {
-            m_primaryAudioStreamIndex = static_cast<int>(stream.getStreamIndex());
+            m_primaryAudioStreamIndex = streamIndex;
             LogMsg(L"MMT/TLV Audio selected streamIndex=%d\n", m_primaryAudioStreamIndex);
         }
     }
 
+    if (!shouldProcessAudioStream(streamIndex))
+        return;
+
     // Convert LOAS/LATM → ADTS
     std::vector<uint8_t> adts;
-    if (!m_adtsConverter.convert(mfu.data.data(), mfu.data.size(), adts) || adts.empty())
+    if (!m_adtsConverter.convert(mfu.data.data(), mfu.data.size(), adts) || adts.empty()) {
+        static volatile LONG s_audioConvertFails = 0;
+        LONG failNo = InterlockedIncrement(&s_audioConvertFails);
+        if (failNo <= 20 || (failNo % 100) == 0) {
+            WCHAR hex[64]{};
+            WCHAR* cursor = hex;
+            size_t remaining = ARRAYSIZE(hex);
+            const size_t previewSize = (std::min)(mfu.data.size(), static_cast<size_t>(8));
+            for (size_t i = 0; i < previewSize && remaining > 4; ++i) {
+                HRESULT hr = StringCchPrintfW(cursor, remaining, L"%02X ", mfu.data[i]);
+                if (FAILED(hr))
+                    break;
+                size_t used = wcslen(cursor);
+                cursor += used;
+                remaining -= used;
+            }
+            LogMsg(L"MMT/TLV Audio ADTS convert failed #%ld: streamIndex=%d, packetId=0x%04X, size=%zu, samplingRate=%u, firstBytes=%s\n",
+                   failNo,
+                   static_cast<int>(stream.getStreamIndex()),
+                   stream.getPacketId(),
+                   mfu.data.size(),
+                   stream.getSamplingRate(),
+                   hex);
+        }
         return;
+    }
+    rememberAdtsConvertibleAudioStream(streamIndex);
 
     long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);
     long long dts = toRefTime(static_cast<int64_t>(mfu.dts), stream);
 
-    m_audioCallback(static_cast<int>(stream.getStreamIndex()),
+    m_audioCallback(streamIndex,
                     false, pts, dts, mfu.isFirstFragment, mfu.isLastFragment,
                     adts.data(), adts.size());
+}
+
+void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
+{
+    if (!m_subtitleCallback || mfu.data.empty())
+        return;
+
+    rememberSubtitleStream(stream);
+
+    long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);
+    long long dts = toRefTime(static_cast<int64_t>(mfu.dts), stream);
+
+    m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
+                       true, pts, dts, true, true,
+                       mfu.data.data(), mfu.data.size());
 }

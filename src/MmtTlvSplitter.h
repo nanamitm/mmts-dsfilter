@@ -74,7 +74,11 @@ private:
     void SeekTo(REFERENCE_TIME pos);
     void PreScanFile();
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
-                                     std::vector<uint8_t>& out);
+                                     std::vector<uint8_t>& out,
+                                     int* width = nullptr,
+                                     int* height = nullptr);
+    static bool ParseHevcSpsSize(const std::vector<uint8_t>& sps,
+                                 int& width, int& height);
     static DWORD WINAPI ThreadProc(LPVOID pv);
     void DemuxLoop();
 
@@ -86,6 +90,8 @@ private:
 
     std::wstring m_filename;
     std::vector<uint8_t> m_hevcExtradata;
+    int m_videoWidth{3840};
+    int m_videoHeight{2160};
 
     HANDLE m_hThread{NULL};
     HANDLE m_hStop{NULL};
@@ -98,9 +104,11 @@ private:
     REFERENCE_TIME m_stopPos{_I64_MAX};
     std::atomic<REFERENCE_TIME> m_currentPts{0};  // updated from video callback
     std::streamsize m_fileSize{0};
+    bool m_audioUnsupported{false};
     double m_rate{1.0};
     REFERENCE_TIME m_seekTarget{0};    // position to seek to (relative, 0 = start)
     REFERENCE_TIME m_segmentStart{0};  // media-time start of the active segment
     std::atomic<bool> m_waitingForVideoRap{false};
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
+    std::atomic<REFERENCE_TIME> m_firstSubtitleTime{-1};
 };

@@ -4,6 +4,12 @@
 #include <dvdmedia.h>   // VIDEOINFOHEADER2
 #include <strsafe.h>
 
+struct SUBTITLEINFO {
+    DWORD dwOffset;
+    CHAR IsoLang[4];
+    WCHAR TrackName[256];
+};
+
 static void LogPinMsg(const WCHAR* format, ...)
 {
     WCHAR buf[512];
@@ -20,6 +26,20 @@ static bool IsHevcRapNal(uint8_t nalType)
     return nalType >= 16 && nalType <= 21;
 }
 
+static const WCHAR* PinKindName(MmtTlvPinKind kind)
+{
+    switch (kind) {
+    case MmtTlvPinKind::Video:
+        return L"Video";
+    case MmtTlvPinKind::Audio:
+        return L"Audio";
+    case MmtTlvPinKind::Subtitle:
+        return L"Subtitle";
+    default:
+        return L"Unknown";
+    }
+}
+
 static REFERENCE_TIME SubtractTimeOffset(REFERENCE_TIME rt, REFERENCE_TIME offset)
 {
     if (rt < 0)
@@ -32,8 +52,19 @@ CMmtTlvOutputPin::CMmtTlvOutputPin(bool isVideo, HRESULT* phr,
                                    CBaseFilter* pFilter, CCritSec* pLock, LPCWSTR pName,
                                    int audioStreamIndex)
     : CBaseOutputPin(NAME("MmtTlvOutputPin"), pFilter, pLock, phr, pName)
+    , m_kind(isVideo ? MmtTlvPinKind::Video : MmtTlvPinKind::Audio)
     , m_isVideo(isVideo)
     , m_audioStreamIndex(audioStreamIndex)
+{
+}
+
+CMmtTlvOutputPin::CMmtTlvOutputPin(MmtTlvPinKind kind, HRESULT* phr,
+                                   CBaseFilter* pFilter, CCritSec* pLock, LPCWSTR pName,
+                                   int streamIndex)
+    : CBaseOutputPin(NAME("MmtTlvOutputPin"), pFilter, pLock, phr, pName)
+    , m_kind(kind)
+    , m_isVideo(kind == MmtTlvPinKind::Video)
+    , m_audioStreamIndex(streamIndex)
 {
 }
 
@@ -116,11 +147,24 @@ void CMmtTlvOutputPin::ResetForSeek()
     m_accumKey  = false;
     m_firstSample = true;
     m_logNextSample = true;
+    m_droppedBeforeSegment = 0;
     if (m_isVideo) {
         m_waitForVideoRap = true;
         m_droppedUntilRap = 0;
+        m_videoFirstWallMs = 0;
+        m_videoFirstPts = -1;
+        m_videoLastPts = -1;
     }
     LogPinMsg(L"MMT/TLV %s ResetForSeek\n", m_isVideo ? L"Video" : L"Audio");
+}
+
+void CMmtTlvOutputPin::SetWaitForVideoRap(bool wait)
+{
+    if (!m_isVideo)
+        return;
+    m_waitForVideoRap = wait;
+    m_droppedUntilRap = 0;
+    LogPinMsg(L"MMT/TLV Video wait for RAP %s\n", wait ? L"enabled" : L"disabled");
 }
 
 HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
@@ -130,7 +174,7 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
 
     pmt->InitMediaType();
 
-    if (m_isVideo) {
+    if (IsVideo()) {
         pmt->SetType(&MEDIATYPE_Video);
         pmt->SetSubtype(&MEDIASUBTYPE_HEVC);
         pmt->SetFormatType(&FORMAT_VideoInfo2);
@@ -159,7 +203,7 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
             memcpy(reinterpret_cast<BYTE*>(vih) + sizeof(VIDEOINFOHEADER2),
                    m_hevcExtradata.data(), m_hevcExtradata.size());
         }
-    } else {
+    } else if (IsAudio()) {
         pmt->SetType(&MEDIATYPE_Audio);
         pmt->SetSubtype(&MEDIASUBTYPE_RAW_AAC1);
         pmt->SetFormatType(&FORMAT_WaveFormatEx);
@@ -176,21 +220,58 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
         wf->nBlockAlign     = 1;
         wf->nAvgBytesPerSec = 0;
         wf->cbSize          = 0;
+    } else {
+        pmt->SetType(&MEDIATYPE_Subtitle);
+        pmt->SetSubtype(&MEDIASUBTYPE_ASS);
+        pmt->SetFormatType(&FORMAT_SubtitleInfo);
+
+        static const char kAssHeader[] =
+            "[Script Info]\r\n"
+            "ScriptType: v4.00+\r\n"
+            "WrapStyle: 2\r\n"
+            "ScaledBorderAndShadow: yes\r\n"
+            "PlayResX: 1920\r\n"
+            "PlayResY: 1080\r\n"
+            "\r\n"
+            "[V4+ Styles]\r\n"
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+            "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n"
+            "Style: Default,Noto Sans JP,96,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
+            "0,0,0,0,100,100,0,0,1,3,1,2,20,20,20,1\r\n"
+            "\r\n"
+            "[Events]\r\n"
+            "Format: ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";
+
+        const ULONG headerSize = sizeof(kAssHeader) - 1;
+        const ULONG fmtSize = sizeof(SUBTITLEINFO) + headerSize;
+        auto* info = reinterpret_cast<SUBTITLEINFO*>(pmt->AllocFormatBuffer(fmtSize));
+        if (!info) return E_OUTOFMEMORY;
+        ZeroMemory(info, fmtSize);
+        info->dwOffset = sizeof(SUBTITLEINFO);
+        info->IsoLang[0] = 'j';
+        info->IsoLang[1] = 'p';
+        info->IsoLang[2] = 'n';
+        StringCchCopyW(info->TrackName, ARRAYSIZE(info->TrackName), L"MMT/TLV Subtitle");
+        memcpy(reinterpret_cast<BYTE*>(info) + sizeof(SUBTITLEINFO), kAssHeader, headerSize);
     }
 
-    pmt->SetTemporalCompression(m_isVideo ? TRUE : FALSE);
+    pmt->SetTemporalCompression(IsVideo() ? TRUE : FALSE);
     pmt->SetVariableSize();
     return S_OK;
 }
 
 HRESULT CMmtTlvOutputPin::CheckMediaType(const CMediaType* pmt)
 {
-    if (m_isVideo) {
+    if (IsVideo()) {
         if (*pmt->Type()    != MEDIATYPE_Video)    return VFW_E_TYPE_NOT_ACCEPTED;
         if (*pmt->Subtype() != MEDIASUBTYPE_HEVC)  return VFW_E_TYPE_NOT_ACCEPTED;
-    } else {
+    } else if (IsAudio()) {
         if (*pmt->Type()    != MEDIATYPE_Audio)       return VFW_E_TYPE_NOT_ACCEPTED;
         if (*pmt->Subtype() != MEDIASUBTYPE_RAW_AAC1) return VFW_E_TYPE_NOT_ACCEPTED;
+    } else {
+        if (*pmt->Type()    != MEDIATYPE_Subtitle) return VFW_E_TYPE_NOT_ACCEPTED;
+        if (*pmt->Subtype() != MEDIASUBTYPE_ASS)   return VFW_E_TYPE_NOT_ACCEPTED;
     }
     return S_OK;
 }
@@ -198,12 +279,24 @@ HRESULT CMmtTlvOutputPin::CheckMediaType(const CMediaType* pmt)
 HRESULT CMmtTlvOutputPin::DecideBufferSize(IMemAllocator* pAlloc, ALLOCATOR_PROPERTIES* pprop)
 {
     ALLOCATOR_PROPERTIES actual;
-    // 4K HEVC I-frame can be 3-10MB; audio frames are small
-    pprop->cbBuffer = m_isVideo ? 16 * 1024 * 1024 : 64 * 1024;
-    pprop->cBuffers  = m_isVideo ? 32 : 64;
+    const bool isVideo = IsVideo();
+    const bool isSubtitle = IsSubtitle();
+    const bool is8kVideo = isVideo && m_width >= 7680;
+    pprop->cbBuffer = isVideo
+        ? (is8kVideo ? 64 * 1024 * 1024 : 16 * 1024 * 1024)
+        : (isSubtitle ? 256 * 1024 : 64 * 1024);
+    pprop->cBuffers  = isVideo ? (is8kVideo ? 8 : 32) : 64;
     pprop->cbAlign   = 1;
     pprop->cbPrefix  = 0;
-    return pAlloc->SetProperties(pprop, &actual);
+    HRESULT hr = pAlloc->SetProperties(pprop, &actual);
+    LogPinMsg(L"MMT/TLV %s DecideBufferSize: hr=0x%08X requested=%ldx%ld actual=%ldx%ld\n",
+              IsVideo() ? L"Video" : (IsAudio() ? L"Audio" : L"Subtitle"),
+              hr,
+              pprop->cBuffers,
+              pprop->cbBuffer,
+              actual.cBuffers,
+              actual.cbBuffer);
+    return hr;
 }
 
 HRESULT CMmtTlvOutputPin::Active()
@@ -214,8 +307,12 @@ HRESULT CMmtTlvOutputPin::Active()
     m_accumKey = false;
     m_firstSample = true;
     m_logNextSample = false;
-    m_waitForVideoRap = m_isVideo;
+    m_waitForVideoRap = false;
     m_droppedUntilRap = 0;
+    m_droppedBeforeSegment = 0;
+    m_videoFirstWallMs = 0;
+    m_videoFirstPts = -1;
+    m_videoLastPts = -1;
 
     HRESULT hr = CBaseOutputPin::Active();
     if (FAILED(hr)) return hr;
@@ -223,7 +320,7 @@ HRESULT CMmtTlvOutputPin::Active()
     delete m_pQueue;
     m_pQueue = nullptr;
 
-    if (m_Connected) {
+    if (m_Connected && !IsSubtitle()) {
         m_pQueue = new COutputQueue(
             m_Connected,
             &hr,
@@ -241,7 +338,7 @@ HRESULT CMmtTlvOutputPin::Active()
     }
 
     LogPinMsg(L"MMT/TLV %s pin Active: queued delivery %s\n",
-              m_isVideo ? L"Video" : L"Audio",
+              PinKindName(m_kind),
               m_pQueue ? L"enabled" : L"disabled");
     return S_OK;
 }
@@ -335,7 +432,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
 
     if (m_isVideo && m_waitForVideoRap && !m_accumKey) {
         LONG dropped = ++m_droppedUntilRap;
-        if (dropped <= 5 || (dropped % 30) == 0) {
+        if (dropped <= 5 || (dropped % 10) == 0) {
             LogPinMsg(L"MMT/TLV Video dropping non-RAP while waiting for RAP #%ld: size=%zu, pts=%I64d ms, dts=%I64d ms\n",
                       dropped, m_accum.size(), m_accumPts / 10000, m_accumDts / 10000);
         }
@@ -368,6 +465,22 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
 
     const REFERENCE_TIME timeOffset = Filter()->GetSegmentTimeOffset();
     if (timeOffset > 0) {
+        if (m_accumPts >= 0 && m_accumPts < timeOffset) {
+            LONG dropped = ++m_droppedBeforeSegment;
+            if (dropped <= 5 || (dropped % 30) == 0) {
+                LogPinMsg(L"MMT/TLV %s dropping pre-segment sample #%ld: pts=%I64d ms, offset=%I64d ms, size=%zu\n",
+                          IsVideo() ? L"Video" : (IsAudio() ? L"Audio" : L"Subtitle"),
+                          dropped,
+                          m_accumPts / 10000,
+                          timeOffset / 10000,
+                          m_accum.size());
+            }
+            m_accum.clear();
+            m_accumPts = -1;
+            m_accumDts = -1;
+            m_accumKey = false;
+            return S_OK;
+        }
         m_accumPts = SubtractTimeOffset(m_accumPts, timeOffset);
         m_accumDts = SubtractTimeOffset(m_accumDts, timeOffset);
     }
@@ -385,9 +498,11 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     LONG bufLen = pSample->GetSize();
 
     if (bufLen < static_cast<LONG>(m_accum.size())) {
-        // Frame too large for allocated buffer - skip and continue
-        DbgLog((LOG_ERROR, 1, TEXT("MmtTlvOutputPin: frame %zu > buffer %ld, dropping"),
-                m_accum.size(), bufLen));
+        LogPinMsg(L"MMT/TLV %s sample too large: size=%zu, buffer=%ld, dropping pts=%I64d ms\n",
+                  IsVideo() ? L"Video" : (IsAudio() ? L"Audio" : L"Subtitle"),
+                  m_accum.size(),
+                  bufLen,
+                  m_accumPts / 10000);
         pSample->Release();
         m_accum.clear();
         return S_OK;
@@ -429,20 +544,49 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
 
     const ULONGLONG bufferMs = tBufferEnd - tBufferStart;
     const ULONGLONG deliverMs = tDeliverEnd - tDeliverStart;
+    LONGLONG videoFrameStepMs = 0;
+    LONGLONG videoDriftMs = 0;
+    if (m_isVideo && m_accumPts >= 0) {
+        if (m_videoFirstWallMs == 0) {
+            m_videoFirstWallMs = tDeliverEnd;
+            m_videoFirstPts = m_accumPts;
+        }
+        if (m_videoLastPts >= 0)
+            videoFrameStepMs = (m_accumPts - m_videoLastPts) / 10000;
+        m_videoLastPts = m_accumPts;
+
+        const LONGLONG wallElapsedMs = static_cast<LONGLONG>(tDeliverEnd - m_videoFirstWallMs);
+        const LONGLONG mediaElapsedMs = (m_accumPts - m_videoFirstPts) / 10000;
+        videoDriftMs = wallElapsedMs - mediaElapsedMs;
+    }
     const bool forceLog = m_logNextSample;
     m_logNextSample = false;
     if (forceLog || sampleNo <= 10 || (sampleNo % 100) == 0 || bufferMs >= 20 || deliverMs >= 20 || FAILED(hr)) {
-        LogPinMsg(L"MMT/TLV %s DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms\n",
-                  m_isVideo ? L"Video" : L"Audio",
-                  sampleNo,
-                  hr,
-                  m_accum.size(),
-                  m_accumPts / 10000,
-                  m_accumDts / 10000,
-                  m_accumKey,
-                  wasFirstSample,
-                  bufferMs,
-                  deliverMs);
+        if (m_isVideo) {
+            LogPinMsg(L"MMT/TLV Video DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms, frameStep=%I64d ms, drift=%I64d ms\n",
+                      sampleNo,
+                      hr,
+                      m_accum.size(),
+                      m_accumPts / 10000,
+                      m_accumDts / 10000,
+                      m_accumKey,
+                      wasFirstSample,
+                      bufferMs,
+                      deliverMs,
+                      videoFrameStepMs,
+                      videoDriftMs);
+        } else {
+            LogPinMsg(L"MMT/TLV Audio DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms\n",
+                      sampleNo,
+                      hr,
+                      m_accum.size(),
+                      m_accumPts / 10000,
+                      m_accumDts / 10000,
+                      m_accumKey,
+                      wasFirstSample,
+                      bufferMs,
+                      deliverMs);
+        }
     }
 
     m_accum.clear();
@@ -450,6 +594,60 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     m_accumDts = -1;
     m_accumKey = false;
 
+    return hr;
+}
+
+HRESULT CMmtTlvOutputPin::DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME stop,
+                                            const char* text, size_t size)
+{
+    if (!IsConnected() || !IsSubtitle() || !text || size == 0)
+        return S_OK;
+
+    static volatile LONG s_subtitleSamples = 0;
+    LONG sampleNo = InterlockedIncrement(&s_subtitleSamples);
+
+    IMediaSample* pSample = nullptr;
+    HRESULT hr = GetDeliveryBuffer(&pSample, nullptr, nullptr, 0);
+    if (FAILED(hr))
+        return hr;
+
+    BYTE* pBuf = nullptr;
+    pSample->GetPointer(&pBuf);
+    LONG bufLen = pSample->GetSize();
+    if (bufLen < static_cast<LONG>(size)) {
+        pSample->Release();
+        LogPinMsg(L"MMT/TLV Subtitle sample too large: size=%zu, buffer=%ld\n", size, bufLen);
+        return S_OK;
+    }
+
+    memcpy(pBuf, text, size);
+    pSample->SetActualDataLength(static_cast<LONG>(size));
+    pSample->SetTime(&start, &stop);
+    pSample->SetSyncPoint(TRUE);
+    pSample->SetPreroll(FALSE);
+    pSample->SetDiscontinuity(sampleNo == 1 ? TRUE : FALSE);
+
+    if (m_pQueue) {
+        hr = m_pQueue->Receive(pSample);
+    } else {
+        hr = Deliver(pSample);
+        pSample->Release();
+    }
+
+    if (sampleNo <= 20 || FAILED(hr)) {
+        int chars = MultiByteToWideChar(CP_UTF8, 0, text, static_cast<int>(size), nullptr, 0);
+        std::wstring preview;
+        if (chars > 0) {
+            preview.resize(static_cast<size_t>(chars));
+            MultiByteToWideChar(CP_UTF8, 0, text, static_cast<int>(size), preview.data(), chars);
+            if (preview.size() > 64)
+                preview.resize(64);
+        } else {
+            preview = L"<utf8-convert-failed>";
+        }
+        LogPinMsg(L"MMT/TLV Subtitle DeliverTextSample #%ld: hr=0x%08X, size=%zu, start=%I64d ms, stop=%I64d ms, text=\"%s\"\n",
+                  sampleNo, hr, size, start / 10000, stop / 10000, preview.c_str());
+    }
     return hr;
 }
 

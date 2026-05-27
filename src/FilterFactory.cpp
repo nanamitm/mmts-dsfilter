@@ -15,6 +15,9 @@ static const REGPINTYPES kVideoTypes[] = {
 static const REGPINTYPES kAudioTypes[] = {
     { &MEDIATYPE_Audio, &MEDIASUBTYPE_RAW_AAC1 }
 };
+static const REGPINTYPES kSubtitleTypes[] = {
+    { &MEDIATYPE_Subtitle, &MEDIASUBTYPE_ASS }
+};
 static const REGFILTERPINS kPins[] = {
     // Video output
     { nullptr, FALSE, TRUE, FALSE, FALSE, &CLSID_NULL, nullptr,
@@ -22,6 +25,9 @@ static const REGFILTERPINS kPins[] = {
     // Audio output
     { nullptr, FALSE, TRUE, FALSE, FALSE, &CLSID_NULL, nullptr,
       ARRAYSIZE(kAudioTypes), kAudioTypes },
+    // Subtitle output
+    { nullptr, FALSE, TRUE, FALSE, FALSE, &CLSID_NULL, nullptr,
+      ARRAYSIZE(kSubtitleTypes), kSubtitleTypes },
 };
 
 // CLSID_LegacyAmFilterCategory = {083863F1-70DE-11d0-BD40-00A0C911CE86}
