@@ -81,6 +81,8 @@ private:
                                  int& width, int& height);
     static DWORD WINAPI ThreadProc(LPVOID pv);
     void DemuxLoop();
+    bool FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME currentBegin,
+                               long long startOffset, REFERENCE_TIME& nextBegin) const;
 
     CCritSec m_pinLock;
     std::vector<CMmtTlvOutputPin*> m_pins;
@@ -111,4 +113,5 @@ private:
     std::atomic<bool> m_waitingForVideoRap{false};
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
     std::atomic<REFERENCE_TIME> m_subtitleTimeOffset{-1};
+    std::atomic<long long> m_demuxByteOffset{0};
 };

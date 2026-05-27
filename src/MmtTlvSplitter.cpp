@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
+static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
 
 #include <strsafe.h>
 static void LogMsg(const WCHAR* format, ...)
@@ -529,6 +530,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
     m_subtitleTimeOffset.store(-1, std::memory_order_release);
+    m_demuxByteOffset.store(0, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
 
     LogMsg(L"MMT/TLV Splitter: Load called for %s\n", pszFileName);
@@ -1080,15 +1082,34 @@ void CMmtTlvSplitter::CreatePins()
                            cue.begin / 10000);
                 }
                 sampleStart = cue.begin - subtitleTimeOffset;
-                sampleStop = cue.hasEnd ? (cue.end - subtitleTimeOffset) : (sampleStart + 5 * 10000000LL);
+                if (cue.hasEnd) {
+                    sampleStop = cue.end - subtitleTimeOffset;
+                } else {
+                    REFERENCE_TIME nextBegin = -1;
+                    const long long lookaheadOffset = m_demuxByteOffset.load(std::memory_order_acquire);
+                    if (FindNextSubtitleBegin(streamIndex, cue.begin, lookaheadOffset, nextBegin)) {
+                        sampleStop = nextBegin - subtitleTimeOffset;
+                        LogMsg(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d\n",
+                               streamIndex,
+                               cue.begin / 10000,
+                               nextBegin / 10000,
+                               lookaheadOffset);
+                    } else {
+                        sampleStop = sampleStart + kDefaultSubtitleDuration;
+                        LogMsg(L"SUBTITLE lookahead miss: streamIndex=%d, current=%I64d ms, byte=%I64d\n",
+                               streamIndex,
+                               cue.begin / 10000,
+                               lookaheadOffset);
+                    }
+                }
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
                 sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
             } else {
                 sampleStart = ToSegmentTime(normPts, m_segmentStart);
-                sampleStop = sampleStart + 5 * 10000000LL;
+                sampleStop = sampleStart + kDefaultSubtitleDuration;
             }
             if (sampleStop <= sampleStart)
-                sampleStop = sampleStart + 5 * 10000000LL;
+                sampleStop = sampleStart + kDefaultSubtitleDuration;
 
             bool delivered = false;
             for (auto* pin : m_pins) {
@@ -1125,6 +1146,81 @@ void CMmtTlvSplitter::NotifyVideoRap(REFERENCE_TIME segmentTime)
 REFERENCE_TIME CMmtTlvSplitter::GetSegmentTimeOffset() const
 {
     return m_segmentTimeOffset.load(std::memory_order_acquire);
+}
+
+bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME currentBegin,
+                                            long long startOffset, REFERENCE_TIME& nextBegin) const
+{
+    constexpr size_t kChunk = 1024 * 1024;
+    constexpr long long kMaxLookaheadBytes = 64LL * 1024 * 1024;
+    constexpr REFERENCE_TIME kMinGap = 10 * 10000LL;
+
+    nextBegin = -1;
+    if (startOffset < 0 || m_fileSize <= 0)
+        return false;
+
+    std::ifstream ifs(m_filename, std::ios::binary);
+    if (!ifs.is_open())
+        return false;
+
+    if (startOffset > static_cast<long long>(m_fileSize))
+        startOffset = static_cast<long long>(m_fileSize);
+    ifs.seekg(static_cast<std::streamoff>(startOffset));
+    if (!ifs.good())
+        return false;
+
+    bool found = false;
+    CFilterDemuxerHandler handler;
+    handler.setSubtitleCallback(
+        [&](int si, bool, long long, long long, bool, bool, const uint8_t* d, size_t sz) {
+            if (found || si != streamIndex)
+                return;
+
+            TtmlDebugStats stats;
+            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
+            if (cue.hasBegin && cue.begin > currentBegin + kMinGap) {
+                nextBegin = cue.begin;
+                found = true;
+            }
+        });
+
+    MmtTlv::MmtTlvDemuxer demuxer;
+    demuxer.setDemuxerHandler(handler);
+
+    std::vector<uint8_t> buf;
+    buf.reserve(kChunk * 2);
+    long long readBytes = 0;
+
+    while (!found && readBytes < kMaxLookaheadBytes) {
+        if (buf.size() < 2 * 1024 * 1024) {
+            size_t oldSz = buf.size();
+            buf.resize(oldSz + kChunk);
+            ifs.read(reinterpret_cast<char*>(buf.data() + oldSz), kChunk);
+            std::streamsize got = ifs.gcount();
+            buf.resize(oldSz + static_cast<size_t>(got));
+            readBytes += static_cast<long long>(got);
+            if (got == 0 && buf.empty())
+                break;
+        }
+
+        MmtTlv::Common::ReadStream stream(buf);
+        while (!found && !stream.isEof()) {
+            auto status = demuxer.demux(stream);
+            if (status == MmtTlv::DemuxStatus::NotEnoughBuffer)
+                break;
+        }
+
+        size_t consumed = buf.size() - stream.leftBytes();
+        if (consumed > 0) {
+            buf.erase(buf.begin(), buf.begin() + consumed);
+        } else if (ifs.eof() || !ifs.good()) {
+            break;
+        } else {
+            break;
+        }
+    }
+
+    return found;
 }
 
 int CMmtTlvSplitter::GetPinCount()
@@ -1264,6 +1360,7 @@ void CMmtTlvSplitter::DemuxLoop()
         if (ratio > 1.0) ratio = 1.0;
         auto byteOffset = static_cast<std::streamoff>(ratio * m_fileSize);
         ifs.seekg(byteOffset);
+        m_demuxByteOffset.store(static_cast<long long>(byteOffset), std::memory_order_release);
         LogMsg(L"MMT/TLV Splitter: DemuxLoop seek target=%I64d ms ratio=%.6f byte=%I64d/%I64d ok=%d\n",
                seekTarget / 10000,
                ratio,
@@ -1271,6 +1368,7 @@ void CMmtTlvSplitter::DemuxLoop()
                static_cast<long long>(m_fileSize),
                ifs.good() ? 1 : 0);
     } else {
+        m_demuxByteOffset.store(0, std::memory_order_release);
         LogMsg(L"MMT/TLV Splitter: DemuxLoop start target=%I64d ms byte=0\n",
                seekTarget / 10000);
     }
@@ -1283,6 +1381,7 @@ void CMmtTlvSplitter::DemuxLoop()
 
     std::vector<uint8_t> buf;
     buf.reserve(kChunk * 2);
+    long long bufferOffset = m_demuxByteOffset.load(std::memory_order_acquire);
 
     while (m_active) {
         if (WaitForSingleObject(m_hStop, 0) == WAIT_OBJECT_0) break;
@@ -1300,6 +1399,8 @@ void CMmtTlvSplitter::DemuxLoop()
         MmtTlv::Common::ReadStream stream(buf);
         while (!stream.isEof()) {
             if (!m_active) break;
+            long long currentOffset = bufferOffset + static_cast<long long>(buf.size() - stream.leftBytes());
+            m_demuxByteOffset.store(currentOffset, std::memory_order_release);
             auto status = m_demuxer.demux(stream);
             if (status == MmtTlv::DemuxStatus::NotEnoughBuffer) break;
         }
@@ -1307,6 +1408,8 @@ void CMmtTlvSplitter::DemuxLoop()
         size_t consumed = buf.size() - stream.leftBytes();
         if (consumed > 0) {
             buf.erase(buf.begin(), buf.begin() + consumed);
+            bufferOffset += static_cast<long long>(consumed);
+            m_demuxByteOffset.store(bufferOffset, std::memory_order_release);
         } else {
             // Avoid infinite loop at EOF when remaining buffer is unparseable
             if (ifs.eof() || !ifs.good()) break;
