@@ -874,17 +874,44 @@ void CMmtTlvSplitter::CreatePins()
     constexpr bool kEnableSubtitlePins = true;
     auto subtitleStreams = m_handler.getSubtitleStreams();
     if (kEnableSubtitlePins) {
+        int primarySubtitleStreamIndex = -1;
+        for (const auto& info : subtitleStreams) {
+            if (info.hasData) {
+                primarySubtitleStreamIndex = info.streamIndex;
+                break;
+            }
+        }
+        if (primarySubtitleStreamIndex < 0) {
+            for (const auto& info : subtitleStreams) {
+                if (info.componentTag == 48) {
+                    primarySubtitleStreamIndex = info.streamIndex;
+                    break;
+                }
+            }
+        }
+        if (primarySubtitleStreamIndex < 0 && !subtitleStreams.empty())
+            primarySubtitleStreamIndex = subtitleStreams.front().streamIndex;
         for (size_t i = 0; i < subtitleStreams.size(); ++i) {
             WCHAR pinName[64];
-            StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Subtitle %zu", i + 1);
+            WCHAR trackName[128];
+            if (subtitleStreams[i].streamIndex == primarySubtitleStreamIndex) {
+                StringCchCopyW(trackName, ARRAYSIZE(trackName), L"\x4E3B\x5B57\x5E55");
+            } else {
+                StringCchPrintfW(trackName, ARRAYSIZE(trackName),
+                                 L"Subtitle (componentTag %d)",
+                                 subtitleStreams[i].componentTag);
+            }
+            StringCchCopyW(pinName, ARRAYSIZE(pinName), trackName);
             auto* pin = new CMmtTlvOutputPin(MmtTlvPinKind::Subtitle, &hr, this, &m_pinLock,
                                              pinName, subtitleStreams[i].streamIndex);
+            pin->SetTrackName(trackName);
             m_pins.push_back(pin);
-            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
                    pinName,
                    subtitleStreams[i].streamIndex,
                    subtitleStreams[i].packetId,
-                   subtitleStreams[i].componentTag);
+                   subtitleStreams[i].componentTag,
+                   subtitleStreams[i].hasData ? 1 : 0);
         }
     } else if (!subtitleStreams.empty()) {
         LogMsg(L"MMT/TLV Splitter: subtitle pins disabled for playback timing test, streams=%zu\n",

@@ -252,7 +252,8 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
         info->IsoLang[0] = 'j';
         info->IsoLang[1] = 'p';
         info->IsoLang[2] = 'n';
-        StringCchCopyW(info->TrackName, ARRAYSIZE(info->TrackName), L"MMT/TLV Subtitle");
+        StringCchCopyW(info->TrackName, ARRAYSIZE(info->TrackName),
+                       m_trackName.empty() ? L"MMT/TLV Subtitle" : m_trackName.c_str());
         memcpy(reinterpret_cast<BYTE*>(info) + sizeof(SUBTITLEINFO), kAssHeader, headerSize);
     }
 

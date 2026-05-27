@@ -101,15 +101,22 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
         [streamIndex](const SubtitleStreamInfo& info) {
             return info.streamIndex == streamIndex;
         });
-    if (it != m_subtitleStreams.end())
+    if (it != m_subtitleStreams.end()) {
+        if (!it->hasData) {
+            it->hasData = true;
+            LogMsg(L"MMT/TLV Subtitle data seen streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+                   it->streamIndex, it->packetId, it->componentTag);
+        }
         return;
+    }
 
     SubtitleStreamInfo info;
     info.streamIndex = streamIndex;
     info.packetId = stream.getPacketId();
     info.componentTag = stream.getComponentTag();
+    info.hasData = true;
     m_subtitleStreams.push_back(info);
-    LogMsg(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+    LogMsg(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, data=1\n",
            info.streamIndex, info.packetId, info.componentTag);
 }
 
@@ -249,12 +256,22 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 
     if (!discoveredSubtitles.empty()) {
         std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        for (auto& info : discoveredSubtitles) {
+            auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
+                [&info](const SubtitleStreamInfo& known) {
+                    return known.streamIndex == info.streamIndex;
+                });
+            if (it != m_subtitleStreams.end())
+                info.hasData = it->hasData;
+        }
+
         bool changed = discoveredSubtitles.size() != m_subtitleStreams.size();
         if (!changed) {
             for (size_t i = 0; i < discoveredSubtitles.size(); ++i) {
                 if (discoveredSubtitles[i].streamIndex != m_subtitleStreams[i].streamIndex ||
                     discoveredSubtitles[i].packetId != m_subtitleStreams[i].packetId ||
-                    discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag) {
+                    discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag ||
+                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData) {
                     changed = true;
                     break;
                 }
@@ -267,8 +284,8 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                    static_cast<unsigned>(mpt.assets.size()), m_subtitleStreams.size());
             for (size_t i = 0; i < m_subtitleStreams.size(); ++i) {
                 const auto& info = m_subtitleStreams[i];
-                LogMsg(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
-                       i, info.streamIndex, info.packetId, info.componentTag);
+                LogMsg(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
+                       i, info.streamIndex, info.packetId, info.componentTag, info.hasData ? 1 : 0);
             }
         }
     }

@@ -22,6 +22,7 @@ public:
         int streamIndex{-1};
         uint16_t packetId{0};
         int componentTag{-1};
+        bool hasData{false};
     };
 
     using SampleCallback = std::function<void(

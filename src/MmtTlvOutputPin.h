@@ -2,6 +2,7 @@
 #include <streams.h>
 #include <vector>
 #include <cstdint>
+#include <string>
 
 class CMmtTlvSplitter;
 class COutputQueue;
@@ -53,6 +54,7 @@ public:
     void SetAudioInfo(int sampleRate, int channels, int bitdepth = 16)
         { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; }
     void SetHevcExtradata(const std::vector<uint8_t>& extra) { m_hevcExtradata = extra; }
+    void SetTrackName(const std::wstring& name) { m_trackName = name; }
 
     bool IsVideo() const { return m_kind == MmtTlvPinKind::Video; }
     bool IsAudio() const { return m_kind == MmtTlvPinKind::Audio; }
@@ -110,6 +112,7 @@ private:
     int m_sampleRate{48000};
     int m_channels{2};
     int m_bitdepth{16};
+    std::wstring m_trackName;
 
     // Fragment accumulation buffer
     std::vector<uint8_t> m_accum;
