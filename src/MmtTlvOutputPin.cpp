@@ -281,11 +281,10 @@ HRESULT CMmtTlvOutputPin::DecideBufferSize(IMemAllocator* pAlloc, ALLOCATOR_PROP
     ALLOCATOR_PROPERTIES actual;
     const bool isVideo = IsVideo();
     const bool isSubtitle = IsSubtitle();
-    const bool is8kVideo = isVideo && m_width >= 7680;
     pprop->cbBuffer = isVideo
-        ? (is8kVideo ? 64 * 1024 * 1024 : 16 * 1024 * 1024)
+        ? 16 * 1024 * 1024
         : (isSubtitle ? 256 * 1024 : 64 * 1024);
-    pprop->cBuffers  = isVideo ? (is8kVideo ? 8 : 32) : 64;
+    pprop->cBuffers  = isVideo ? 32 : 64;
     pprop->cbAlign   = 1;
     pprop->cbPrefix  = 0;
     HRESULT hr = pAlloc->SetProperties(pprop, &actual);
