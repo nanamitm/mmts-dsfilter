@@ -142,16 +142,27 @@ static std::string FormatAssColorTag(const TTMLCssValueColor& color)
     return tag;
 }
 
+static int AssFontSizeFromSpan(const TTMLSpanTag* span)
+{
+    if (!span)
+        return 96;
+
+    float fontWidth = 0;
+    float fontHeight = 0;
+    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontHeight > 0)
+        return (std::max)(1, static_cast<int>(std::lround(fontHeight * 1080.0 / 2160.0)));
+
+    return 96;
+}
+
 static std::string BuildAssStyleTags(const TTMLSpanTag* span)
 {
     std::string tags;
     if (!span)
         return tags;
 
-    float fontWidth = 0;
-    float fontHeight = 0;
-    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontHeight > 0) {
-        const int assFontSize = (std::max)(1, static_cast<int>(std::lround(fontHeight * 1080.0 / 2160.0)));
+    const int assFontSize = AssFontSizeFromSpan(span);
+    if (assFontSize > 0) {
         tags += FormatAssTag("\\fs%d", assFontSize);
     }
 
@@ -165,7 +176,64 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span)
     return tags;
 }
 
-static std::string BuildAssPositionTags(const TTMLPTag& p, bool lowerByOneLine)
+static double EstimateAssCharWidth(wchar_t ch, int fontSize)
+{
+    if ((ch >= 0x20 && ch <= 0x7e) || (ch >= 0xff61 && ch <= 0xff9f))
+        return fontSize * 0.55;
+    return fontSize * 0.95;
+}
+
+static double EstimateAssHalfLineWidth(const TTMLPTag& p)
+{
+    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const int fallbackFontSize = AssFontSizeFromSpan(firstSpan);
+    double maxWidth = 0;
+    double currentWidth = 0;
+
+    for (const auto& span : p.spanTags) {
+        const int fontSize = AssFontSizeFromSpan(&span);
+        int chars = MultiByteToWideChar(CP_UTF8, 0, span.text.c_str(),
+                                        static_cast<int>(span.text.size()), nullptr, 0);
+        if (chars <= 0)
+            chars = 0;
+        std::wstring wide(static_cast<size_t>(chars), L'\0');
+        if (chars > 0) {
+            MultiByteToWideChar(CP_UTF8, 0, span.text.c_str(),
+                                static_cast<int>(span.text.size()), wide.data(), chars);
+        }
+        for (wchar_t ch : wide) {
+            if (ch == L'\r')
+                continue;
+            if (ch == L'\n') {
+                maxWidth = (std::max)(maxWidth, currentWidth);
+                currentWidth = 0;
+                continue;
+            }
+            currentWidth += EstimateAssCharWidth(ch, fontSize > 0 ? fontSize : fallbackFontSize);
+        }
+    }
+
+    maxWidth = (std::max)(maxWidth, currentWidth);
+    return maxWidth / 2.0;
+}
+
+static const TTMLPTag* SelectAssPositionParagraph(const TTMLDivTag& div)
+{
+    const TTMLPTag* selected = nullptr;
+    double selectedWidth = -1;
+
+    for (const auto& p : div.pTags) {
+        double width = EstimateAssHalfLineWidth(p);
+        if (width > selectedWidth) {
+            selected = &p;
+            selectedWidth = width;
+        }
+    }
+
+    return selected;
+}
+
+static std::string BuildAssPositionTags(const TTMLPTag& p)
 {
     float originX = 0;
     float originY = 0;
@@ -173,44 +241,24 @@ static std::string BuildAssPositionTags(const TTMLPTag& p, bool lowerByOneLine)
         float extentX = 0;
         float extentY = 0;
         const bool hasExtent = TryGetLengthPair(p.region.extent, extentX, extentY);
-        const double anchorX = hasExtent ? (originX + extentX / 2.0f) : originX;
-        const int x = static_cast<int>(std::lround(anchorX * 1920.0 / 3840.0));
-        float yOffset = 0;
-        if (lowerByOneLine && !p.spanTags.empty()) {
-            const auto& style = p.spanTags.begin()->style;
-            if (style.lineHeight.has_value()) {
-                TryGetLength(*style.lineHeight, yOffset);
-            }
-            if (yOffset <= 0) {
-                float fontWidth = 0;
-                float fontHeight = 0;
-                if (TryGetLengthPair(style.fontSize, fontWidth, fontHeight))
-                    yOffset = fontHeight;
-            }
+        double anchorX = hasExtent ? (originX + extentX / 2.0f) : originX;
+        double xPos = anchorX * 1920.0 / 3840.0;
+        if (hasExtent) {
+            constexpr double kMargin = 20.0;
+            const double halfLineWidth = EstimateAssHalfLineWidth(p);
+            const double minX = (std::min)(960.0, halfLineWidth + kMargin);
+            const double maxX = 1920.0 - minX;
+            xPos = (std::min)((std::max)(xPos, minX), maxX);
+        } else {
+            xPos = (std::min)((std::max)(xPos, 20.0), 1900.0);
         }
-        const int y = static_cast<int>(std::lround((originY + yOffset) * 1080.0 / 2160.0));
+        const int x = static_cast<int>(std::lround(xPos));
+        const int y = static_cast<int>(std::lround(originY * 1080.0 / 2160.0));
         return std::string(hasExtent ? "\\an8" : "\\an7") +
                FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
     }
 
     return "\\an2\\pos(960,980)";
-}
-
-static size_t CountSubtitleLines(const TTMLDivTag& div)
-{
-    size_t lines = 0;
-    for (const auto& p : div.pTags) {
-        bool hasText = false;
-        for (const auto& span : p.spanTags) {
-            if (!span.text.empty()) {
-                hasText = true;
-                lines += static_cast<size_t>(std::count(span.text.begin(), span.text.end(), '\n'));
-            }
-        }
-        if (hasText)
-            ++lines;
-    }
-    return lines;
 }
 
 static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats)
@@ -228,7 +276,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
 
     for (const auto& div : ttml.divTags) {
         ++stats.divs;
-        const bool lowerByOneLine = CountSubtitleLines(div) > 1;
+        const TTMLPTag* positionP = SelectAssPositionParagraph(div);
         if (div.begin.has_value()) {
             const REFERENCE_TIME begin = static_cast<REFERENCE_TIME>(*div.begin) * 10000;
             cue.begin = cue.hasBegin ? (std::min)(cue.begin, begin) : begin;
@@ -250,7 +298,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     text << span.text;
                     if (!wroteAssParagraph) {
                         ass << "0,0,Default,,0,0,0,,{"
-                            << BuildAssPositionTags(p, lowerByOneLine)
+                            << BuildAssPositionTags(positionP ? *positionP : p)
                             << BuildAssStyleTags(firstSpan)
                             << "}";
                         wroteAssParagraph = true;
