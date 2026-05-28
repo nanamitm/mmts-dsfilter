@@ -69,6 +69,27 @@ The filter is produced as:
 msvc\x64\<Configuration>\mmts-dsfilter.ax
 ```
 
+## GitHub Release Package
+
+The `Build Release` GitHub Actions workflow builds the Release configuration
+and creates a ZIP package containing:
+
+```text
+mmts-dsfilter.ax
+register-filter.ps1
+unregister-filter.ps1
+README.md
+```
+
+The workflow can be run manually from GitHub Actions to create an artifact. It
+also publishes the ZIP as a GitHub Release asset when a `v*` tag is pushed, for
+example:
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Register
 
 The helper scripts automatically elevate to administrator rights when needed.

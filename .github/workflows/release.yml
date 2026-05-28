@@ -1,0 +1,70 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout mmts-dsfilter
+        uses: actions/checkout@v4
+        with:
+          path: mmts-dsfilter
+
+      - name: Checkout dantto4k
+        uses: actions/checkout@v4
+        with:
+          repository: nanamitm/dantto4k
+          path: dantto4k
+
+      - name: Build Release
+        shell: pwsh
+        working-directory: mmts-dsfilter
+        run: ./build.ps1 -Configuration Release
+
+      - name: Create release package
+        shell: pwsh
+        working-directory: mmts-dsfilter
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $shortSha = ($env:GITHUB_SHA).Substring(0, 7)
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "snapshot-$shortSha" }
+          $packageName = "mmts-dsfilter-$version-x64"
+          $packageRoot = Join-Path $PWD "artifacts\$packageName"
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+
+          Copy-Item -LiteralPath "msvc\x64\Release\mmts-dsfilter.ax" -Destination $packageRoot
+          Copy-Item -LiteralPath "scripts\register-filter.ps1" -Destination $packageRoot
+          Copy-Item -LiteralPath "scripts\unregister-filter.ps1" -Destination $packageRoot
+          Copy-Item -LiteralPath "README.md" -Destination $packageRoot
+
+          $zipPath = Join-Path $PWD "artifacts\$packageName.zip"
+          if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath
+          }
+          Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath $zipPath
+
+          "PACKAGE_NAME=$packageName" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PACKAGE_ZIP=mmts-dsfilter/artifacts/$packageName.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ env.PACKAGE_ZIP }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PACKAGE_ZIP }}

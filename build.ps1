@@ -12,7 +12,18 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $project = Join-Path $repoRoot "msvc\mmts-dsfilter.vcxproj"
-$msbuild = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\Msbuild\Current\Bin\amd64\MSBuild.exe"
+
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (Test-Path -LiteralPath $vswhere) {
+    $vsInstall = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+    if ($vsInstall) {
+        $msbuild = Join-Path $vsInstall "MSBuild\Current\Bin\amd64\MSBuild.exe"
+    }
+}
+
+if (-not $msbuild) {
+    $msbuild = "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\Msbuild\Current\Bin\amd64\MSBuild.exe"
+}
 
 if (-not (Test-Path -LiteralPath $msbuild)) {
     throw "MSBuild not found: $msbuild"
