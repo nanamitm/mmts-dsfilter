@@ -90,6 +90,10 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
+The workflow checks out `dantto4k` from the same GitHub owner as this
+repository, so forks should also provide a sibling `<owner>/dantto4k`
+repository.
+
 ## Register
 
 The helper scripts automatically elevate to administrator rights when needed.

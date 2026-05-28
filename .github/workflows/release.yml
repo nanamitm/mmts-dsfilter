@@ -22,7 +22,7 @@ jobs:
       - name: Checkout dantto4k
         uses: actions/checkout@v4
         with:
-          repository: nanamitm/dantto4k
+          repository: ${{ github.repository_owner }}/dantto4k
           path: dantto4k
 
       - name: Build Release
