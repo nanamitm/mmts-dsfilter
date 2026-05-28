@@ -198,21 +198,28 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
         }
     } else if (IsAudio()) {
         pmt->SetType(&MEDIATYPE_Audio);
-        pmt->SetSubtype(&MEDIASUBTYPE_RAW_AAC1);
+        pmt->SetSubtype(m_audioLatm ? &MEDIASUBTYPE_MPEG_LOAS : &MEDIASUBTYPE_RAW_AAC1);
         pmt->SetFormatType(&FORMAT_WaveFormatEx);
 
+        const ULONG extraSize = static_cast<ULONG>(m_audioLatm ? m_audioExtraData.size() : 0);
+        const ULONG fmtSize = sizeof(WAVEFORMATEX) + extraSize;
         WAVEFORMATEX* wf = reinterpret_cast<WAVEFORMATEX*>(
-            pmt->AllocFormatBuffer(sizeof(WAVEFORMATEX)));
+            pmt->AllocFormatBuffer(fmtSize));
         if (!wf) return E_OUTOFMEMORY;
-        ZeroMemory(wf, sizeof(WAVEFORMATEX));
+        ZeroMemory(wf, fmtSize);
 
-        wf->wFormatTag      = 0x00FF;  // WAVE_FORMAT_RAW_AAC1
+        wf->wFormatTag      = m_audioLatm ? 0x1602 : 0x00FF;  // WAVE_FORMAT_MPEG_LOAS / WAVE_FORMAT_RAW_AAC1
         wf->nChannels       = static_cast<WORD>(m_channels);
         wf->nSamplesPerSec  = static_cast<DWORD>(m_sampleRate);
         wf->wBitsPerSample  = static_cast<WORD>(m_bitdepth);
         wf->nBlockAlign     = 1;
         wf->nAvgBytesPerSec = 0;
-        wf->cbSize          = 0;
+        wf->cbSize          = static_cast<WORD>(extraSize);
+
+        if (extraSize > 0) {
+            memcpy(reinterpret_cast<BYTE*>(wf) + sizeof(WAVEFORMATEX),
+                   m_audioExtraData.data(), extraSize);
+        }
     } else {
         pmt->SetType(&MEDIATYPE_Subtitle);
         pmt->SetSubtype(&MEDIASUBTYPE_ASS);
@@ -262,7 +269,8 @@ HRESULT CMmtTlvOutputPin::CheckMediaType(const CMediaType* pmt)
         if (*pmt->Subtype() != MEDIASUBTYPE_HEVC)  return VFW_E_TYPE_NOT_ACCEPTED;
     } else if (IsAudio()) {
         if (*pmt->Type()    != MEDIATYPE_Audio)       return VFW_E_TYPE_NOT_ACCEPTED;
-        if (*pmt->Subtype() != MEDIASUBTYPE_RAW_AAC1) return VFW_E_TYPE_NOT_ACCEPTED;
+        if (*pmt->Subtype() != (m_audioLatm ? MEDIASUBTYPE_MPEG_LOAS : MEDIASUBTYPE_RAW_AAC1))
+            return VFW_E_TYPE_NOT_ACCEPTED;
     } else {
         if (*pmt->Type()    != MEDIATYPE_Subtitle) return VFW_E_TYPE_NOT_ACCEPTED;
         if (*pmt->Subtype() != MEDIASUBTYPE_ASS)   return VFW_E_TYPE_NOT_ACCEPTED;
@@ -554,7 +562,8 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     }
     const bool forceLog = m_logNextSample;
     m_logNextSample = false;
-    if (forceLog || sampleNo <= 10 || (sampleNo % 100) == 0 || bufferMs >= 20 || deliverMs >= 20 || FAILED(hr)) {
+    const bool logFailure = FAILED(hr) && m_isVideo;
+    if (forceLog || sampleNo <= 10 || (sampleNo % 100) == 0 || bufferMs >= 20 || deliverMs >= 20 || logFailure) {
         if (m_isVideo) {
             LogPinDetail(L"MMT/TLV Video DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms, frameStep=%I64d ms, drift=%I64d ms\n",
                       sampleNo,
@@ -569,9 +578,12 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
                       videoFrameStepMs,
                       videoDriftMs);
         } else {
-            LogPinDetail(L"MMT/TLV Audio DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms\n",
+            LogPinDetail(L"MMT/TLV Audio DeliverSample #%ld: hr=0x%08X, streamIndex=%d, format=%s, channels=%d, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms\n",
                       sampleNo,
                       hr,
+                      m_audioStreamIndex,
+                      m_audioLatm ? L"LATM" : L"ADTS",
+                      m_channels,
                       m_accum.size(),
                       m_accumPts / 10000,
                       m_accumDts / 10000,

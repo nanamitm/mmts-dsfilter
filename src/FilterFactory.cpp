@@ -13,7 +13,8 @@ static const REGPINTYPES kVideoTypes[] = {
     { &MEDIATYPE_Video, &MEDIASUBTYPE_HEVC }
 };
 static const REGPINTYPES kAudioTypes[] = {
-    { &MEDIATYPE_Audio, &MEDIASUBTYPE_RAW_AAC1 }
+    { &MEDIATYPE_Audio, &MEDIASUBTYPE_RAW_AAC1 },
+    { &MEDIATYPE_Audio, &MEDIASUBTYPE_MPEG_LOAS }
 };
 static const REGPINTYPES kSubtitleTypes[] = {
     { &MEDIATYPE_Subtitle, &MEDIASUBTYPE_ASS }

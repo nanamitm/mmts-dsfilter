@@ -1181,14 +1181,14 @@ void CMmtTlvSplitter::PreScanFile()
     }
     {
         auto discoveredAudioStreams = handler.getAudioStreams();
-        auto convertibleAudioStreams = handler.getAdtsConvertibleAudioStreams();
-        if (!discoveredAudioStreams.empty() && convertibleAudioStreams.empty()) {
+        auto playableAudioStreams = handler.getPlayableAudioStreams();
+        if (!discoveredAudioStreams.empty() && playableAudioStreams.empty()) {
             m_audioUnsupported = true;
             m_handler.setKnownAudioStreams({});
             m_handler.setRequireAdtsConvertibleAudio(true);
-            LogMsg(L"MMT/TLV Splitter: audio streams found but no ADTS-convertible stream; audio pins disabled\n");
-        } else if (!convertibleAudioStreams.empty()) {
-            m_handler.setKnownAudioStreams(convertibleAudioStreams);
+            LogMsg(L"MMT/TLV Splitter: audio streams found but no playable ADTS/LATM stream; audio pins disabled\n");
+        } else if (!playableAudioStreams.empty()) {
+            m_handler.setKnownAudioStreams(playableAudioStreams);
             m_handler.setRequireAdtsConvertibleAudio(true);
         } else {
             m_handler.setKnownAudioStreams(discoveredAudioStreams);
@@ -1202,8 +1202,9 @@ void CMmtTlvSplitter::PreScanFile()
         LogMsg(L"MMT/TLV Splitter: PreScan audio stream count=%zu\n", streams.size());
         for (size_t i = 0; i < streams.size(); ++i) {
             const auto& info = streams[i];
-            LogMsg(L"MMT/TLV Splitter: PreScan audio[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
-                   i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
+            LogMsg(L"MMT/TLV Splitter: PreScan audio[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u, extra=%zu\n",
+                   i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate,
+                   info.latm ? L"LATM" : L"ADTS", info.channels, info.extraData.size());
         }
     }
     {
@@ -1437,13 +1438,21 @@ void CMmtTlvSplitter::CreatePins()
             auto* pin = new CMmtTlvOutputPin(false, &hr, this, &m_pinLock,
                                              pinName, audioStreams[i].streamIndex);
             if (audioStreams[i].samplingRate > 0)
-                pin->SetAudioInfo(static_cast<int>(audioStreams[i].samplingRate), 2);
+                pin->SetAudioInfo(static_cast<int>(audioStreams[i].samplingRate),
+                                  audioStreams[i].channels,
+                                  16,
+                                  audioStreams[i].latm,
+                                  audioStreams[i].extraData);
+            pin->SetTrackName(audioStreams[i].latm ? L"AAC LATM 22.2ch" : L"AAC ADTS");
             m_pins.push_back(pin);
-            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, format=%s, channels=%u, extra=%zu\n",
                    pinName,
                    audioStreams[i].streamIndex,
                    audioStreams[i].packetId,
-                   audioStreams[i].componentTag);
+                   audioStreams[i].componentTag,
+                   audioStreams[i].latm ? L"LATM" : L"ADTS",
+                   audioStreams[i].channels,
+                   audioStreams[i].extraData.size());
         }
     }
     constexpr bool kEnableSubtitlePins = true;
@@ -2171,8 +2180,9 @@ STDMETHODIMP CMmtTlvSplitter::Count(DWORD* pcStreams)
            *pcStreams, m_handler.getSelectedAudioStreamIndex());
     for (size_t i = 0; i < streams.size(); ++i) {
         const auto& info = streams[i];
-        LogMsg(L"MMT/TLV StreamSelect: Count stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
-               i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
+        LogDetail(L"MMT/TLV StreamSelect: Count stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u\n",
+               i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate,
+               info.latm ? L"LATM" : L"ADTS", info.channels);
     }
     return S_OK;
 }
@@ -2194,8 +2204,17 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
     if (plcid) *plcid = 0;
     if (pdwGroup) *pdwGroup = 1;
     if (ppszName) {
-        *ppszName = AllocStreamName(L"Audio %d (stream %d, component %d)",
-                                    lIndex + 1, info);
+        WCHAR formatName[16];
+        StringCchCopyW(formatName, ARRAYSIZE(formatName), info.latm ? L"LATM" : L"ADTS");
+        WCHAR buf[160];
+        StringCchPrintfW(buf, ARRAYSIZE(buf),
+                         L"Audio %ld %s %uch (stream %d, component %d)",
+                         lIndex + 1, formatName, info.channels,
+                         info.streamIndex, info.componentTag);
+        const size_t chars = wcslen(buf) + 1;
+        *ppszName = static_cast<LPWSTR>(CoTaskMemAlloc(chars * sizeof(WCHAR)));
+        if (*ppszName)
+            StringCchCopyW(*ppszName, chars, buf);
         if (!*ppszName)
             return E_OUTOFMEMORY;
     }

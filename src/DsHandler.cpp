@@ -38,6 +38,7 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
 
     int streamIndex = static_cast<int>(stream.getStreamIndex());
     if (m_requireAdtsConvertibleAudio &&
+        !stream.is22_2chAudio() &&
         std::find(m_adtsConvertibleAudioStreams.begin(),
                   m_adtsConvertibleAudioStreams.end(),
                   streamIndex) == m_adtsConvertibleAudioStreams.end()) {
@@ -48,17 +49,58 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
         [streamIndex](const AudioStreamInfo& info) {
             return info.streamIndex == streamIndex;
         });
-    if (it != m_audioStreams.end())
+    if (it != m_audioStreams.end()) {
+        if (it->latm && it->extraData.empty())
+            LogDetail(L"MMT/TLV Audio LATM stream known without extra data: streamIndex=%d\n", streamIndex);
         return;
+    }
 
     AudioStreamInfo info;
     info.streamIndex = streamIndex;
     info.packetId = stream.getPacketId();
     info.componentTag = stream.getComponentTag();
     info.samplingRate = stream.getSamplingRate();
+    info.channels = stream.is22_2chAudio() ? 24 : 2;
+    info.latm = stream.is22_2chAudio();
     m_audioStreams.push_back(info);
-    LogDetail(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
-           info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
+    LogDetail(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u\n",
+           info.streamIndex, info.packetId, info.componentTag, info.samplingRate,
+           info.latm ? L"LATM" : L"ADTS", info.channels);
+}
+
+void CFilterDemuxerHandler::rememberLatmConfig(int streamIndex, const uint8_t* data, size_t size)
+{
+    if (!data || size < 9)
+        return;
+
+    const uint16_t syncWord = static_cast<uint16_t>((data[0] << 3) | ((data[1] & 0xE0) >> 5));
+    if (syncWord != 0x2B7)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [streamIndex](const AudioStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (it == m_audioStreams.end() || !it->latm || !it->extraData.empty())
+        return;
+
+    constexpr size_t kStreamMuxConfigProbeBytes = 6;
+    it->extraData.assign(data + 3, data + 3 + kStreamMuxConfigProbeBytes);
+
+    WCHAR hex[64]{};
+    WCHAR* cursor = hex;
+    size_t remaining = ARRAYSIZE(hex);
+    for (uint8_t b : it->extraData) {
+        HRESULT hr = StringCchPrintfW(cursor, remaining, L"%02X ", b);
+        if (FAILED(hr))
+            break;
+        size_t used = wcslen(cursor);
+        cursor += used;
+        remaining -= used;
+    }
+    LogDetail(L"MMT/TLV Audio LATM extra data captured: streamIndex=%d, bytes=%zu, data=%s\n",
+              streamIndex, it->extraData.size(), hex);
 }
 
 bool CFilterDemuxerHandler::shouldProcessAudioStream(int streamIndex) const
@@ -67,8 +109,15 @@ bool CFilterDemuxerHandler::shouldProcessAudioStream(int streamIndex) const
     if (!m_requireAdtsConvertibleAudio)
         return true;
 
-    if (m_primaryAudioStreamIndex != -1)
-        return m_primaryAudioStreamIndex == streamIndex;
+    // Each DirectShow audio output pin represents one stream.  MPC-BE may switch
+    // between those pins without calling IAMStreamSelect::Enable, so demux-time
+    // filtering by m_primaryAudioStreamIndex can starve the selected pin.
+    auto known = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [streamIndex](const AudioStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (known != m_audioStreams.end())
+        return true;
 
     return std::find(m_adtsConvertibleAudioStreams.begin(),
                      m_adtsConvertibleAudioStreams.end(),
@@ -159,6 +208,8 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                     const auto* audio = static_cast<const MmtTlv::MhAudioComponentDescriptor*>(descriptor.get());
                     info.componentTag = audio->componentTag;
                     info.samplingRate = audio->getConvertedSamplingRate();
+                    info.channels = audio->is22_2chAudio() ? 24 : 2;
+                    info.latm = audio->is22_2chAudio();
                     break;
                 }
                 }
@@ -186,9 +237,20 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 
     if (!discovered.empty()) {
         std::lock_guard<std::mutex> lock(m_audioMutex);
+        for (auto& info : discovered) {
+            auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+                [&info](const AudioStreamInfo& known) {
+                    return known.streamIndex == info.streamIndex;
+                });
+            if (it != m_audioStreams.end() && !it->extraData.empty())
+                info.extraData = it->extraData;
+        }
+
         if (m_requireAdtsConvertibleAudio) {
             discovered.erase(std::remove_if(discovered.begin(), discovered.end(),
                 [this](const AudioStreamInfo& info) {
+                    if (info.latm)
+                        return false;
                     return std::find(m_adtsConvertibleAudioStreams.begin(),
                                      m_adtsConvertibleAudioStreams.end(),
                                      info.streamIndex) == m_adtsConvertibleAudioStreams.end();
@@ -222,7 +284,10 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             for (size_t i = 0; i < discovered.size(); ++i) {
                 if (discovered[i].streamIndex != m_audioStreams[i].streamIndex ||
                     discovered[i].packetId != m_audioStreams[i].packetId ||
-                    discovered[i].componentTag != m_audioStreams[i].componentTag) {
+                    discovered[i].componentTag != m_audioStreams[i].componentTag ||
+                    discovered[i].channels != m_audioStreams[i].channels ||
+                    discovered[i].latm != m_audioStreams[i].latm ||
+                    discovered[i].extraData != m_audioStreams[i].extraData) {
                     changed = true;
                     break;
                 }
@@ -241,8 +306,9 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                    m_primaryAudioStreamIndex);
             for (size_t i = 0; i < m_audioStreams.size(); ++i) {
                 const auto& info = m_audioStreams[i];
-                LogDetail(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
-                       i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
+                LogDetail(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u, extra=%zu\n",
+                       i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate,
+                       info.latm ? L"LATM" : L"ADTS", info.channels, info.extraData.size());
             }
         }
     }
@@ -347,12 +413,35 @@ std::vector<CFilterDemuxerHandler::AudioStreamInfo> CFilterDemuxerHandler::getAd
     std::lock_guard<std::mutex> lock(m_audioMutex);
     std::vector<AudioStreamInfo> streams;
     for (const auto& info : m_audioStreams) {
-        if (std::find(m_adtsConvertibleAudioStreams.begin(),
+        if (!info.latm &&
+            std::find(m_adtsConvertibleAudioStreams.begin(),
                       m_adtsConvertibleAudioStreams.end(),
                       info.streamIndex) != m_adtsConvertibleAudioStreams.end()) {
             streams.push_back(info);
         }
     }
+    return streams;
+}
+
+std::vector<CFilterDemuxerHandler::AudioStreamInfo> CFilterDemuxerHandler::getPlayableAudioStreams() const
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    std::vector<AudioStreamInfo> streams;
+
+    for (const auto& info : m_audioStreams) {
+        if (!info.latm &&
+            std::find(m_adtsConvertibleAudioStreams.begin(),
+                      m_adtsConvertibleAudioStreams.end(),
+                      info.streamIndex) != m_adtsConvertibleAudioStreams.end()) {
+            streams.push_back(info);
+        }
+    }
+
+    for (const auto& info : m_audioStreams) {
+        if (info.latm)
+            streams.push_back(info);
+    }
+
     return streams;
 }
 
@@ -412,7 +501,19 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
     if (!shouldProcessAudioStream(streamIndex))
         return;
 
-    // Convert LOAS/LATM → ADTS
+    if (stream.is22_2chAudio()) {
+        rememberLatmConfig(streamIndex, mfu.data.data(), mfu.data.size());
+
+        long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);
+        long long dts = toRefTime(static_cast<int64_t>(mfu.dts), stream);
+
+        m_audioCallback(streamIndex,
+                        false, pts, dts, mfu.isFirstFragment, mfu.isLastFragment,
+                        mfu.data.data(), mfu.data.size());
+        return;
+    }
+
+    // Convert LOAS/LATM → ADTS for ordinary AAC streams.
     std::vector<uint8_t> adts;
     if (!m_adtsConverter.convert(mfu.data.data(), mfu.data.size(), adts) || adts.empty()) {
         static volatile LONG s_audioConvertFails = 0;

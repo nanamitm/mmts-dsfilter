@@ -2,6 +2,7 @@
 #include <functional>
 #include <vector>
 #include <mutex>
+#include <cstdint>
 #include "demuxerHandler.h"
 #include "adtsConverter.h"
 
@@ -16,6 +17,9 @@ public:
         uint16_t packetId{0};
         int componentTag{-1};
         uint32_t samplingRate{0};
+        uint16_t channels{2};
+        bool latm{false};
+        std::vector<uint8_t> extraData;
     };
 
     struct SubtitleStreamInfo {
@@ -51,6 +55,7 @@ public:
     void setKnownAudioStreams(const std::vector<AudioStreamInfo>& streams);
     void setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams);
     std::vector<AudioStreamInfo> getAdtsConvertibleAudioStreams() const;
+    std::vector<AudioStreamInfo> getPlayableAudioStreams() const;
     void setRequireAdtsConvertibleAudio(bool require);
     void setAudioStreamListLocked(bool locked);
     int getSelectedAudioStreamIndex() const;
@@ -59,6 +64,7 @@ public:
 private:
     long long toRefTime(int64_t pts, const MmtTlv::MmtStream& stream);
     void rememberAudioStream(const MmtTlv::MmtStream& stream);
+    void rememberLatmConfig(int streamIndex, const uint8_t* data, size_t size);
     void rememberAdtsConvertibleAudioStream(int streamIndex);
     void rememberSubtitleStream(const MmtTlv::MmtStream& stream);
     bool shouldProcessAudioStream(int streamIndex) const;

@@ -12,6 +12,10 @@ AAC audio streams as DirectShow output pins.
 - Registers `.mmts` as a DirectShow source filter extension.
 - Exposes HEVC video output.
 - Exposes each MPT `mp4a` audio stream as a separate audio output pin.
+- Outputs ordinary AAC streams as ADTS/`MEDIASUBTYPE_RAW_AAC1`.
+- Outputs 22.2ch audio streams as AAC LATM/LOAS using
+  `MEDIASUBTYPE_MPEG_LOAS` / `WAVE_FORMAT_MPEG_LOAS` (`0x1602`) for LAV Audio
+  Decoder.
 - Supports DirectShow seeking through `IMediaSeeking`.
 - Queues downstream delivery to avoid renderer/decoder blocking the demuxer.
 - Starts playback and seek recovery from HEVC RAP/IRAP frames.
@@ -111,6 +115,24 @@ Essential lifecycle logs are emitted in all builds through `OutputDebugString`.
 Verbose sample delivery, subtitle layout, TTML lookahead, and per-stream probe
 logs are emitted only in Debug builds. Define `MMT_TLV_VERBOSE_LOG` for Release
 builds if detailed logs are needed temporarily.
+
+## Audio Notes
+
+The splitter keeps one DirectShow audio output pin per playable audio stream so
+MPC-BE can switch tracks normally. For 8K broadcasts, 22.2ch audio is carried as
+AAC LATM/LOAS rather than the ADTS form used for ordinary AAC tracks. These
+LATM streams are passed through without ADTS conversion and are advertised as:
+
+```text
+majortype:  MEDIATYPE_Audio
+subtype:    MEDIASUBTYPE_MPEG_LOAS {00001602-0000-0010-8000-00AA00389B71}
+formattype: FORMAT_WaveFormatEx
+wFormatTag: WAVE_FORMAT_MPEG_LOAS (0x1602)
+```
+
+Some downstream filters return failures on non-selected audio branches while
+another audio track is active. The splitter treats those failures as non-fatal
+and continues delivering samples to all connected audio pins.
 
 ## Notes
 

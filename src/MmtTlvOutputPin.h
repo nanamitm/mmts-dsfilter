@@ -51,8 +51,9 @@ public:
 
     // Called by the filter to set stream metadata before connection.
     void SetVideoInfo(int width, int height) { m_width = width; m_height = height; }
-    void SetAudioInfo(int sampleRate, int channels, int bitdepth = 16)
-        { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; }
+    void SetAudioInfo(int sampleRate, int channels, int bitdepth = 16, bool latm = false,
+                      const std::vector<uint8_t>& extraData = {})
+        { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; m_audioLatm = latm; m_audioExtraData = extraData; }
     void SetHevcExtradata(const std::vector<uint8_t>& extra) { m_hevcExtradata = extra; }
     void SetTrackName(const std::wstring& name) { m_trackName = name; }
 
@@ -112,6 +113,8 @@ private:
     int m_sampleRate{48000};
     int m_channels{2};
     int m_bitdepth{16};
+    bool m_audioLatm{false};
+    std::vector<uint8_t> m_audioExtraData;
     std::wstring m_trackName;
 
     // Fragment accumulation buffer
