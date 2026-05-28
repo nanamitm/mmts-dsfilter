@@ -21,9 +21,18 @@ function Get-PowerShellExe {
     return "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 }
 
-if (-not $FilterPath) {
+function Resolve-DefaultFilterPath {
+    $bundledPath = Join-Path $PSScriptRoot "mmts-dsfilter.ax"
+    if (Test-Path -LiteralPath $bundledPath) {
+        return $bundledPath
+    }
+
     $repoRoot = Split-Path -Parent $PSScriptRoot
-    $FilterPath = Join-Path $repoRoot "msvc\x64\$Configuration\mmts-dsfilter.ax"
+    return Join-Path $repoRoot "msvc\x64\$Configuration\mmts-dsfilter.ax"
+}
+
+if (-not $FilterPath) {
+    $FilterPath = Resolve-DefaultFilterPath
 }
 
 $FilterPath = [IO.Path]::GetFullPath($FilterPath)

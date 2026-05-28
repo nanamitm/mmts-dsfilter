@@ -73,6 +73,19 @@ msvc\x64\<Configuration>\mmts-dsfilter.ax
 
 The helper scripts automatically elevate to administrator rights when needed.
 
+For release packages where the scripts are placed next to
+`mmts-dsfilter.ax`, run them without arguments:
+
+```powershell
+.\register-filter.ps1
+```
+
+To unregister from the same package folder:
+
+```powershell
+.\unregister-filter.ps1
+```
+
 To register a Release build:
 
 ```powershell
