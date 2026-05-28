@@ -1,8 +1,8 @@
 #include "MmtTlvOutputPin.h"
+#include "DebugLog.h"
 #include "MmtTlvSplitter.h"
 #include "Guids.h"
 #include <dvdmedia.h>   // VIDEOINFOHEADER2
-#include <strsafe.h>
 
 struct SUBTITLEINFO {
     DWORD dwOffset;
@@ -10,15 +10,8 @@ struct SUBTITLEINFO {
     WCHAR TrackName[256];
 };
 
-static void LogPinMsg(const WCHAR* format, ...)
-{
-    WCHAR buf[512];
-    va_list args;
-    va_start(args, format);
-    StringCchVPrintfW(buf, ARRAYSIZE(buf), format, args);
-    va_end(args);
-    OutputDebugStringW(buf);
-}
+#define LogPinMsg MmtTlvLogInfo
+#define LogPinDetail MmtTlvLogDebug
 
 static bool IsHevcRapNal(uint8_t nalType)
 {
@@ -80,7 +73,7 @@ STDMETHODIMP CMmtTlvOutputPin::NonDelegatingQueryInterface(REFIID riid, void** p
     if (riid == IID_IMediaSeeking)
         return GetInterface(static_cast<IMediaSeeking*>(this), ppv);
     if (riid == IID_IAMStreamSelect) {
-        LogPinMsg(L"MMT/TLV %s pin QI for IAMStreamSelect\n", m_isVideo ? L"Video" : L"Audio");
+        LogPinDetail(L"MMT/TLV %s pin QI for IAMStreamSelect\n", m_isVideo ? L"Video" : L"Audio");
         return GetInterface(static_cast<IAMStreamSelect*>(this), ppv);
     }
     return CBaseOutputPin::NonDelegatingQueryInterface(riid, ppv);
@@ -155,7 +148,7 @@ void CMmtTlvOutputPin::ResetForSeek()
         m_videoFirstPts = -1;
         m_videoLastPts = -1;
     }
-    LogPinMsg(L"MMT/TLV %s ResetForSeek\n", m_isVideo ? L"Video" : L"Audio");
+    LogPinDetail(L"MMT/TLV %s ResetForSeek\n", m_isVideo ? L"Video" : L"Audio");
 }
 
 void CMmtTlvOutputPin::SetWaitForVideoRap(bool wait)
@@ -337,7 +330,7 @@ HRESULT CMmtTlvOutputPin::Active()
         }
     }
 
-    LogPinMsg(L"MMT/TLV %s pin Active: queued delivery %s\n",
+    LogPinDetail(L"MMT/TLV %s pin Active: queued delivery %s\n",
               PinKindName(m_kind),
               m_pQueue ? L"enabled" : L"disabled");
     return S_OK;
@@ -433,7 +426,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     if (m_isVideo && m_waitForVideoRap && !m_accumKey) {
         LONG dropped = ++m_droppedUntilRap;
         if (dropped <= 5 || (dropped % 10) == 0) {
-            LogPinMsg(L"MMT/TLV Video dropping non-RAP while waiting for RAP #%ld: size=%zu, pts=%I64d ms, dts=%I64d ms\n",
+            LogPinDetail(L"MMT/TLV Video dropping non-RAP while waiting for RAP #%ld: size=%zu, pts=%I64d ms, dts=%I64d ms\n",
                       dropped, m_accum.size(), m_accumPts / 10000, m_accumDts / 10000);
         }
         m_accum.clear();
@@ -444,7 +437,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     }
 
     if (m_isVideo && m_waitForVideoRap && m_accumKey) {
-        LogPinMsg(L"MMT/TLV Video RAP reached: dropped=%ld, pts=%I64d ms, dts=%I64d ms\n",
+        LogPinDetail(L"MMT/TLV Video RAP reached: dropped=%ld, pts=%I64d ms, dts=%I64d ms\n",
                   m_droppedUntilRap, m_accumPts / 10000, m_accumDts / 10000);
         m_waitForVideoRap = false;
         Filter()->NotifyVideoRap(m_accumPts);
@@ -453,7 +446,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     if (!m_isVideo && Filter()->IsWaitingForVideoRap()) {
         LONG dropped = ++m_droppedUntilRap;
         if (dropped <= 5 || (dropped % 30) == 0) {
-            LogPinMsg(L"MMT/TLV Audio dropping while waiting for video RAP #%ld: size=%zu, pts=%I64d ms, dts=%I64d ms\n",
+            LogPinDetail(L"MMT/TLV Audio dropping while waiting for video RAP #%ld: size=%zu, pts=%I64d ms, dts=%I64d ms\n",
                       dropped, m_accum.size(), m_accumPts / 10000, m_accumDts / 10000);
         }
         m_accum.clear();
@@ -468,7 +461,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         if (m_accumPts >= 0 && m_accumPts < timeOffset) {
             LONG dropped = ++m_droppedBeforeSegment;
             if (dropped <= 5 || (dropped % 30) == 0) {
-                LogPinMsg(L"MMT/TLV %s dropping pre-segment sample #%ld: pts=%I64d ms, offset=%I64d ms, size=%zu\n",
+                LogPinDetail(L"MMT/TLV %s dropping pre-segment sample #%ld: pts=%I64d ms, offset=%I64d ms, size=%zu\n",
                           IsVideo() ? L"Video" : (IsAudio() ? L"Audio" : L"Subtitle"),
                           dropped,
                           m_accumPts / 10000,
@@ -563,7 +556,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     m_logNextSample = false;
     if (forceLog || sampleNo <= 10 || (sampleNo % 100) == 0 || bufferMs >= 20 || deliverMs >= 20 || FAILED(hr)) {
         if (m_isVideo) {
-            LogPinMsg(L"MMT/TLV Video DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms, frameStep=%I64d ms, drift=%I64d ms\n",
+            LogPinDetail(L"MMT/TLV Video DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms, frameStep=%I64d ms, drift=%I64d ms\n",
                       sampleNo,
                       hr,
                       m_accum.size(),
@@ -576,7 +569,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
                       videoFrameStepMs,
                       videoDriftMs);
         } else {
-            LogPinMsg(L"MMT/TLV Audio DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms\n",
+            LogPinDetail(L"MMT/TLV Audio DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms\n",
                       sampleNo,
                       hr,
                       m_accum.size(),
@@ -645,7 +638,7 @@ HRESULT CMmtTlvOutputPin::DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME
         } else {
             preview = L"<utf8-convert-failed>";
         }
-        LogPinMsg(L"MMT/TLV Subtitle DeliverTextSample #%ld: hr=0x%08X, size=%zu, start=%I64d ms, stop=%I64d ms, text=\"%s\"\n",
+        LogPinDetail(L"MMT/TLV Subtitle DeliverTextSample #%ld: hr=0x%08X, size=%zu, start=%I64d ms, stop=%I64d ms, text=\"%s\"\n",
                   sampleNo, hr, size, start / 10000, stop / 10000, preview.c_str());
     }
     return hr;

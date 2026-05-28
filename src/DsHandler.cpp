@@ -1,4 +1,5 @@
 #include "DsHandler.h"
+#include "DebugLog.h"
 #include "mmtStream.h"
 #include "mpt.h"
 #include "mmtDescriptors.h"
@@ -6,18 +7,10 @@
 #include "mhAudioComponentDescriptor.h"
 #include "mpuProcessorBase.h"  // NOPTS_VALUE
 #include <windows.h>
-#include <strsafe.h>
 #include <algorithm>
 
-static void LogMsg(const WCHAR* format, ...)
-{
-    WCHAR buf[512];
-    va_list args;
-    va_start(args, format);
-    StringCchVPrintfW(buf, ARRAYSIZE(buf), format, args);
-    va_end(args);
-    OutputDebugStringW(buf);
-}
+#define LogMsg MmtTlvLogInfo
+#define LogDetail MmtTlvLogDebug
 
 long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream& stream)
 {
@@ -64,7 +57,7 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
     info.componentTag = stream.getComponentTag();
     info.samplingRate = stream.getSamplingRate();
     m_audioStreams.push_back(info);
-    LogMsg(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
+    LogDetail(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
            info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
 }
 
@@ -89,7 +82,7 @@ void CFilterDemuxerHandler::rememberAdtsConvertibleAudioStream(int streamIndex)
                   m_adtsConvertibleAudioStreams.end(),
                   streamIndex) == m_adtsConvertibleAudioStreams.end()) {
         m_adtsConvertibleAudioStreams.push_back(streamIndex);
-        LogMsg(L"MMT/TLV Audio ADTS conversion available: streamIndex=%d\n", streamIndex);
+        LogDetail(L"MMT/TLV Audio ADTS conversion available: streamIndex=%d\n", streamIndex);
     }
 }
 
@@ -104,7 +97,7 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
     if (it != m_subtitleStreams.end()) {
         if (!it->hasData) {
             it->hasData = true;
-            LogMsg(L"MMT/TLV Subtitle data seen streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
+            LogDetail(L"MMT/TLV Subtitle data seen streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
                    it->streamIndex, it->packetId, it->componentTag);
         }
         return;
@@ -116,7 +109,7 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
     info.componentTag = stream.getComponentTag();
     info.hasData = true;
     m_subtitleStreams.push_back(info);
-    LogMsg(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, data=1\n",
+    LogDetail(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, data=1\n",
            info.streamIndex, info.packetId, info.componentTag);
 }
 
@@ -218,7 +211,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 }
             }
             if (missing) {
-                LogMsg(L"MMT/TLV Audio MPT changed after pin creation; keeping PreScan audio list (%zu stream(s))\n",
+                LogDetail(L"MMT/TLV Audio MPT changed after pin creation; keeping PreScan audio list (%zu stream(s))\n",
                        m_audioStreams.size());
             }
             return;
@@ -248,7 +241,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                    m_primaryAudioStreamIndex);
             for (size_t i = 0; i < m_audioStreams.size(); ++i) {
                 const auto& info = m_audioStreams[i];
-                LogMsg(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
+                LogDetail(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u\n",
                        i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate);
             }
         }
@@ -284,7 +277,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                    static_cast<unsigned>(mpt.assets.size()), m_subtitleStreams.size());
             for (size_t i = 0; i < m_subtitleStreams.size(); ++i) {
                 const auto& info = m_subtitleStreams[i];
-                LogMsg(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
+                LogDetail(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
                        i, info.streamIndex, info.packetId, info.componentTag, info.hasData ? 1 : 0);
             }
         }
@@ -437,7 +430,7 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
                 cursor += used;
                 remaining -= used;
             }
-            LogMsg(L"MMT/TLV Audio ADTS convert failed #%ld: streamIndex=%d, packetId=0x%04X, size=%zu, samplingRate=%u, firstBytes=%s\n",
+            LogDetail(L"MMT/TLV Audio ADTS convert failed #%ld: streamIndex=%d, packetId=0x%04X, size=%zu, samplingRate=%u, firstBytes=%s\n",
                    failNo,
                    static_cast<int>(stream.getStreamIndex()),
                    stream.getPacketId(),

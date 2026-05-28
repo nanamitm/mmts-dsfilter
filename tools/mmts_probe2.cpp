@@ -18,6 +18,7 @@
 #include "mpuProcessorBase.h"  // NOPTS_VALUE, MfuData
 #include "stream.h"
 #include "timebase.h"
+#include "ttml.h"
 
 using namespace MmtTlv;
 
@@ -46,6 +47,20 @@ public:
         uint16_t    numOfAuErrors = 0;
     };
     std::map<int, StreamInfo> streams;
+    int subtitleSamples = 0;
+
+    static bool getLengthPair(const std::optional<TTMLCssValuePair>& pair, double& x, double& y)
+    {
+        if (!pair.has_value())
+            return false;
+        try {
+            x = pair->first.getValue<TTMLCssValueLength>().value;
+            y = pair->second.getValue<TTMLCssValueLength>().value;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
 
     void onVideoData(const MmtStream& stream, const MfuData& mfu) override {
         auto& st = streams[mfu.streamIndex];
@@ -92,6 +107,55 @@ public:
                 if (ms > st.lastPtsMs) st.lastPtsMs = ms;
             }
         }
+    }
+
+    void onSubtitleData(const MmtStream& stream, const MfuData& mfu) override {
+        auto& st = streams[mfu.streamIndex];
+        st.type = "Subtitle";
+        st.frameCount++;
+
+        if (subtitleSamples >= 8)
+            return;
+        ++subtitleSamples;
+
+        std::string xml(mfu.data.begin(), mfu.data.end());
+        TTML ttml = TTMLPaser::parse(xml);
+
+        double maxOriginX = 0, maxOriginY = 0, maxExtentX = 0, maxExtentY = 0;
+        double maxFontX = 0, maxFontY = 0;
+        size_t divs = 0, paragraphs = 0, spans = 0;
+        printf("  [Subtitle TTML #%d] streamIndex=%d bytes=%zu\n",
+               subtitleSamples, mfu.streamIndex, mfu.data.size());
+
+        for (const auto& div : ttml.divTags) {
+            ++divs;
+            for (const auto& p : div.pTags) {
+                ++paragraphs;
+                double x = 0, y = 0;
+                if (getLengthPair(p.region.origin, x, y)) {
+                    maxOriginX = std::max(maxOriginX, x);
+                    maxOriginY = std::max(maxOriginY, y);
+                }
+                if (getLengthPair(p.region.extent, x, y)) {
+                    maxExtentX = std::max(maxExtentX, x);
+                    maxExtentY = std::max(maxExtentY, y);
+                }
+                for (const auto& span : p.spanTags) {
+                    ++spans;
+                    if (getLengthPair(span.style.fontSize, x, y)) {
+                        maxFontX = std::max(maxFontX, x);
+                        maxFontY = std::max(maxFontY, y);
+                    }
+                }
+            }
+        }
+
+        printf("    divs=%zu p=%zu spans=%zu maxOrigin=%.1f,%.1f maxExtent=%.1f,%.1f maxFont=%.1f,%.1f\n",
+               divs, paragraphs, spans, maxOriginX, maxOriginY, maxExtentX, maxExtentY,
+               maxFontX, maxFontY);
+        printf("    coordinateGuess=%s\n",
+               (maxOriginX > 3840 || maxOriginY > 2160 || maxExtentX > 3840 || maxExtentY > 2160 ||
+                maxFontX > 144 || maxFontY > 144) ? "possibly 8K/native" : "4K-logical-like");
     }
 
     void print(const char* label) const {

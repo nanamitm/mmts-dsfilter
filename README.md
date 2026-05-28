@@ -22,6 +22,7 @@ AAC audio streams as DirectShow output pins.
 src/          Filter implementation
 msvc/         Visual Studio project and module definition
 tools/        Local probe/debug helper sources
+scripts/      Registration helper scripts
 baseclasses/  DirectShow BaseClasses copy from Microsoft samples
 ```
 
@@ -66,7 +67,33 @@ msvc\x64\<Configuration>\mmts-dsfilter.ax
 
 ## Register
 
-Run from an elevated command prompt:
+The helper scripts automatically elevate to administrator rights when needed.
+
+To register a Release build:
+
+```powershell
+.\scripts\register-filter.ps1 -Configuration Release
+```
+
+To register a Debug build:
+
+```powershell
+.\scripts\register-filter.ps1 -Configuration Debug
+```
+
+To unregister:
+
+```powershell
+.\scripts\unregister-filter.ps1 -Configuration Release
+```
+
+You can also pass an explicit `.ax` path:
+
+```powershell
+.\scripts\register-filter.ps1 -FilterPath .\msvc\x64\Debug\mmts-dsfilter.ax
+```
+
+Manual registration is also possible from an elevated command prompt:
 
 ```cmd
 regsvr32 msvc\x64\Debug\mmts-dsfilter.ax
@@ -77,6 +104,13 @@ To unregister:
 ```cmd
 regsvr32 /u msvc\x64\Debug\mmts-dsfilter.ax
 ```
+
+## Debug Logging
+
+Essential lifecycle logs are emitted in all builds through `OutputDebugString`.
+Verbose sample delivery, subtitle layout, TTML lookahead, and per-stream probe
+logs are emitted only in Debug builds. Define `MMT_TLV_VERBOSE_LOG` for Release
+builds if detailed logs are needed temporarily.
 
 ## Notes
 
