@@ -96,55 +96,26 @@ repository.
 
 ## Register
 
-The helper scripts automatically elevate to administrator rights when needed.
+> **Administrator privileges are required.**
 
-For release packages where the scripts are placed next to
-`mmts-dsfilter.ax`, run them without arguments:
+From a release package, right-click each script and choose
+**Run with PowerShell as administrator**:
 
-```powershell
-.\register-filter.ps1
-```
+- `register-filter.ps1` — registers the filter
+- `unregister-filter.ps1` — unregisters the filter
 
-To unregister from the same package folder:
+`regsvr32` will show a dialog confirming success or failure.
 
-```powershell
-.\unregister-filter.ps1
-```
-
-To register a Release build:
-
-```powershell
-.\scripts\register-filter.ps1 -Configuration Release
-```
-
-To register a Debug build:
-
-```powershell
-.\scripts\register-filter.ps1 -Configuration Debug
-```
-
-To unregister:
-
-```powershell
-.\scripts\unregister-filter.ps1 -Configuration Release
-```
-
-You can also pass an explicit `.ax` path:
-
-```powershell
-.\scripts\register-filter.ps1 -FilterPath .\msvc\x64\Debug\mmts-dsfilter.ax
-```
-
-Manual registration is also possible from an elevated command prompt:
+For a development build, use an elevated command prompt:
 
 ```cmd
-regsvr32 msvc\x64\Debug\mmts-dsfilter.ax
+regsvr32 msvc\x64\Release\mmts-dsfilter.ax
 ```
 
 To unregister:
 
 ```cmd
-regsvr32 /u msvc\x64\Debug\mmts-dsfilter.ax
+regsvr32 /u msvc\x64\Release\mmts-dsfilter.ax
 ```
 
 ## Debug Logging
