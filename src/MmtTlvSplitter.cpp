@@ -17,6 +17,8 @@
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
+static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuration;
+static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 
@@ -1057,6 +1059,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_subtitleTimeOffset.store(-1, std::memory_order_release);
     m_demuxByteOffset.store(0, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
+    ClearPendingSubtitleCues();
 
     LogMsg(L"MMT/TLV Splitter: Load called for %s\n", pszFileName);
 
@@ -1518,6 +1521,7 @@ void CMmtTlvSplitter::CreatePins()
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
+            PumpPendingSubtitleChunks(samplePts);
             videoPin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
         });
 
@@ -1592,6 +1596,7 @@ void CMmtTlvSplitter::CreatePins()
 
             REFERENCE_TIME sampleStart;
             REFERENCE_TIME sampleStop;
+            bool repeatUntilNextCue = false;
             if (cue.hasBegin) {
                 REFERENCE_TIME subtitleTimeOffset = m_subtitleTimeOffset.load(std::memory_order_acquire);
                 if (subtitleTimeOffset < 0) {
@@ -1622,16 +1627,17 @@ void CMmtTlvSplitter::CreatePins()
                     if (FindNextSubtitleBegin(streamIndex, cue.begin, lookaheadOffset, nextBegin)) {
                         sampleStop = nextBegin - subtitleTimeOffset;
                         LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d\n",
-                               streamIndex,
-                               cue.begin / 10000,
-                               nextBegin / 10000,
-                               lookaheadOffset);
+                                  streamIndex,
+                                  cue.begin / 10000,
+                                  nextBegin / 10000,
+                                  lookaheadOffset);
                     } else {
-                        sampleStop = sampleStart + kDefaultSubtitleDuration;
-                        LogDetail(L"SUBTITLE lookahead miss: streamIndex=%d, current=%I64d ms, byte=%I64d\n",
-                               streamIndex,
-                               cue.begin / 10000,
-                               lookaheadOffset);
+                        sampleStop = sampleStart + kSubtitleChunkDuration;
+                        repeatUntilNextCue = true;
+                        LogDetail(L"SUBTITLE lookahead miss, pending chunk: streamIndex=%d, current=%I64d ms, byte=%I64d\n",
+                                  streamIndex,
+                                  cue.begin / 10000,
+                                  lookaheadOffset);
                     }
                 }
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
@@ -1643,22 +1649,23 @@ void CMmtTlvSplitter::CreatePins()
             if (sampleStop <= sampleStart)
                 sampleStop = sampleStart + kDefaultSubtitleDuration;
 
-            bool delivered = false;
-            for (auto* pin : m_pins) {
-                if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {
-                    if (!cue.assEvents.empty()) {
-                        for (const auto& sampleText : cue.assEvents) {
-                            pin->DeliverTextSample(sampleStart, sampleStop, sampleText.c_str(), sampleText.size());
-                        }
-                    } else {
-                        pin->DeliverTextSample(sampleStart, sampleStop, cue.assText.c_str(), cue.assText.size());
-                    }
-                    delivered = true;
-                }
-            }
-            if (!delivered) {
-                LogMsg(L"SUBTITLE CALLBACK: no pin for streamIndex=%d, pts=%I64d ms\n",
-                       streamIndex, normPts / 10000);
+            FlushPendingSubtitleCue(streamIndex, sampleStart);
+
+            if (repeatUntilNextCue) {
+                PendingSubtitleCue pending;
+                pending.streamIndex = streamIndex;
+                pending.start = sampleStart;
+                pending.nextChunkStart = sampleStart;
+                pending.assEvents = cue.assEvents;
+                pending.assText = cue.assText;
+                m_pendingSubtitleCues.push_back(std::move(pending));
+                LogDetail(L"SUBTITLE pending open: streamIndex=%d, start=%I64d ms, firstDeadline=%I64d ms, chunkStop=%I64d ms\n",
+                          streamIndex,
+                          sampleStart / 10000,
+                          (sampleStart + kSubtitleInitialDelay) / 10000,
+                          sampleStop / 10000);
+            } else {
+                DeliverSubtitleCue(streamIndex, sampleStart, sampleStop, cue.assEvents, cue.assText);
             }
         });
 
@@ -1761,6 +1768,109 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
     return found;
 }
 
+void CMmtTlvSplitter::ClearPendingSubtitleCues()
+{
+    m_pendingSubtitleCues.clear();
+}
+
+void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME stopTime)
+{
+    for (auto it = m_pendingSubtitleCues.begin(); it != m_pendingSubtitleCues.end();) {
+        if (it->streamIndex != streamIndex) {
+            ++it;
+            continue;
+        }
+
+        if (stopTime > it->nextChunkStart) {
+            DeliverSubtitleCue(it->streamIndex, it->nextChunkStart, stopTime,
+                               it->assEvents, it->assText);
+            LogDetail(L"SUBTITLE pending close deliver: streamIndex=%d, start=%I64d ms, stop=%I64d ms\n",
+                      streamIndex,
+                      it->nextChunkStart / 10000,
+                      stopTime / 10000);
+        } else {
+            LogDetail(L"SUBTITLE pending closed: streamIndex=%d, stop=%I64d ms, next=%I64d ms\n",
+                      streamIndex,
+                      stopTime / 10000,
+                      it->nextChunkStart / 10000);
+        }
+        it = m_pendingSubtitleCues.erase(it);
+    }
+}
+
+void CMmtTlvSplitter::FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime)
+{
+    for (const auto& cue : m_pendingSubtitleCues) {
+        if (stopTime > cue.nextChunkStart) {
+            DeliverSubtitleCue(cue.streamIndex, cue.nextChunkStart, stopTime,
+                               cue.assEvents, cue.assText);
+            LogDetail(L"SUBTITLE pending final deliver: streamIndex=%d, start=%I64d ms, stop=%I64d ms\n",
+                      cue.streamIndex,
+                      cue.nextChunkStart / 10000,
+                      stopTime / 10000);
+        }
+    }
+    m_pendingSubtitleCues.clear();
+}
+
+void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
+{
+    if (currentTime < 0 || m_pendingSubtitleCues.empty())
+        return;
+
+    for (auto& cue : m_pendingSubtitleCues) {
+        if (cue.nextChunkStart == cue.start) {
+            if (cue.start + kSubtitleInitialDelay > currentTime)
+                continue;
+
+            REFERENCE_TIME chunkStart = cue.start;
+            REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
+            DeliverSubtitleCue(cue.streamIndex, chunkStart, chunkStop, cue.assEvents, cue.assText);
+            cue.nextChunkStart = chunkStop;
+            LogDetail(L"SUBTITLE pending first: streamIndex=%d, start=%I64d ms, stop=%I64d ms, current=%I64d ms\n",
+                      cue.streamIndex,
+                      chunkStart / 10000,
+                      chunkStop / 10000,
+                      currentTime / 10000);
+        }
+
+        while (cue.nextChunkStart + kSubtitleChunkDuration <= currentTime) {
+            REFERENCE_TIME chunkStart = cue.nextChunkStart;
+            REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
+            DeliverSubtitleCue(cue.streamIndex, chunkStart, chunkStop, cue.assEvents, cue.assText);
+            cue.nextChunkStart = chunkStop;
+            LogDetail(L"SUBTITLE pending repeat: streamIndex=%d, start=%I64d ms, stop=%I64d ms, current=%I64d ms\n",
+                      cue.streamIndex,
+                      chunkStart / 10000,
+                      chunkStop / 10000,
+                      currentTime / 10000);
+        }
+    }
+}
+
+void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, REFERENCE_TIME stop,
+                                         const std::vector<std::string>& assEvents,
+                                         const std::string& assText)
+{
+    bool delivered = false;
+    for (auto* pin : m_pins) {
+        if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {
+            if (!assEvents.empty()) {
+                for (const auto& sampleText : assEvents) {
+                    pin->DeliverTextSample(start, stop, sampleText.c_str(), sampleText.size());
+                }
+            } else {
+                pin->DeliverTextSample(start, stop, assText.c_str(), assText.size());
+            }
+            delivered = true;
+        }
+    }
+    if (!delivered) {
+        LogMsg(L"SUBTITLE CALLBACK: no pin for streamIndex=%d, start=%I64d ms\n",
+               streamIndex, start / 10000);
+    }
+}
+
 int CMmtTlvSplitter::GetPinCount()
 {
     CAutoLock lock(&m_pinLock);
@@ -1846,6 +1956,7 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
 
     m_seekTarget = pos;
     m_currentPts = pos;   // normalised position (0-based)
+    ClearPendingSubtitleCues();
 
     // Keep stream registration intact across seek so video starts faster.
     m_demuxer.resetStreams();
@@ -1879,6 +1990,7 @@ void CMmtTlvSplitter::DemuxLoop()
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
     m_subtitleTimeOffset.store(-1, std::memory_order_release);
+    ClearPendingSubtitleCues();
     const bool waitForRap = seekTarget > 0;
     m_waitingForVideoRap.store(waitForRap, std::memory_order_release);
     for (auto* pin : m_pins) {
@@ -1955,6 +2067,7 @@ void CMmtTlvSplitter::DemuxLoop()
     }
 
     if (!m_isSeeking) {
+        FlushAllPendingSubtitleCues(m_currentPts.load(std::memory_order_relaxed));
         for (auto* pin : m_pins)
             pin->DeliverEOS();
     }

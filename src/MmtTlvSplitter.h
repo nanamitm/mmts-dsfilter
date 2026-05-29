@@ -83,6 +83,13 @@ private:
     void DemuxLoop();
     bool FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME currentBegin,
                                long long startOffset, REFERENCE_TIME& nextBegin) const;
+    void ClearPendingSubtitleCues();
+    void FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME stopTime);
+    void FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime);
+    void PumpPendingSubtitleChunks(REFERENCE_TIME currentTime);
+    void DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, REFERENCE_TIME stop,
+                            const std::vector<std::string>& assEvents,
+                            const std::string& assText);
 
     CCritSec m_pinLock;
     std::vector<CMmtTlvOutputPin*> m_pins;
@@ -114,4 +121,13 @@ private:
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
     std::atomic<REFERENCE_TIME> m_subtitleTimeOffset{-1};
     std::atomic<long long> m_demuxByteOffset{0};
+
+    struct PendingSubtitleCue {
+        int streamIndex = -1;
+        REFERENCE_TIME start = 0;
+        REFERENCE_TIME nextChunkStart = 0;
+        std::vector<std::string> assEvents;
+        std::string assText;
+    };
+    std::vector<PendingSubtitleCue> m_pendingSubtitleCues;
 };
