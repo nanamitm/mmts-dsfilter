@@ -136,8 +136,8 @@ DelayMs=0
 
 Generated ASS subtitles use ARIB/TTML cell positions per character so changing
 the selected font does not move later characters on the line. `FontName`,
-`CaptionTransparency`, `OutlineWidth`, and `DelayMs` are applied now.
-Background settings are read and reserved for the background rectangle mode.
+`CaptionTransparency`, `BackgroundTransparency`, `ShowBackground`,
+`OutlineWidth`, and `DelayMs` are applied now.
 
 ## Debug Logging
 

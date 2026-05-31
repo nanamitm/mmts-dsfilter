@@ -509,10 +509,74 @@ static std::string WideCharSliceToUtf8(const std::wstring& text, size_t pos, siz
     return utf8;
 }
 
+static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
+                                  uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& assAlpha)
+{
+    r = 0;
+    g = 0;
+    b = 0;
+    bool hasColor = false;
+
+    if (span.style.backgroundColor.has_value()) {
+        try {
+            const TTMLCssValueColor color = span.style.backgroundColor->getValue<TTMLCssValueColor>();
+            r = color.r;
+            g = color.g;
+            b = color.b;
+            if (settings.backgroundAlpha < 0) {
+                if (color.a == 0)
+                    return false;
+                assAlpha = 255 - color.a;
+            }
+            hasColor = true;
+        } catch (const std::bad_variant_access&) {
+        }
+    }
+
+    if (settings.backgroundAlpha >= 0) {
+        if (settings.backgroundAlpha >= 255)
+            return false;
+        assAlpha = static_cast<uint8_t>(settings.backgroundAlpha);
+        return true;
+    }
+
+    return hasColor;
+}
+
+static void AppendAssBackgroundEvent(double xPos, double yPos, double width, double height,
+                                     const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
+                                     std::vector<std::string>& events)
+{
+    if (!settings.showBackground || width <= 0 || height <= 0)
+        return;
+
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    uint8_t assAlpha = 0;
+    if (!GetAssBackgroundColor(span, settings, r, g, b, assAlpha))
+        return;
+
+    const int x1 = static_cast<int>(std::floor(xPos));
+    const int y1 = static_cast<int>(std::floor(yPos));
+    const int x2 = static_cast<int>(std::floor(xPos + width));
+    const int y2 = static_cast<int>(std::floor(yPos + height));
+    if (x1 >= x2 || y1 >= y2)
+        return;
+
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "%zu,0,Default,,0,0,0,,{\\an7\\pos(0,0)\\p1\\1c&H%02X%02X%02X&\\1a&H%02X&}"
+                  "m %d %d l %d %d %d %d %d %d{\\p0}",
+                  events.size(), b, g, r, assAlpha, x1, y1, x2, y1, x2, y2, x1, y2);
+    events.emplace_back(buf);
+}
+
 static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, double extraYAss,
                                       bool hasXOverride, double xOverrideAss,
                                       const MmtsCaptionSettings& settings,
-                                      std::vector<std::string>& events)
+                                      std::vector<std::string>& events,
+                                      bool showBackground)
 {
     double baseX = 960.0;
     double baseY = 980.0;
@@ -535,6 +599,7 @@ static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, doubl
         if (cellWidth <= 0)
             cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
 
+        const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
         const std::string spanTags = BuildAssStyleTags(&span, fontScale, settings);
         const std::wstring wide = Utf8ToWide(span.text);
         for (size_t i = 0; i < wide.size();) {
@@ -556,8 +621,11 @@ static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, doubl
             if (utf8.empty())
                 continue;
 
+            if (showBackground)
+                AppendAssBackgroundEvent(x, y, cellWidth, spanFontSize, span, settings, events);
+
             std::ostringstream ass;
-            ass << events.size() << ",0,Default,,0,0,0,,{"
+            ass << events.size() << ",1,Default,,0,0,0,,{"
                 << BuildAssPositionTagsFromAss(x, y)
                 << spanTags << "}" << EscapeAssText(utf8);
             events.push_back(ass.str());
@@ -713,7 +781,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     }
                     if (wroteLine) {
                         text << "\n";
-                        AppendAssCellLayoutEvents(p, fontScale, 0, false, 0, settings, cue.assEvents);
+                        AppendAssCellLayoutEvents(p, fontScale, 0, false, 0, settings, cue.assEvents, true);
                     }
                 }
             } else {
@@ -747,7 +815,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     }
                     if (wroteLine) {
                         text << "\n";
-                        AppendAssCellLayoutEvents(p, fontScale, extraYAss, false, 0, settings, cue.assEvents);
+                        AppendAssCellLayoutEvents(p, fontScale, extraYAss, false, 0, settings, cue.assEvents, true);
                     }
                 }
             }
@@ -843,7 +911,8 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     AppendAssCellLayoutEvents(p, fontScale, extraYAss,
                                               paragraphHasXOverride[pIndex],
                                               paragraphXOverride[pIndex],
-                                              settings, cue.assEvents);
+                                              settings, cue.assEvents,
+                                              !IsRubyLikeParagraph(p, divMaxFontSize));
                 }
             }
         }
