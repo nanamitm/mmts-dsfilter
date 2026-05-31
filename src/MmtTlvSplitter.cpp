@@ -573,6 +573,70 @@ static void AppendAssBackgroundEvent(double xPos, double yPos, double width, dou
     events.emplace_back(buf);
 }
 
+static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, double extraYAss,
+                                          bool hasXOverride, double xOverrideAss,
+                                          const MmtsCaptionSettings& settings,
+                                          std::vector<std::string>& events)
+{
+    if (!settings.showBackground)
+        return;
+
+    double baseX = 960.0;
+    double baseY = 980.0;
+    if (!ParagraphBasePositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
+        return;
+
+    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
+    const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
+    const double fallbackCellWidth = ParagraphCellWidthAss(p);
+    double x = baseX;
+    double y = baseY;
+
+    for (const auto& span : p.spanTags) {
+        if (span.text.empty())
+            continue;
+
+        double cellWidth = AssCellWidthFromSpan(&span);
+        if (cellWidth <= 0)
+            cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
+
+        const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
+        const std::wstring wide = Utf8ToWide(span.text);
+        bool inRun = false;
+        double runX = x;
+        double runWidth = 0;
+
+        auto flushRun = [&]() {
+            if (!inRun || runWidth <= 0)
+                return;
+            AppendAssBackgroundEvent(runX, y, runWidth, spanFontSize, span, settings, events);
+            inRun = false;
+            runWidth = 0;
+        };
+
+        for (wchar_t ch : wide) {
+            if (ch == L'\r')
+                continue;
+            if (ch == L'\n') {
+                flushRun();
+                x = baseX;
+                y += lineGap;
+                continue;
+            }
+
+            if (!inRun) {
+                inRun = true;
+                runX = x;
+                runWidth = 0;
+            }
+            runWidth += cellWidth;
+            x += cellWidth;
+        }
+        flushRun();
+    }
+}
+
 static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, double extraYAss,
                                       bool hasXOverride, double xOverrideAss,
                                       const MmtsCaptionSettings& settings,
@@ -592,6 +656,9 @@ static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, doubl
     double y = baseY;
     bool wroteEvent = false;
 
+    if (showBackground)
+        AppendAssCellBackgroundEvents(p, fontScale, extraYAss, hasXOverride, xOverrideAss, settings, events);
+
     for (const auto& span : p.spanTags) {
         if (span.text.empty())
             continue;
@@ -600,7 +667,6 @@ static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, doubl
         if (cellWidth <= 0)
             cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
 
-        const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
         const std::string spanTags = BuildAssStyleTags(&span, fontScale, settings);
         const std::wstring wide = Utf8ToWide(span.text);
         for (size_t i = 0; i < wide.size();) {
@@ -621,9 +687,6 @@ static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, doubl
             i = next;
             if (utf8.empty())
                 continue;
-
-            if (showBackground)
-                AppendAssBackgroundEvent(x, y, cellWidth, spanFontSize, span, settings, events);
 
             std::ostringstream ass;
             ass << events.size() << ",1,Default,,0,0,0,,{"
