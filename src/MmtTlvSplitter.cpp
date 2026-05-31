@@ -12,7 +12,6 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
@@ -100,6 +99,81 @@ struct TtmlTextCue {
     REFERENCE_TIME begin = 0;
     REFERENCE_TIME end = 0;
 };
+
+struct MmtsCaptionSettings {
+    int captionAlpha = 0;       // ASS alpha: 0=opaque, 255=fully transparent
+    int backgroundAlpha = -1;   // reserved for background rectangles
+    bool showBackground = true;
+    int outlineWidth = 0;
+    int delayMs = 0;
+    std::string fontName = "MS Gothic";
+};
+
+static void GetMmtsIniPath(WCHAR* iniPath, DWORD size)
+{
+    HMODULE hMod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&GetMmtsIniPath), &hMod);
+    if (!GetModuleFileNameW(hMod, iniPath, size)) {
+        iniPath[0] = L'\0';
+        return;
+    }
+
+    WCHAR* dot = wcsrchr(iniPath, L'.');
+    if (dot)
+        wcscpy_s(dot, size - static_cast<DWORD>(dot - iniPath), L".ini");
+}
+
+static bool ReadIniValue(const WCHAR* iniPath, const WCHAR* section, const WCHAR* key,
+                         WCHAR* buf, DWORD size)
+{
+    return GetPrivateProfileStringW(section, key, L"", buf, size, iniPath) > 0;
+}
+
+static MmtsCaptionSettings GetMmtsCaptionSettings()
+{
+    static MmtsCaptionSettings cached;
+    static DWORD lastLoad = 0;
+    static WCHAR lastPath[MAX_PATH] = {};
+
+    WCHAR iniPath[MAX_PATH] = {};
+    GetMmtsIniPath(iniPath, MAX_PATH);
+
+    DWORD now = GetTickCount();
+    if (lastLoad != 0 && now - lastLoad <= 5000 && wcscmp(lastPath, iniPath) == 0)
+        return cached;
+
+    MmtsCaptionSettings s;
+    WCHAR buf[MAX_PATH] = {};
+
+    if (ReadIniValue(iniPath, L"MMTS", L"CaptionTransparency", buf, ARRAYSIZE(buf))) {
+        int t = (std::max)(0, (std::min)(100, _wtoi(buf)));
+        s.captionAlpha = t * 255 / 100;
+    }
+    if (ReadIniValue(iniPath, L"MMTS", L"BackgroundTransparency", buf, ARRAYSIZE(buf))) {
+        int t = (std::max)(0, (std::min)(100, _wtoi(buf)));
+        s.backgroundAlpha = t * 255 / 100;
+    }
+    if (ReadIniValue(iniPath, L"MMTS", L"ShowBackground", buf, ARRAYSIZE(buf)))
+        s.showBackground = _wtoi(buf) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"OutlineWidth", buf, ARRAYSIZE(buf)))
+        s.outlineWidth = (std::max)(0, (std::min)(10, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"DelayMs", buf, ARRAYSIZE(buf)))
+        s.delayMs = (std::max)(-30000, (std::min)(30000, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"FontName", buf, ARRAYSIZE(buf))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+        if (len > 1) {
+            s.fontName.resize(len - 1);
+            WideCharToMultiByte(CP_UTF8, 0, buf, -1, &s.fontName[0], len, nullptr, nullptr);
+        }
+    }
+
+    cached = s;
+    lastLoad = now;
+    wcscpy_s(lastPath, iniPath);
+    return cached;
+}
 
 static std::string EscapeAssText(const std::string& text);
 
@@ -291,7 +365,21 @@ static int AssFontSizeFromSpan(const TTMLSpanTag* span, double fontScale)
     return (std::max)(1, static_cast<int>(std::lround(BaseAssFontSizeFromSpan(span) * fontScale)));
 }
 
-static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale)
+static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
+{
+    if (!span)
+        return 100;
+
+    float fontWidth = 0;
+    float fontHeight = 0;
+    if (!TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) || fontWidth <= 0 || fontHeight <= 0)
+        return 100;
+
+    return (std::max)(1, static_cast<int>(std::lround(fontWidth * 100.0 / fontHeight)));
+}
+
+static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale,
+                                     const MmtsCaptionSettings& settings)
 {
     std::string tags;
     if (!span)
@@ -301,7 +389,18 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale)
     if (assFontSize > 0) {
         tags += FormatAssTag("\\fs%d", assFontSize);
     }
-    tags += "\\fnMS Gothic\\fsp0";
+    const int scaleX = AssFontScaleXPercentFromSpan(span);
+    if (scaleX != 100)
+        tags += FormatAssTag("\\fscx%d", scaleX);
+    tags += "\\fn" + settings.fontName + "\\fsp0";
+    if (settings.captionAlpha > 0) {
+        char alphaBuf[32];
+        std::snprintf(alphaBuf, sizeof(alphaBuf), "\\1a&H%02X&",
+                      static_cast<unsigned>(settings.captionAlpha));
+        tags += alphaBuf;
+    }
+    if (settings.outlineWidth > 0)
+        tags += FormatAssTag("\\bord%d", settings.outlineWidth);
 
     if (span->style.color.has_value()) {
         try {
@@ -311,13 +410,6 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale)
     }
 
     return tags;
-}
-
-static double EstimateAssCharWidth(wchar_t ch, int fontSize)
-{
-    if ((ch >= 0x20 && ch <= 0x7e) || (ch >= 0xff61 && ch <= 0xff9f))
-        return fontSize * 0.55;
-    return fontSize * 0.95;
 }
 
 static std::wstring Utf8ToWide(const std::string& text)
@@ -331,112 +423,6 @@ static std::wstring Utf8ToWide(const std::string& text)
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
                         wide.data(), chars);
     return wide;
-}
-
-static bool MeasureGdiTextWidth(const std::wstring& text, int fontSize, double& width)
-{
-    if (text.empty() || fontSize <= 0)
-        return false;
-
-    static std::unordered_map<std::wstring, double> cache;
-    std::wstring key = std::to_wstring(fontSize) + L"\n" + text;
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-        width = it->second;
-        return true;
-    }
-
-    HDC hdc = CreateCompatibleDC(nullptr);
-    if (!hdc)
-        return false;
-
-    HFONT font = CreateFontW(-fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Meiryo");
-    if (!font) {
-        DeleteDC(hdc);
-        return false;
-    }
-
-    HGDIOBJ oldFont = SelectObject(hdc, font);
-    SIZE size = {};
-    const BOOL ok = GetTextExtentPoint32W(hdc, text.c_str(), static_cast<int>(text.size()), &size);
-    if (oldFont)
-        SelectObject(hdc, oldFont);
-    DeleteObject(font);
-    DeleteDC(hdc);
-
-    if (!ok)
-        return false;
-
-    width = static_cast<double>(size.cx);
-    cache.emplace(std::move(key), width);
-    return true;
-}
-
-static double EstimateAssHalfLineWidth(const TTMLPTag& p)
-{
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    const int fallbackFontSize = AssFontSizeFromSpan(firstSpan, 1.0);
-    double maxWidth = 0;
-    double currentWidth = 0;
-
-    for (const auto& span : p.spanTags) {
-        const int fontSize = AssFontSizeFromSpan(&span, 1.0);
-        std::wstring wide = Utf8ToWide(span.text);
-        for (wchar_t ch : wide) {
-            if (ch == L'\r')
-                continue;
-            if (ch == L'\n') {
-                maxWidth = (std::max)(maxWidth, currentWidth);
-                currentWidth = 0;
-                continue;
-            }
-            currentWidth += EstimateAssCharWidth(ch, fontSize > 0 ? fontSize : fallbackFontSize);
-        }
-    }
-
-    maxWidth = (std::max)(maxWidth, currentWidth);
-    return maxWidth / 2.0;
-}
-
-static double MeasureAssHalfLineWidth(const TTMLPTag& p)
-{
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    const int fallbackFontSize = AssFontSizeFromSpan(firstSpan, 1.0);
-    double maxWidth = 0;
-    std::wstring currentLine;
-
-    auto finishLine = [&]() {
-        if (currentLine.empty()) {
-            maxWidth = (std::max)(maxWidth, 0.0);
-            return;
-        }
-
-        double lineWidth = 0;
-        if (!MeasureGdiTextWidth(currentLine, fallbackFontSize, lineWidth)) {
-            for (wchar_t ch : currentLine)
-                lineWidth += EstimateAssCharWidth(ch, fallbackFontSize);
-        }
-        maxWidth = (std::max)(maxWidth, lineWidth);
-        currentLine.clear();
-    };
-
-    for (const auto& span : p.spanTags) {
-        std::wstring wide = Utf8ToWide(span.text);
-        for (wchar_t ch : wide) {
-            if (ch == L'\r')
-                continue;
-            if (ch == L'\n') {
-                finishLine();
-                continue;
-            }
-            currentLine.push_back(ch);
-        }
-    }
-    finishLine();
-
-    return maxWidth / 2.0;
 }
 
 static int CountAssTextChars(const TTMLPTag& p)
@@ -477,37 +463,110 @@ static bool ParagraphOriginX(const TTMLPTag& p, float& originX)
     return TryGetLengthPair(p.region.origin, originX, originY);
 }
 
-static const TTMLPTag* SelectAssPositionParagraph(const TTMLDivTag& div)
+static std::string BuildAssPositionTagsFromAss(double xPos, double yPos)
 {
-    const TTMLPTag* selected = nullptr;
-    double selectedWidth = -1;
-
-    for (const auto& p : div.pTags) {
-        const double width = EstimateAssHalfLineWidth(p);
-        if (width > selectedWidth) {
-            selected = &p;
-            selectedWidth = width;
-        }
-    }
-
-    return selected;
+    const int x = static_cast<int>(std::floor(xPos));
+    const int y = static_cast<int>(std::floor(yPos));
+    return std::string("\\an7") +
+           FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
 }
 
-static std::string BuildAssPositionTags(const TTMLPTag& p, double extraYAss,
-                                        bool hasXOverride, double xOverrideAss)
+static bool ParagraphBasePositionAss(const TTMLPTag& p, double extraYAss,
+                                     bool hasXOverride, double xOverrideAss,
+                                     double& xAss, double& yAss)
 {
     float originX = 0;
     float originY = 0;
-    if (TryGetLengthPair(p.region.origin, originX, originY)) {
-        double xPos = hasXOverride ? xOverrideAss : originX * 1920.0 / 3840.0;
-        const double yPos = (originY + B24LineOffsetYFromParagraph(p)) * 1080.0 / 2160.0 + extraYAss;
-        const int x = static_cast<int>(std::lround(xPos));
-        const int y = static_cast<int>(std::lround(yPos));
-        return std::string("\\an7") +
-               FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
+    if (!TryGetLengthPair(p.region.origin, originX, originY))
+        return false;
+
+    xAss = hasXOverride ? xOverrideAss : originX * 1920.0 / 3840.0;
+    yAss = (originY + B24LineOffsetYFromParagraph(p)) * 1080.0 / 2160.0 + extraYAss;
+    return true;
+}
+
+static std::string WideCharSliceToUtf8(const std::wstring& text, size_t pos, size_t& nextPos)
+{
+    nextPos = pos + 1;
+    if (pos >= text.size())
+        return {};
+
+    wchar_t chars[2] = { text[pos], 0 };
+    int charCount = 1;
+    if (chars[0] >= 0xD800 && chars[0] <= 0xDBFF && pos + 1 < text.size() &&
+        text[pos + 1] >= 0xDC00 && text[pos + 1] <= 0xDFFF) {
+        chars[1] = text[pos + 1];
+        charCount = 2;
+        nextPos = pos + 2;
     }
 
-    return "\\an2\\pos(960,980)";
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, chars, charCount, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0)
+        return {};
+
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, chars, charCount, &utf8[0], bytes, nullptr, nullptr);
+    return utf8;
+}
+
+static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, double extraYAss,
+                                      bool hasXOverride, double xOverrideAss,
+                                      const MmtsCaptionSettings& settings,
+                                      std::vector<std::string>& events)
+{
+    double baseX = 960.0;
+    double baseY = 980.0;
+    if (!ParagraphBasePositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
+        return false;
+
+    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
+    const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
+    const double fallbackCellWidth = ParagraphCellWidthAss(p);
+    double x = baseX;
+    double y = baseY;
+    bool wroteEvent = false;
+
+    for (const auto& span : p.spanTags) {
+        if (span.text.empty())
+            continue;
+
+        double cellWidth = AssCellWidthFromSpan(&span);
+        if (cellWidth <= 0)
+            cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
+
+        const std::string spanTags = BuildAssStyleTags(&span, fontScale, settings);
+        const std::wstring wide = Utf8ToWide(span.text);
+        for (size_t i = 0; i < wide.size();) {
+            const wchar_t ch = wide[i];
+            if (ch == L'\r') {
+                ++i;
+                continue;
+            }
+            if (ch == L'\n') {
+                x = baseX;
+                y += lineGap;
+                ++i;
+                continue;
+            }
+
+            size_t next = i + 1;
+            const std::string utf8 = WideCharSliceToUtf8(wide, i, next);
+            i = next;
+            if (utf8.empty())
+                continue;
+
+            std::ostringstream ass;
+            ass << events.size() << ",0,Default,,0,0,0,,{"
+                << BuildAssPositionTagsFromAss(x, y)
+                << spanTags << "}" << EscapeAssText(utf8);
+            events.push_back(ass.str());
+            wroteEvent = true;
+            x += cellWidth;
+        }
+    }
+
+    return wroteEvent;
 }
 
 static bool CalculateRubyCellX(const TTMLPTag& ruby, const TTMLPTag& parent, double& xAss)
@@ -615,6 +674,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
 
     std::string xml(reinterpret_cast<const char*>(data), size);
     TTML ttml = TTMLPaser::parse(xml);
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
     std::ostringstream text;
 
     for (const auto& div : ttml.divTags) {
@@ -638,50 +698,24 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 paragraphs.push_back(&p);
 
             if (paragraphs.size() <= 1) {
-                const TTMLPTag* positionP = SelectAssPositionParagraph(div);
-                const double fontScale = positionP ? AssFontScaleForParagraph(*positionP) : 1.0;
-                std::ostringstream ass;
-                bool wroteAssEvent = false;
-                bool wroteAnyLine = false;
-
-                if (positionP)
-                    LogAssParagraphLayout(*positionP, cue.assEvents.size(), fontScale, 0);
-
                 for (const auto& p : div.pTags) {
                     ++stats.paragraphs;
                     bool wroteLine = false;
-                    bool wroteAssLine = false;
-                    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+                    const double fontScale = AssFontScaleForParagraph(p);
+                    LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, 0);
                     for (const auto& span : p.spanTags) {
                         ++stats.spans;
                         if (!span.text.empty()) {
                             text << span.text;
-                            if (!wroteAssEvent) {
-                                ass << cue.assEvents.size() << ",0,Default,,0,0,0,,{"
-                                    << BuildAssPositionTags(positionP ? *positionP : p, 0, false, 0)
-                                    << BuildAssStyleTags(firstSpan, fontScale)
-                                    << "}";
-                                wroteAssEvent = true;
-                            } else if (!wroteAssLine) {
-                                ass << "\\N";
-                            }
-                            std::string spanTags = BuildAssStyleTags(&span, fontScale);
-                            if (!spanTags.empty())
-                                ass << "{" << spanTags << "}";
-                            ass << EscapeAssText(span.text);
                             stats.textBytes += span.text.size();
                             wroteLine = true;
-                            wroteAssLine = true;
                         }
                     }
                     if (wroteLine) {
                         text << "\n";
-                        wroteAnyLine = true;
+                        AppendAssCellLayoutEvents(p, fontScale, 0, false, 0, settings, cue.assEvents);
                     }
                 }
-
-                if (wroteAnyLine && wroteAssEvent)
-                    cue.assEvents.push_back(ass.str());
             } else {
                 std::vector<double> paragraphExtraY(paragraphs.size(), 0);
                 for (size_t i = 1; i < paragraphs.size(); ++i) {
@@ -700,9 +734,6 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     const auto& p = *paragraphs[pIndex];
                     ++stats.paragraphs;
                     bool wroteLine = false;
-                    bool wroteAssEvent = false;
-                    std::ostringstream ass;
-                    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
                     const double fontScale = AssFontScaleForParagraph(p);
                     const double extraYAss = paragraphExtraY[pIndex];
                     LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, extraYAss);
@@ -710,25 +741,13 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                         ++stats.spans;
                         if (!span.text.empty()) {
                             text << span.text;
-                            if (!wroteAssEvent) {
-                                ass << cue.assEvents.size() << ",0,Default,,0,0,0,,{"
-                                    << BuildAssPositionTags(p, extraYAss, false, 0)
-                                    << BuildAssStyleTags(firstSpan, fontScale)
-                                    << "}";
-                                wroteAssEvent = true;
-                            }
-                            std::string spanTags = BuildAssStyleTags(&span, fontScale);
-                            if (!spanTags.empty())
-                                ass << "{" << spanTags << "}";
-                            ass << EscapeAssText(span.text);
                             stats.textBytes += span.text.size();
                             wroteLine = true;
                         }
                     }
                     if (wroteLine) {
                         text << "\n";
-                        if (wroteAssEvent)
-                            cue.assEvents.push_back(ass.str());
+                        AppendAssCellLayoutEvents(p, fontScale, extraYAss, false, 0, settings, cue.assEvents);
                     }
                 }
             }
@@ -808,9 +827,6 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 const auto& p = *paragraphs[pIndex];
                 ++stats.paragraphs;
                 bool wroteLine = false;
-                bool wroteAssEvent = false;
-                std::ostringstream ass;
-                const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
                 const double fontScale = AssFontScaleForParagraph(p);
                 const double extraYAss = paragraphExtraY[pIndex];
                 LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, extraYAss);
@@ -818,27 +834,16 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     ++stats.spans;
                     if (!span.text.empty()) {
                         text << span.text;
-                        if (!wroteAssEvent) {
-                            ass << cue.assEvents.size() << ",0,Default,,0,0,0,,{"
-                                << BuildAssPositionTags(p, extraYAss,
-                                                        paragraphHasXOverride[pIndex],
-                                                        paragraphXOverride[pIndex])
-                                << BuildAssStyleTags(firstSpan, fontScale)
-                                << "}";
-                            wroteAssEvent = true;
-                        }
-                        std::string spanTags = BuildAssStyleTags(&span, fontScale);
-                        if (!spanTags.empty())
-                            ass << "{" << spanTags << "}";
-                        ass << EscapeAssText(span.text);
                         stats.textBytes += span.text.size();
                         wroteLine = true;
                     }
                 }
                 if (wroteLine) {
                     text << "\n";
-                    if (wroteAssEvent)
-                        cue.assEvents.push_back(ass.str());
+                    AppendAssCellLayoutEvents(p, fontScale, extraYAss,
+                                              paragraphHasXOverride[pIndex],
+                                              paragraphXOverride[pIndex],
+                                              settings, cue.assEvents);
                 }
             }
         }
@@ -1852,6 +1857,13 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, 
                                          const std::vector<std::string>& assEvents,
                                          const std::string& assText)
 {
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (settings.delayMs != 0) {
+        const REFERENCE_TIME offset = static_cast<REFERENCE_TIME>(settings.delayMs) * 10000LL;
+        start = (std::max)(static_cast<REFERENCE_TIME>(0), start + offset);
+        stop = (std::max)(start + 1, stop + offset);
+    }
+
     bool delivered = false;
     for (auto* pin : m_pins) {
         if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {

@@ -76,6 +76,7 @@ and creates a ZIP package containing:
 
 ```text
 mmts-dsfilter.ax
+mmts-dsfilter.ini
 register-filter.ps1
 unregister-filter.ps1
 README.md
@@ -117,6 +118,26 @@ To unregister:
 ```cmd
 regsvr32 /u msvc\x64\Release\mmts-dsfilter.ax
 ```
+
+## Subtitle Settings
+
+Place `mmts-dsfilter.ini` next to `mmts-dsfilter.ax`. The release package
+includes a sample INI.
+
+```ini
+[MMTS]
+FontName=MS Gothic
+CaptionTransparency=0
+BackgroundTransparency=50
+ShowBackground=1
+OutlineWidth=0
+DelayMs=0
+```
+
+Generated ASS subtitles use ARIB/TTML cell positions per character so changing
+the selected font does not move later characters on the line. `FontName`,
+`CaptionTransparency`, `OutlineWidth`, and `DelayMs` are applied now.
+Background settings are read and reserved for the background rectangle mode.
 
 ## Debug Logging
 
