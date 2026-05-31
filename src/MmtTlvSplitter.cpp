@@ -3,14 +3,18 @@
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
 #include "ttml.h"
+#include "pugixml.hpp"
 #include <fstream>
 #include <strmif.h>
 #include <cwchar>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -98,9 +102,22 @@ struct TtmlTextCue {
     std::vector<std::string> assEvents;
     bool hasBegin = false;
     bool hasEnd = false;
+    bool missingGlyph = false;
     REFERENCE_TIME begin = 0;
     REFERENCE_TIME end = 0;
 };
+
+struct SubtitleGlyphResource {
+    int unitsPerEm = 360;
+    int ascent = 360;
+    int descent = 0;
+    std::string pathData;
+};
+
+static std::mutex g_subtitleGlyphMutex;
+static std::map<std::pair<int, uint32_t>, SubtitleGlyphResource> g_subtitleGlyphs;
+static std::mutex g_subtitleGlyphLoadMutex;
+static std::vector<std::wstring> g_loadedSubtitleGlyphFiles;
 
 struct MmtsCaptionSettings {
     int captionAlpha = 0;       // ASS alpha: 0=opaque, 255=fully transparent
@@ -231,6 +248,27 @@ static bool WriteFileBytes(const std::wstring& path, const void* data, size_t si
     return ok;
 }
 
+static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& data)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > 16 * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+
+    data.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    bool ok = data.empty() ||
+              ReadFile(h, data.data(), static_cast<DWORD>(data.size()), &read, nullptr);
+    CloseHandle(h);
+    return ok && read == data.size();
+}
+
 static std::wstring DefaultSubtitleDumpDir()
 {
     WCHAR iniPath[MAX_PATH] = {};
@@ -290,6 +328,222 @@ static void DumpSubtitleDataIfEnabled(int streamIndex, LONG callbackNo, REFERENC
     if (dumpNo <= 5 || (dumpNo % 50) == 0) {
         LogMsg(L"MMT/TLV Subtitle dump #%ld: \"%s\"\n", dumpNo, ttmlPath.c_str());
     }
+}
+
+static const WCHAR* GuessSubtitleResourceExtension(const uint8_t* data, size_t size)
+{
+    if (!data || size == 0)
+        return L".bin";
+
+    const size_t probe = (std::min)(size, static_cast<size_t>(64));
+    size_t i = 0;
+    while (i < probe && (data[i] == 0xEF || data[i] == 0xBB || data[i] == 0xBF ||
+                         data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n')) {
+        ++i;
+    }
+
+    if (i < probe && data[i] == '<') {
+        if (i + 4 < size && std::memcmp(data + i, "<svg", 4) == 0)
+            return L".svg";
+        if (i + 5 < size && std::memcmp(data + i, "<?xml", 5) == 0)
+            return L".svg";
+    }
+    if (size >= 2 && data[0] == 0x1F && data[1] == 0x8B)
+        return L".gz";
+    return L".bin";
+}
+
+static void DumpSubtitleResourceIfEnabled(int streamIndex, LONG callbackNo, REFERENCE_TIME normPts,
+                                          int dataType, int subsampleNumber, int lastSubsampleNumber,
+                                          const uint8_t* data, size_t size)
+{
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (!settings.dumpSubtitleData || !data || size == 0)
+        return;
+
+    static volatile LONG s_dumpedResources = 0;
+    LONG dumpNo = InterlockedIncrement(&s_dumpedResources);
+    if (dumpNo > settings.dumpSubtitleMaxFiles)
+        return;
+
+    std::wstring dir = settings.dumpSubtitleDir.empty() ? DefaultSubtitleDumpDir() : settings.dumpSubtitleDir;
+    if (!EnsureDirectoryTree(dir)) {
+        LogMsg(L"MMT/TLV Subtitle resource dump: cannot create dir \"%s\"\n", dir.c_str());
+        return;
+    }
+
+    WCHAR baseName[224] = {};
+    StringCchPrintfW(baseName, ARRAYSIZE(baseName),
+                    L"subtitle_resource_s%d_cb%06ld_pts%I64d_type%d_sub%d_of%d",
+                    streamIndex, callbackNo, normPts / 10000,
+                    dataType, subsampleNumber, lastSubsampleNumber);
+
+    std::wstring dataPath = dir + L"\\" + baseName + GuessSubtitleResourceExtension(data, size);
+    if (!WriteFileBytes(dataPath, data, size)) {
+        LogMsg(L"MMT/TLV Subtitle resource dump: failed to write \"%s\"\n", dataPath.c_str());
+        return;
+    }
+
+    char meta[384] = {};
+    std::snprintf(meta, sizeof(meta),
+                  "streamIndex=%d\ncallback=%ld\nptsMs=%lld\nsize=%zu\n"
+                  "dataType=%d\nsubsampleNumber=%d\nlastSubsampleNumber=%d\n",
+                  streamIndex, callbackNo, static_cast<long long>(normPts / 10000), size,
+                  dataType, subsampleNumber, lastSubsampleNumber);
+    std::wstring metaPath = dir + L"\\" + baseName + L".txt";
+    WriteFileBytes(metaPath, meta, strlen(meta));
+
+    if (dumpNo <= 5 || (dumpNo % 50) == 0) {
+        LogMsg(L"MMT/TLV Subtitle resource dump #%ld: \"%s\"\n", dumpNo, dataPath.c_str());
+    }
+}
+
+static bool ParseSvgUnicodeValue(const char* value, uint32_t& codepoint)
+{
+    if (!value || !*value)
+        return false;
+
+    std::string text(value);
+    const std::string hexEntity = "&#x";
+    size_t pos = text.find(hexEntity);
+    if (pos != std::string::npos) {
+        pos += hexEntity.size();
+        size_t end = text.find(';', pos);
+        if (end == std::string::npos)
+            end = text.size();
+        codepoint = static_cast<uint32_t>(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16));
+        return codepoint != 0;
+    }
+
+    if (text.rfind("U+", 0) == 0 || text.rfind("u+", 0) == 0) {
+        codepoint = static_cast<uint32_t>(std::strtoul(text.c_str() + 2, nullptr, 16));
+        return codepoint != 0;
+    }
+
+    int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (needed <= 0)
+        return false;
+    std::wstring wide(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), wide.data(), needed);
+    codepoint = static_cast<uint32_t>(wide[0]);
+    return codepoint != 0;
+}
+
+static bool ParseUnicodeRangeValue(const char* value, uint32_t& codepoint)
+{
+    if (!value || !*value)
+        return false;
+    std::string text(value);
+    size_t pos = text.find("U+");
+    if (pos == std::string::npos)
+        pos = text.find("u+");
+    if (pos == std::string::npos)
+        return false;
+    pos += 2;
+    size_t end = pos;
+    while (end < text.size() && std::isxdigit(static_cast<unsigned char>(text[end])))
+        ++end;
+    if (end == pos)
+        return false;
+    codepoint = static_cast<uint32_t>(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16));
+    return codepoint != 0;
+}
+
+static void RegisterSubtitleGlyphResource(int streamIndex, const uint8_t* data, size_t size)
+{
+    if (!data || size == 0)
+        return;
+
+    pugi::xml_document doc;
+    pugi::xml_parse_result result = doc.load_buffer(data, size);
+    if (result.status != pugi::status_ok) {
+        LogDetail(L"MMT/TLV Subtitle glyph resource parse failed: streamIndex=%d status=%d\n",
+                  streamIndex, static_cast<int>(result.status));
+        return;
+    }
+
+    pugi::xml_node svg = doc.child("svg");
+    if (!svg) {
+        LogDetail(L"MMT/TLV Subtitle glyph resource ignored: streamIndex=%d no svg root\n", streamIndex);
+        return;
+    }
+
+    int registered = 0;
+    for (pugi::xml_node defs : svg.children("defs")) {
+        for (pugi::xml_node font : defs.children("font")) {
+            SubtitleGlyphResource base;
+            if (font.attribute("horiz-adv-x"))
+                base.unitsPerEm = font.attribute("horiz-adv-x").as_int(base.unitsPerEm);
+
+            pugi::xml_node face = font.child("font-face");
+            if (face) {
+                base.unitsPerEm = face.attribute("units-per-em").as_int(base.unitsPerEm);
+                base.ascent = face.attribute("ascent").as_int(base.ascent);
+                base.descent = face.attribute("descent").as_int(base.descent);
+            }
+
+            uint32_t faceCodepoint = 0;
+            ParseUnicodeRangeValue(face.attribute("unicode-range").value(), faceCodepoint);
+
+            for (pugi::xml_node glyph : font.children("glyph")) {
+                uint32_t codepoint = 0;
+                if (!ParseSvgUnicodeValue(glyph.attribute("unicode").value(), codepoint))
+                    codepoint = faceCodepoint;
+                const char* path = glyph.attribute("d").value();
+                if (codepoint == 0 || !path || !*path)
+                    continue;
+
+                SubtitleGlyphResource resource = base;
+                resource.pathData = path;
+                std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+                g_subtitleGlyphs[{streamIndex, codepoint}] = std::move(resource);
+                ++registered;
+                LogDetail(L"MMT/TLV Subtitle glyph registered: streamIndex=%d U+%04X units=%d ascent=%d descent=%d\n",
+                          streamIndex, codepoint, resource.unitsPerEm, resource.ascent, resource.descent);
+            }
+        }
+    }
+
+    if (registered == 0) {
+        LogDetail(L"MMT/TLV Subtitle glyph resource parsed but no glyph registered: streamIndex=%d\n", streamIndex);
+    }
+}
+
+static void TryLoadDumpedSubtitleGlyphResources(int streamIndex)
+{
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (!settings.dumpSubtitleData)
+        return;
+
+    std::lock_guard<std::mutex> loadLock(g_subtitleGlyphLoadMutex);
+    std::wstring dir = settings.dumpSubtitleDir.empty() ? DefaultSubtitleDumpDir() : settings.dumpSubtitleDir;
+    std::wstring pattern = dir + L"\\subtitle_resource_s*_*.svg";
+
+    WIN32_FIND_DATAW findData = {};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &findData);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do {
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        std::wstring path = dir + L"\\" + findData.cFileName;
+        if (std::find(g_loadedSubtitleGlyphFiles.begin(), g_loadedSubtitleGlyphFiles.end(), path) !=
+            g_loadedSubtitleGlyphFiles.end()) {
+            continue;
+        }
+
+        std::vector<uint8_t> data;
+        if (ReadFileBytes(path, data)) {
+            RegisterSubtitleGlyphResource(streamIndex, data.data(), data.size());
+            g_loadedSubtitleGlyphFiles.push_back(path);
+            LogDetail(L"MMT/TLV Subtitle glyph loaded from dump: streamIndex=%d file=\"%s\"\n",
+                      streamIndex, path.c_str());
+        }
+    } while (FindNextFileW(hFind, &findData));
+
+    FindClose(hFind);
 }
 
 static std::string EscapeAssText(const std::string& text);
@@ -626,6 +880,276 @@ static std::string WideCharSliceToUtf8(const std::wstring& text, size_t pos, siz
     return utf8;
 }
 
+class SvgPathParser {
+public:
+    explicit SvgPathParser(const std::string& path) : m_path(path) {}
+
+    bool eof()
+    {
+        skipSeparators();
+        return m_pos >= m_path.size();
+    }
+
+    bool readCommand(char& command)
+    {
+        skipSeparators();
+        if (m_pos >= m_path.size())
+            return false;
+        char c = m_path[m_pos];
+        if (std::isalpha(static_cast<unsigned char>(c))) {
+            command = c;
+            ++m_pos;
+            return true;
+        }
+        return false;
+    }
+
+    bool readNumber(double& value)
+    {
+        skipSeparators();
+        if (m_pos >= m_path.size())
+            return false;
+        const char* begin = m_path.c_str() + m_pos;
+        char* end = nullptr;
+        value = std::strtod(begin, &end);
+        if (end == begin)
+            return false;
+        m_pos = static_cast<size_t>(end - m_path.c_str());
+        return true;
+    }
+
+private:
+    void skipSeparators()
+    {
+        while (m_pos < m_path.size()) {
+            const unsigned char c = static_cast<unsigned char>(m_path[m_pos]);
+            if (std::isspace(c) || c == ',') {
+                ++m_pos;
+                continue;
+            }
+            break;
+        }
+    }
+
+    const std::string& m_path;
+    size_t m_pos = 0;
+};
+
+static void AppendAssDrawingPoint(std::ostringstream& ass, double value)
+{
+    ass << static_cast<int>(std::lround(value));
+}
+
+static bool BuildAssGlyphDrawingPath(const SubtitleGlyphResource& glyph,
+                                     double xPos, double yPos,
+                                     double width, double height,
+                                     std::string& out)
+{
+    if (glyph.pathData.empty() || width <= 0 || height <= 0)
+        return false;
+
+    const double units = glyph.unitsPerEm > 0 ? glyph.unitsPerEm : 360.0;
+    const double glyphHeight = glyph.ascent > glyph.descent ? glyph.ascent - glyph.descent : units;
+    const double scaleX = width / units;
+    const double scaleY = height / glyphHeight;
+    auto tx = [&](double v) { return xPos + v * scaleX; };
+    auto ty = [&](double v) { return yPos + (glyph.ascent - v) * scaleY; };
+
+    SvgPathParser parser(glyph.pathData);
+    std::ostringstream ass;
+    char command = 0;
+    double cx = 0;
+    double cy = 0;
+    double sx = 0;
+    double sy = 0;
+
+    auto appendMove = [&](double x, double y) {
+        ass << "m ";
+        AppendAssDrawingPoint(ass, tx(x));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y));
+        ass << ' ';
+        cx = sx = x;
+        cy = sy = y;
+    };
+    auto appendLine = [&](double x, double y) {
+        ass << "l ";
+        AppendAssDrawingPoint(ass, tx(x));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y));
+        ass << ' ';
+        cx = x;
+        cy = y;
+    };
+    auto appendCubic = [&](double x1, double y1, double x2, double y2, double x, double y) {
+        ass << "b ";
+        AppendAssDrawingPoint(ass, tx(x1));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y1));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, tx(x2));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y2));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, tx(x));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y));
+        ass << ' ';
+        cx = x;
+        cy = y;
+    };
+
+    bool wrote = false;
+    while (!parser.eof()) {
+        char nextCommand = 0;
+        if (parser.readCommand(nextCommand))
+            command = nextCommand;
+        if (command == 0)
+            break;
+
+        const bool relative = command >= 'a' && command <= 'z';
+        switch (command) {
+        case 'M':
+        case 'm':
+        {
+            double x = 0;
+            double y = 0;
+            if (!parser.readNumber(x) || !parser.readNumber(y))
+                return wrote;
+            if (relative) {
+                x += cx;
+                y += cy;
+            }
+            appendMove(x, y);
+            wrote = true;
+            command = relative ? 'l' : 'L';
+            break;
+        }
+        case 'L':
+        case 'l':
+        {
+            double x = 0;
+            double y = 0;
+            if (!parser.readNumber(x) || !parser.readNumber(y))
+                break;
+            if (relative) {
+                x += cx;
+                y += cy;
+            }
+            appendLine(x, y);
+            wrote = true;
+            break;
+        }
+        case 'H':
+        case 'h':
+        {
+            double x = 0;
+            if (!parser.readNumber(x))
+                break;
+            if (relative)
+                x += cx;
+            appendLine(x, cy);
+            wrote = true;
+            break;
+        }
+        case 'V':
+        case 'v':
+        {
+            double y = 0;
+            if (!parser.readNumber(y))
+                break;
+            if (relative)
+                y += cy;
+            appendLine(cx, y);
+            wrote = true;
+            break;
+        }
+        case 'C':
+        case 'c':
+        {
+            double x1 = 0;
+            double y1 = 0;
+            double x2 = 0;
+            double y2 = 0;
+            double x = 0;
+            double y = 0;
+            if (!parser.readNumber(x1) || !parser.readNumber(y1) ||
+                !parser.readNumber(x2) || !parser.readNumber(y2) ||
+                !parser.readNumber(x) || !parser.readNumber(y)) {
+                break;
+            }
+            if (relative) {
+                x1 += cx;
+                y1 += cy;
+                x2 += cx;
+                y2 += cy;
+                x += cx;
+                y += cy;
+            }
+            appendCubic(x1, y1, x2, y2, x, y);
+            wrote = true;
+            break;
+        }
+        case 'Z':
+        case 'z':
+            appendLine(sx, sy);
+            wrote = true;
+            command = 0;
+            break;
+        default:
+            return wrote;
+        }
+    }
+
+    out = ass.str();
+    return wrote && !out.empty();
+}
+
+static bool GetSubtitleGlyphResource(int streamIndex, uint32_t codepoint, SubtitleGlyphResource& glyph)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+        auto it = g_subtitleGlyphs.find({streamIndex, codepoint});
+        if (it != g_subtitleGlyphs.end()) {
+            glyph = it->second;
+            return true;
+        }
+    }
+
+    TryLoadDumpedSubtitleGlyphResources(streamIndex);
+
+    std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+    auto it = g_subtitleGlyphs.find({streamIndex, codepoint});
+    if (it != g_subtitleGlyphs.end()) {
+        glyph = it->second;
+        return true;
+    }
+
+    if (codepoint >= 0xE000 && codepoint <= 0xF8FF) {
+        LogDetail(L"MMT/TLV Subtitle glyph missing: streamIndex=%d U+%04X\n", streamIndex, codepoint);
+    }
+    return false;
+}
+
+static std::string BuildAssDrawingStyleTags(const TTMLSpanTag* span,
+                                            const MmtsCaptionSettings& settings)
+{
+    std::string tags = "\\bord0";
+    if (settings.captionAlpha > 0) {
+        char alphaBuf[32];
+        std::snprintf(alphaBuf, sizeof(alphaBuf), "\\1a&H%02X&",
+                      static_cast<unsigned>(settings.captionAlpha));
+        tags += alphaBuf;
+    }
+    if (span && span->style.color.has_value()) {
+        try {
+            tags += FormatAssColorTag(span->style.color->getValue<TTMLCssValueColor>());
+        } catch (const std::bad_variant_access&) {
+        }
+    }
+    return tags;
+}
+
 static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
                                   uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& assAlpha)
 {
@@ -753,11 +1277,12 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
     }
 }
 
-static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, double extraYAss,
+static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double fontScale, double extraYAss,
                                       bool hasXOverride, double xOverrideAss,
                                       const MmtsCaptionSettings& settings,
                                       std::vector<std::string>& events,
-                                      bool showBackground)
+                                      bool showBackground,
+                                      bool* missingGlyph = nullptr)
 {
     double baseX = 960.0;
     double baseY = 980.0;
@@ -798,11 +1323,36 @@ static bool AppendAssCellLayoutEvents(const TTMLPTag& p, double fontScale, doubl
                 continue;
             }
 
+            const size_t current = i;
             size_t next = i + 1;
-            const std::string utf8 = WideCharSliceToUtf8(wide, i, next);
+            const std::string utf8 = WideCharSliceToUtf8(wide, current, next);
             i = next;
             if (utf8.empty())
                 continue;
+
+            uint32_t codepoint = static_cast<uint32_t>(ch);
+            if (ch >= 0xD800 && ch <= 0xDBFF && next <= wide.size() && next > current + 1) {
+                const uint32_t hi = static_cast<uint32_t>(ch) - 0xD800;
+                const uint32_t lo = static_cast<uint32_t>(wide[current + 1]) - 0xDC00;
+                codepoint = 0x10000 + ((hi << 10) | lo);
+            }
+
+            SubtitleGlyphResource glyph;
+            std::string glyphPath;
+            const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
+            if (GetSubtitleGlyphResource(streamIndex, codepoint, glyph) &&
+                BuildAssGlyphDrawingPath(glyph, x, y, cellWidth, spanFontSize, glyphPath)) {
+                std::ostringstream ass;
+                ass << events.size() << ",1,Default,,0,0,0,,{\\an7\\pos(0,0)"
+                    << BuildAssDrawingStyleTags(&span, settings)
+                    << "\\p1}" << glyphPath << "{\\p0}";
+                events.push_back(ass.str());
+                wroteEvent = true;
+                x += cellWidth;
+                continue;
+            }
+            if (missingGlyph && codepoint >= 0xE000 && codepoint <= 0xF8FF)
+                *missingGlyph = true;
 
             std::ostringstream ass;
             ass << events.size() << ",1,Default,,0,0,0,,{"
@@ -913,7 +1463,8 @@ static double AssFontScaleForParagraph(const TTMLPTag& p)
     return FitAssFontScale(baseFontSize, CountAssParagraphLines(p), yPos, hasExtent, extentY);
 }
 
-static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats)
+static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats,
+                                        int streamIndex = -1)
 {
     stats = {};
     TtmlTextCue cue;
@@ -961,7 +1512,8 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     }
                     if (wroteLine) {
                         text << "\n";
-                        AppendAssCellLayoutEvents(p, fontScale, 0, false, 0, settings, cue.assEvents, true);
+                        AppendAssCellLayoutEvents(streamIndex, p, fontScale, 0, false, 0,
+                                                  settings, cue.assEvents, true, &cue.missingGlyph);
                     }
                 }
             } else {
@@ -995,7 +1547,8 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     }
                     if (wroteLine) {
                         text << "\n";
-                        AppendAssCellLayoutEvents(p, fontScale, extraYAss, false, 0, settings, cue.assEvents, true);
+                        AppendAssCellLayoutEvents(streamIndex, p, fontScale, extraYAss, false, 0,
+                                                  settings, cue.assEvents, true, &cue.missingGlyph);
                     }
                 }
             }
@@ -1088,11 +1641,12 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 }
                 if (wroteLine) {
                     text << "\n";
-                    AppendAssCellLayoutEvents(p, fontScale, extraYAss,
+                    AppendAssCellLayoutEvents(streamIndex, p, fontScale, extraYAss,
                                               paragraphHasXOverride[pIndex],
                                               paragraphXOverride[pIndex],
                                               settings, cue.assEvents,
-                                              !IsRubyLikeParagraph(p, divMaxFontSize));
+                                              !IsRubyLikeParagraph(p, divMaxFontSize),
+                                              &cue.missingGlyph);
                 }
             }
         }
@@ -1808,10 +2362,24 @@ void CMmtTlvSplitter::CreatePins()
             LONG callbackNo = InterlockedIncrement(&s_subtitleCallbacks);
 
             TtmlDebugStats stats;
-            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
+            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, streamIndex);
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
             DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
+
+            if (cue.missingGlyph && !cue.text.empty()) {
+                DeferredSubtitleSample sample;
+                sample.streamIndex = streamIndex;
+                sample.pts = pts;
+                sample.callbackNo = callbackNo;
+                sample.data.assign(d, d + sz);
+                m_deferredSubtitleSamples.push_back(std::move(sample));
+                if (m_deferredSubtitleSamples.size() > 32)
+                    m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
+                LogDetail(L"SUBTITLE CALLBACK deferred for glyph: callback=%ld streamIndex=%d pts=%I64d ms size=%zu\n",
+                          callbackNo, streamIndex, normPts / 10000, sz);
+                return;
+            }
 
             if (callbackNo <= 20 || cue.text.empty()) {
                 std::wstring preview = Utf8Preview(cue.text);
@@ -1924,6 +2492,24 @@ void CMmtTlvSplitter::CreatePins()
             }
         });
 
+    m_handler.setSubtitleResourceCallback(
+        [this](int streamIndex, int dataType, int subsampleNumber, int lastSubsampleNumber,
+               long long pts, long long, const uint8_t* d, size_t sz) {
+            static volatile LONG s_subtitleResourceCallbacks = 0;
+            LONG callbackNo = InterlockedIncrement(&s_subtitleResourceCallbacks);
+            REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+            RegisterSubtitleGlyphResource(streamIndex, d, sz);
+            ProcessDeferredSubtitleSamples();
+            DumpSubtitleResourceIfEnabled(streamIndex, callbackNo, normPts,
+                                          dataType, subsampleNumber, lastSubsampleNumber,
+                                          d, sz);
+            if (callbackNo <= 20) {
+                LogDetail(L"SUBTITLE RESOURCE CALLBACK #%ld: streamIndex=%d, pts=%I64d ms, dataType=%d, subsample=%d/%d, size=%zu\n",
+                          callbackNo, streamIndex, normPts / 10000,
+                          dataType, subsampleNumber, lastSubsampleNumber, sz);
+            }
+        });
+
     m_demuxer.setDemuxerHandler(m_handler);
 }
 
@@ -1977,7 +2563,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
                 return;
 
             TtmlDebugStats stats;
-            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
+            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, si);
             if (cue.hasBegin && cue.begin > currentBegin + kMinGap) {
                 nextBegin = cue.begin;
                 found = true;
@@ -2026,6 +2612,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
 void CMmtTlvSplitter::ClearPendingSubtitleCues()
 {
     m_pendingSubtitleCues.clear();
+    m_deferredSubtitleSamples.clear();
 }
 
 void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME stopTime)
@@ -2066,6 +2653,55 @@ void CMmtTlvSplitter::FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime)
         }
     }
     m_pendingSubtitleCues.clear();
+}
+
+void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
+{
+    if (m_deferredSubtitleSamples.empty())
+        return;
+
+    std::vector<DeferredSubtitleSample> remaining;
+    for (const auto& sample : m_deferredSubtitleSamples) {
+        TtmlDebugStats stats;
+        TtmlTextCue cue = ExtractTtmlPlainText(sample.data.data(), sample.data.size(), stats, sample.streamIndex);
+        if (cue.missingGlyph) {
+            remaining.push_back(sample);
+            continue;
+        }
+        if (cue.text.empty())
+            continue;
+
+        REFERENCE_TIME normPts = (sample.pts >= 0 && m_firstPts >= 0) ? sample.pts - m_firstPts : sample.pts;
+        REFERENCE_TIME sampleStart = 0;
+        REFERENCE_TIME sampleStop = 0;
+        if (cue.hasBegin) {
+            REFERENCE_TIME subtitleTimeOffset = m_subtitleTimeOffset.load(std::memory_order_acquire);
+            if (subtitleTimeOffset < 0) {
+                REFERENCE_TIME anchorTime = normPts;
+                if (anchorTime <= 0)
+                    anchorTime = m_currentPts.load(std::memory_order_acquire);
+                subtitleTimeOffset = cue.begin - anchorTime;
+                m_subtitleTimeOffset.store(subtitleTimeOffset, std::memory_order_release);
+            }
+            sampleStart = cue.begin - subtitleTimeOffset;
+            sampleStop = cue.hasEnd ? cue.end - subtitleTimeOffset : sampleStart + kDefaultSubtitleDuration;
+            sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
+            sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
+        } else {
+            sampleStart = ToSegmentTime(normPts, m_segmentStart);
+            sampleStop = sampleStart + kDefaultSubtitleDuration;
+        }
+
+        if (sampleStop <= sampleStart)
+            sampleStop = sampleStart + kDefaultSubtitleDuration;
+
+        FlushPendingSubtitleCue(sample.streamIndex, sampleStart);
+        DeliverSubtitleCue(sample.streamIndex, sampleStart, sampleStop, cue.assEvents, cue.assText);
+        LogDetail(L"SUBTITLE deferred delivered: callback=%ld streamIndex=%d start=%I64d ms stop=%I64d ms\n",
+                  sample.callbackNo, sample.streamIndex, sampleStart / 10000, sampleStop / 10000);
+    }
+
+    m_deferredSubtitleSamples.swap(remaining);
 }
 
 void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)

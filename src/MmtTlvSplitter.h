@@ -90,6 +90,7 @@ private:
     void DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, REFERENCE_TIME stop,
                             const std::vector<std::string>& assEvents,
                             const std::string& assText);
+    void ProcessDeferredSubtitleSamples();
 
     CCritSec m_pinLock;
     std::vector<CMmtTlvOutputPin*> m_pins;
@@ -130,4 +131,12 @@ private:
         std::string assText;
     };
     std::vector<PendingSubtitleCue> m_pendingSubtitleCues;
+
+    struct DeferredSubtitleSample {
+        int streamIndex = -1;
+        long long pts = -1;
+        LONG callbackNo = 0;
+        std::vector<uint8_t> data;
+    };
+    std::vector<DeferredSubtitleSample> m_deferredSubtitleSamples;
 };

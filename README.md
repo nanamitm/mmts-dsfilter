@@ -142,8 +142,9 @@ the selected font does not move later characters on the line. `FontName`,
 `CaptionTransparency`, `BackgroundTransparency`, `ShowBackground`,
 `OutlineWidth`, and `DelayMs` are applied now. If TTML does not provide a
 background color, a dark gray cell background is used. Set
-`DumpSubtitleData=1` to save raw TTML samples and metadata for investigation;
-an empty `DumpSubtitleDir` writes to `subtitle_dump` next to the filter.
+`DumpSubtitleData=1` to save raw TTML samples, referenced subtitle resources,
+and metadata for investigation; an empty `DumpSubtitleDir` writes to
+`subtitle_dump` next to the filter.
 
 ## Debug Logging
 
