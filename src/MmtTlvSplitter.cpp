@@ -20,6 +20,7 @@ static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuratio
 static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
+static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
 
 #define LogMsg MmtTlvLogInfo
 #define LogDetail MmtTlvLogDebug
@@ -102,7 +103,7 @@ struct TtmlTextCue {
 
 struct MmtsCaptionSettings {
     int captionAlpha = 0;       // ASS alpha: 0=opaque, 255=fully transparent
-    int backgroundAlpha = -1;   // reserved for background rectangles
+    int backgroundAlpha = -1;   // -1=use TTML data, 0-255=fixed override
     bool showBackground = true;
     int outlineWidth = 0;
     int delayMs = 0;
@@ -512,9 +513,9 @@ static std::string WideCharSliceToUtf8(const std::wstring& text, size_t pos, siz
 static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
                                   uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& assAlpha)
 {
-    r = 0;
-    g = 0;
-    b = 0;
+    r = kDefaultBackgroundRgb;
+    g = kDefaultBackgroundRgb;
+    b = kDefaultBackgroundRgb;
     bool hasColor = false;
 
     if (span.style.backgroundColor.has_value()) {
