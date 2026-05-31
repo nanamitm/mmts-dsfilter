@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -107,7 +108,10 @@ struct MmtsCaptionSettings {
     bool showBackground = true;
     int outlineWidth = 0;
     int delayMs = 0;
+    bool dumpSubtitleData = false;
+    int dumpSubtitleMaxFiles = 200;
     std::string fontName = "MS Gothic";
+    std::wstring dumpSubtitleDir;
 };
 
 static void GetMmtsIniPath(WCHAR* iniPath, DWORD size)
@@ -162,6 +166,12 @@ static MmtsCaptionSettings GetMmtsCaptionSettings()
         s.outlineWidth = (std::max)(0, (std::min)(10, _wtoi(buf)));
     if (ReadIniValue(iniPath, L"MMTS", L"DelayMs", buf, ARRAYSIZE(buf)))
         s.delayMs = (std::max)(-30000, (std::min)(30000, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleData", buf, ARRAYSIZE(buf)))
+        s.dumpSubtitleData = _wtoi(buf) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleMaxFiles", buf, ARRAYSIZE(buf)))
+        s.dumpSubtitleMaxFiles = (std::max)(1, (std::min)(10000, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleDir", buf, ARRAYSIZE(buf)))
+        s.dumpSubtitleDir = buf;
     if (ReadIniValue(iniPath, L"MMTS", L"FontName", buf, ARRAYSIZE(buf))) {
         int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
         if (len > 1) {
@@ -174,6 +184,112 @@ static MmtsCaptionSettings GetMmtsCaptionSettings()
     lastLoad = now;
     wcscpy_s(lastPath, iniPath);
     return cached;
+}
+
+static bool EnsureDirectoryTree(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES)
+        return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && slash > 2) {
+        std::wstring parent = path.substr(0, slash);
+        if (!parent.empty() && !EnsureDirectoryTree(parent))
+            return false;
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr))
+        return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool WriteFileBytes(const std::wstring& path, const void* data, size_t size)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t remaining = size;
+    bool ok = true;
+    while (remaining > 0) {
+        DWORD chunk = static_cast<DWORD>((std::min)(remaining, static_cast<size_t>(DWORD_MAX)));
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, nullptr) || written != chunk) {
+            ok = false;
+            break;
+        }
+        p += written;
+        remaining -= written;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+static std::wstring DefaultSubtitleDumpDir()
+{
+    WCHAR iniPath[MAX_PATH] = {};
+    GetMmtsIniPath(iniPath, MAX_PATH);
+    WCHAR* slash = wcsrchr(iniPath, L'\\');
+    if (slash)
+        *(slash + 1) = L'\0';
+    else
+        iniPath[0] = L'\0';
+
+    std::wstring dir = iniPath;
+    dir += L"subtitle_dump";
+    return dir;
+}
+
+static void DumpSubtitleDataIfEnabled(int streamIndex, LONG callbackNo, REFERENCE_TIME normPts,
+                                      const uint8_t* data, size_t size,
+                                      const TtmlTextCue& cue, const TtmlDebugStats& stats)
+{
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (!settings.dumpSubtitleData || !data || size == 0)
+        return;
+
+    static volatile LONG s_dumpedSamples = 0;
+    LONG dumpNo = InterlockedIncrement(&s_dumpedSamples);
+    if (dumpNo > settings.dumpSubtitleMaxFiles)
+        return;
+
+    std::wstring dir = settings.dumpSubtitleDir.empty() ? DefaultSubtitleDumpDir() : settings.dumpSubtitleDir;
+    if (!EnsureDirectoryTree(dir)) {
+        LogMsg(L"MMT/TLV Subtitle dump: cannot create dir \"%s\"\n", dir.c_str());
+        return;
+    }
+
+    WCHAR baseName[192] = {};
+    StringCchPrintfW(baseName, ARRAYSIZE(baseName),
+                    L"subtitle_s%d_cb%06ld_pts%I64d", streamIndex, callbackNo, normPts / 10000);
+
+    std::wstring ttmlPath = dir + L"\\" + baseName + L".ttml";
+    if (!WriteFileBytes(ttmlPath, data, size)) {
+        LogMsg(L"MMT/TLV Subtitle dump: failed to write \"%s\"\n", ttmlPath.c_str());
+        return;
+    }
+
+    char meta[512] = {};
+    std::snprintf(meta, sizeof(meta),
+                  "streamIndex=%d\ncallback=%ld\nptsMs=%lld\nsize=%zu\n"
+                  "ttmlBeginMs=%lld\nhasBegin=%d\nttmlEndMs=%lld\nhasEnd=%d\n"
+                  "divs=%zu\nparagraphs=%zu\nspans=%zu\ntextBytes=%zu\n",
+                  streamIndex, callbackNo, static_cast<long long>(normPts / 10000), size,
+                  static_cast<long long>(cue.begin / 10000), cue.hasBegin ? 1 : 0,
+                  static_cast<long long>(cue.end / 10000), cue.hasEnd ? 1 : 0,
+                  stats.divs, stats.paragraphs, stats.spans, stats.textBytes);
+    std::wstring metaPath = dir + L"\\" + baseName + L".txt";
+    WriteFileBytes(metaPath, meta, strlen(meta));
+
+    if (dumpNo <= 5 || (dumpNo % 50) == 0) {
+        LogMsg(L"MMT/TLV Subtitle dump #%ld: \"%s\"\n", dumpNo, ttmlPath.c_str());
+    }
 }
 
 static std::string EscapeAssText(const std::string& text);
@@ -1695,6 +1811,7 @@ void CMmtTlvSplitter::CreatePins()
             TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+            DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
 
             if (callbackNo <= 20 || cue.text.empty()) {
                 std::wstring preview = Utf8Preview(cue.text);

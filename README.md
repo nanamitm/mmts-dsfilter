@@ -132,13 +132,18 @@ BackgroundTransparency=50
 ShowBackground=1
 OutlineWidth=0
 DelayMs=0
+DumpSubtitleData=0
+DumpSubtitleDir=
+DumpSubtitleMaxFiles=200
 ```
 
 Generated ASS subtitles use ARIB/TTML cell positions per character so changing
 the selected font does not move later characters on the line. `FontName`,
 `CaptionTransparency`, `BackgroundTransparency`, `ShowBackground`,
 `OutlineWidth`, and `DelayMs` are applied now. If TTML does not provide a
-background color, a dark gray cell background is used.
+background color, a dark gray cell background is used. Set
+`DumpSubtitleData=1` to save raw TTML samples and metadata for investigation;
+an empty `DumpSubtitleDir` writes to `subtitle_dump` next to the filter.
 
 ## Debug Logging
 
