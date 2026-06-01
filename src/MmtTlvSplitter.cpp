@@ -1269,6 +1269,35 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
     double x = baseX;
     double y = baseY;
 
+    // Merged run state: accumulate adjacent cells with identical background
+    // color into a single rectangle to avoid dark edge lines from alpha
+    // compositing between separately drawn same-color rectangles.
+    bool     inRun     = false;
+    double   runX      = 0;
+    double   runWidth  = 0;
+    double   runHeight = 0;
+    uint8_t  runR = 0, runG = 0, runB = 0, runA = 0;
+
+    auto flushRun = [&]() {
+        if (!inRun || runWidth <= 0) return;
+        const int x1 = static_cast<int>(std::floor(runX));
+        const int y1 = static_cast<int>(std::floor(y));
+        const int x2 = static_cast<int>(std::floor(runX + runWidth));
+        const int y2 = static_cast<int>(std::floor(y + runHeight));
+        if (x1 < x2 && y1 < y2) {
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "%zu,0,Default,,0,0,0,,{\\an7\\pos(0,0)\\p1"
+                          "\\1c&H%02X%02X%02X&\\1a&H%02X&}"
+                          "m %d %d l %d %d %d %d %d %d{\\p0}",
+                          events.size(), runB, runG, runR, runA,
+                          x1, y1, x2, y1, x2, y2, x1, y2);
+            events.emplace_back(buf);
+        }
+        inRun = false;
+        runWidth = 0;
+    };
+
     for (const auto& span : p.spanTags) {
         if (span.text.empty())
             continue;
@@ -1279,17 +1308,9 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
 
         const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
         const std::wstring wide = Utf8ToWide(span.text);
-        bool inRun = false;
-        double runX = x;
-        double runWidth = 0;
 
-        auto flushRun = [&]() {
-            if (!inRun || runWidth <= 0)
-                return;
-            AppendAssBackgroundEvent(runX, y, runWidth, spanFontSize, span, settings, events);
-            inRun = false;
-            runWidth = 0;
-        };
+        uint8_t spanR = 0, spanG = 0, spanB = 0, spanA = 0;
+        const bool hasColor = GetAssBackgroundColor(span, settings, spanR, spanG, spanB, spanA);
 
         for (wchar_t ch : wide) {
             if (ch == L'\r')
@@ -1301,16 +1322,28 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
                 continue;
             }
 
-            if (!inRun) {
-                inRun = true;
-                runX = x;
-                runWidth = 0;
+            if (!hasColor) {
+                // No background for this cell: flush any active run and skip
+                flushRun();
+                x += cellWidth;
+                continue;
             }
-            runWidth += cellWidth;
+
+            // Extend the active run if color matches; otherwise start a new one
+            if (inRun && spanR == runR && spanG == runG && spanB == runB && spanA == runA) {
+                runWidth += cellWidth;
+            } else {
+                flushRun();
+                inRun    = true;
+                runX     = x;
+                runWidth = cellWidth;
+                runHeight = spanFontSize;
+                runR = spanR; runG = spanG; runB = spanB; runA = spanA;
+            }
             x += cellWidth;
         }
-        flushRun();
     }
+    flushRun();
 }
 
 static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double fontScale, double extraYAss,
