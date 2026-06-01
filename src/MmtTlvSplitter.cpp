@@ -129,6 +129,10 @@ struct MmtsCaptionSettings {
     int dumpSubtitleMaxFiles = 200;
     std::string fontName = "MS Gothic";
     std::wstring dumpSubtitleDir;
+    // When true, full-width brackets transmitted as MSZ are rendered at half
+    // width (\fscx50) to match ARIB font metrics. When false (default), they
+    // are rendered at full width to avoid overlap with general fonts.
+    bool aribBracketSquish = false;
 };
 
 static void GetMmtsIniPath(WCHAR* iniPath, DWORD size)
@@ -189,6 +193,8 @@ static MmtsCaptionSettings GetMmtsCaptionSettings()
         s.dumpSubtitleMaxFiles = (std::max)(1, (std::min)(10000, _wtoi(buf)));
     if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleDir", buf, ARRAYSIZE(buf)))
         s.dumpSubtitleDir = buf;
+    if (ReadIniValue(iniPath, L"MMTS", L"AribBracketSquish", buf, ARRAYSIZE(buf)))
+        s.aribBracketSquish = _wtoi(buf) != 0;
     if (ReadIniValue(iniPath, L"MMTS", L"FontName", buf, ARRAYSIZE(buf))) {
         int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
         if (len > 1) {
@@ -761,7 +767,8 @@ static bool SpanIsMistaggedFullwidthBracket(const TTMLSpanTag* span)
     return true;
 }
 
-static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
+static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span,
+                                        const MmtsCaptionSettings& settings)
 {
     if (!span)
         return 100;
@@ -771,10 +778,12 @@ static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
     if (!TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) || fontWidth <= 0 || fontHeight <= 0)
         return 100;
 
-    // Broadcasters sometimes transmit full-width brackets (『』「」【】) as
-    // MSZ (72x144), which would produce scaleX=50% and cause visual overlap.
-    // Treat them as full-width (100%) regardless of the transmitted fontSize.
-    if (fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
+    // Broadcasters transmit full-width brackets as MSZ (72x144). With general
+    // fonts this causes overlap, so default to full-width (scaleX=100%).
+    // Set AribBracketSquish=1 in the INI to use ARIB-intended half-width
+    // rendering (scaleX=50%), which matches ARIB-specific font metrics.
+    if (!settings.aribBracketSquish &&
+        fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
         return 100;
 
     return (std::max)(1, static_cast<int>(std::lround(fontWidth * 100.0 / fontHeight)));
@@ -791,7 +800,7 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale,
     if (assFontSize > 0) {
         tags += FormatAssTag("\\fs%d", assFontSize);
     }
-    const int scaleX = AssFontScaleXPercentFromSpan(span);
+    const int scaleX = AssFontScaleXPercentFromSpan(span, settings);
     if (scaleX != 100)
         tags += FormatAssTag("\\fscx%d", scaleX);
     tags += "\\fn" + settings.fontName + "\\fsp0";
@@ -840,7 +849,8 @@ static int CountAssTextChars(const TTMLPTag& p)
     return total;
 }
 
-static double AssCellWidthFromSpan(const TTMLSpanTag* span)
+static double AssCellWidthFromSpan(const TTMLSpanTag* span,
+                                   const MmtsCaptionSettings& settings)
 {
     if (!span)
         return 64.0;
@@ -848,9 +858,10 @@ static double AssCellWidthFromSpan(const TTMLSpanTag* span)
     float fontWidth = 0;
     float fontHeight = 0;
     if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontWidth > 0) {
-        // Full-width brackets mis-tagged as MSZ: use fontHeight as the cell
-        // width so the next character is positioned at the correct offset.
-        if (fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
+        // When not using ARIB font metrics, full-width brackets mis-tagged as
+        // MSZ must advance by a full cell so the next character is not overlapped.
+        if (!settings.aribBracketSquish &&
+            fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
             return fontHeight * 1920.0 / 3840.0;
         return fontWidth * 1920.0 / 3840.0;
     }
@@ -858,10 +869,11 @@ static double AssCellWidthFromSpan(const TTMLSpanTag* span)
     return BaseAssFontSizeFromSpan(span);
 }
 
-static double ParagraphCellWidthAss(const TTMLPTag& p)
+static double ParagraphCellWidthAss(const TTMLPTag& p,
+                                    const MmtsCaptionSettings& settings)
 {
     const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    return AssCellWidthFromSpan(firstSpan);
+    return AssCellWidthFromSpan(firstSpan, settings);
 }
 
 static bool ParagraphOriginX(const TTMLPTag& p, float& originX)
@@ -1265,7 +1277,7 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
     const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
     const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
-    const double fallbackCellWidth = ParagraphCellWidthAss(p);
+    const double fallbackCellWidth = ParagraphCellWidthAss(p, settings);
     double x = baseX;
     double y = baseY;
 
@@ -1302,7 +1314,7 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
         if (span.text.empty())
             continue;
 
-        double cellWidth = AssCellWidthFromSpan(&span);
+        double cellWidth = AssCellWidthFromSpan(&span, settings);
         if (cellWidth <= 0)
             cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
 
@@ -1361,7 +1373,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double
     const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
     const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
-    const double fallbackCellWidth = ParagraphCellWidthAss(p);
+    const double fallbackCellWidth = ParagraphCellWidthAss(p, settings);
     double x = baseX;
     double y = baseY;
     bool wroteEvent = false;
@@ -1373,7 +1385,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double
         if (span.text.empty())
             continue;
 
-        double cellWidth = AssCellWidthFromSpan(&span);
+        double cellWidth = AssCellWidthFromSpan(&span, settings);
         if (cellWidth <= 0)
             cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
 
@@ -1436,15 +1448,16 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double
     return wroteEvent;
 }
 
-static bool CalculateRubyCellX(const TTMLPTag& ruby, const TTMLPTag& parent, double& xAss)
+static bool CalculateRubyCellX(const TTMLPTag& ruby, const TTMLPTag& parent,
+                               const MmtsCaptionSettings& settings, double& xAss)
 {
     float rubyOriginX = 0;
     float parentOriginX = 0;
     if (!ParagraphOriginX(ruby, rubyOriginX) || !ParagraphOriginX(parent, parentOriginX))
         return false;
 
-    const double parentCellAss = ParagraphCellWidthAss(parent);
-    const double rubyCellAss = ParagraphCellWidthAss(ruby);
+    const double parentCellAss = ParagraphCellWidthAss(parent, settings);
+    const double rubyCellAss = ParagraphCellWidthAss(ruby, settings);
     if (parentCellAss <= 0 || rubyCellAss <= 0)
         return false;
 
@@ -1685,7 +1698,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                                paragraphExtraY[i], desiredGap);
                     }
                     double xAss = 0;
-                    if (CalculateRubyCellX(*paragraphs[i], *paragraphs[j], xAss)) {
+                    if (CalculateRubyCellX(*paragraphs[i], *paragraphs[j], settings, xAss)) {
                         paragraphHasXOverride[i] = true;
                         paragraphXOverride[i] = xAss;
                     }
