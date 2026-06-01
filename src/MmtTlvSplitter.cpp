@@ -132,7 +132,7 @@ struct MmtsCaptionSettings {
     // When true, full-width brackets transmitted as MSZ are rendered at half
     // width (\fscx50) to match ARIB font metrics. When false (default), they
     // are rendered at full width to avoid overlap with general fonts.
-    bool aribBracketSquish = false;
+    bool aribBracketSquish = true;
 };
 
 static void GetMmtsIniPath(WCHAR* iniPath, DWORD size)
