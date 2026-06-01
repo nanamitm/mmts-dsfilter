@@ -39,9 +39,20 @@ public:
         const uint8_t* data,
         size_t size)>;
 
+    using SubtitleResourceCallback = std::function<void(
+        int streamIndex,
+        int dataType,
+        int subsampleNumber,
+        int lastSubsampleNumber,
+        long long pts,
+        long long dts,
+        const uint8_t* data,
+        size_t size)>;
+
     void setVideoCallback(SampleCallback cb) { m_videoCallback = std::move(cb); }
     void setAudioCallback(SampleCallback cb) { m_audioCallback = std::move(cb); }
     void setSubtitleCallback(SampleCallback cb) { m_subtitleCallback = std::move(cb); }
+    void setSubtitleResourceCallback(SubtitleResourceCallback cb) { m_subtitleResourceCallback = std::move(cb); }
 
     void onVideoData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu) override;
     void onAudioData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu) override;
@@ -72,6 +83,7 @@ private:
     SampleCallback m_videoCallback;
     SampleCallback m_audioCallback;
     SampleCallback m_subtitleCallback;
+    SubtitleResourceCallback m_subtitleResourceCallback;
     ADTSConverter  m_adtsConverter;
     long long m_basePts{-1};  // first valid PTS seen, in 100ns units
     int m_primaryAudioStreamIndex{-1};

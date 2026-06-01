@@ -553,13 +553,28 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
 
 void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
-    if (!m_subtitleCallback || mfu.data.empty())
+    if (mfu.data.empty())
         return;
 
     rememberSubtitleStream(stream);
 
     long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);
     long long dts = toRefTime(static_cast<int64_t>(mfu.dts), stream);
+
+    if (mfu.subtitleDataType != 0) {
+        if (m_subtitleResourceCallback) {
+            m_subtitleResourceCallback(static_cast<int>(stream.getStreamIndex()),
+                                       mfu.subtitleDataType,
+                                       mfu.subtitleSubsampleNumber,
+                                       mfu.subtitleLastSubsampleNumber,
+                                       pts, dts,
+                                       mfu.data.data(), mfu.data.size());
+        }
+        return;
+    }
+
+    if (!m_subtitleCallback)
+        return;
 
     m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
                        true, pts, dts, true, true,

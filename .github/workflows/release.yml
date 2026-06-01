@@ -45,6 +45,7 @@ jobs:
           Copy-Item -LiteralPath "msvc\x64\Release\mmts-dsfilter.ax" -Destination $packageRoot
           Copy-Item -LiteralPath "scripts\register-filter.ps1" -Destination $packageRoot
           Copy-Item -LiteralPath "scripts\unregister-filter.ps1" -Destination $packageRoot
+          Copy-Item -LiteralPath "settings\mmts-dsfilter.ini" -Destination $packageRoot
           Copy-Item -LiteralPath "README.md" -Destination $packageRoot
 
           $zipPath = Join-Path $PWD "artifacts\$packageName.zip"

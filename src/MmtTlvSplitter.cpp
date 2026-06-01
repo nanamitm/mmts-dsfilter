@@ -3,16 +3,20 @@
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
 #include "ttml.h"
+#include "pugixml.hpp"
 #include <fstream>
 #include <strmif.h>
 #include <cwchar>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
@@ -21,6 +25,7 @@ static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuratio
 static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
+static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
 
 #define LogMsg MmtTlvLogInfo
 #define LogDetail MmtTlvLogDebug
@@ -97,9 +102,455 @@ struct TtmlTextCue {
     std::vector<std::string> assEvents;
     bool hasBegin = false;
     bool hasEnd = false;
+    bool missingGlyph = false;
     REFERENCE_TIME begin = 0;
     REFERENCE_TIME end = 0;
 };
+
+struct SubtitleGlyphResource {
+    int unitsPerEm = 360;
+    int ascent = 360;
+    int descent = 0;
+    std::string pathData;
+};
+
+static std::mutex g_subtitleGlyphMutex;
+static std::map<std::pair<int, uint32_t>, SubtitleGlyphResource> g_subtitleGlyphs;
+static std::mutex g_subtitleGlyphLoadMutex;
+static std::vector<std::wstring> g_loadedSubtitleGlyphFiles;
+
+struct MmtsCaptionSettings {
+    int captionAlpha = 0;       // ASS alpha: 0=opaque, 255=fully transparent
+    int backgroundAlpha = -1;   // -1=use TTML data, 0-255=fixed override
+    bool showBackground = true;
+    int outlineWidth = 0;
+    int delayMs = 0;
+    bool dumpSubtitleData = false;
+    int dumpSubtitleMaxFiles = 200;
+    std::string fontName = "MS Gothic";
+    std::wstring dumpSubtitleDir;
+    // When true, full-width brackets transmitted as MSZ are rendered at half
+    // width (\fscx50) to match ARIB font metrics. When false (default), they
+    // are rendered at full width to avoid overlap with general fonts.
+    bool aribBracketSquish = true;
+};
+
+static void GetMmtsIniPath(WCHAR* iniPath, DWORD size)
+{
+    HMODULE hMod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&GetMmtsIniPath), &hMod);
+    if (!GetModuleFileNameW(hMod, iniPath, size)) {
+        iniPath[0] = L'\0';
+        return;
+    }
+
+    WCHAR* dot = wcsrchr(iniPath, L'.');
+    if (dot)
+        wcscpy_s(dot, size - static_cast<DWORD>(dot - iniPath), L".ini");
+}
+
+static bool ReadIniValue(const WCHAR* iniPath, const WCHAR* section, const WCHAR* key,
+                         WCHAR* buf, DWORD size)
+{
+    return GetPrivateProfileStringW(section, key, L"", buf, size, iniPath) > 0;
+}
+
+static MmtsCaptionSettings GetMmtsCaptionSettings()
+{
+    static MmtsCaptionSettings cached;
+    static DWORD lastLoad = 0;
+    static WCHAR lastPath[MAX_PATH] = {};
+
+    WCHAR iniPath[MAX_PATH] = {};
+    GetMmtsIniPath(iniPath, MAX_PATH);
+
+    DWORD now = GetTickCount();
+    if (lastLoad != 0 && now - lastLoad <= 5000 && wcscmp(lastPath, iniPath) == 0)
+        return cached;
+
+    MmtsCaptionSettings s;
+    WCHAR buf[MAX_PATH] = {};
+
+    if (ReadIniValue(iniPath, L"MMTS", L"CaptionTransparency", buf, ARRAYSIZE(buf))) {
+        int t = (std::max)(0, (std::min)(100, _wtoi(buf)));
+        s.captionAlpha = t * 255 / 100;
+    }
+    if (ReadIniValue(iniPath, L"MMTS", L"BackgroundTransparency", buf, ARRAYSIZE(buf))) {
+        int t = (std::max)(0, (std::min)(100, _wtoi(buf)));
+        s.backgroundAlpha = t * 255 / 100;
+    }
+    if (ReadIniValue(iniPath, L"MMTS", L"ShowBackground", buf, ARRAYSIZE(buf)))
+        s.showBackground = _wtoi(buf) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"OutlineWidth", buf, ARRAYSIZE(buf)))
+        s.outlineWidth = (std::max)(0, (std::min)(10, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"DelayMs", buf, ARRAYSIZE(buf)))
+        s.delayMs = (std::max)(-30000, (std::min)(30000, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleData", buf, ARRAYSIZE(buf)))
+        s.dumpSubtitleData = _wtoi(buf) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleMaxFiles", buf, ARRAYSIZE(buf)))
+        s.dumpSubtitleMaxFiles = (std::max)(1, (std::min)(10000, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleDir", buf, ARRAYSIZE(buf)))
+        s.dumpSubtitleDir = buf;
+    if (ReadIniValue(iniPath, L"MMTS", L"AribBracketSquish", buf, ARRAYSIZE(buf)))
+        s.aribBracketSquish = _wtoi(buf) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"FontName", buf, ARRAYSIZE(buf))) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+        if (len > 1) {
+            s.fontName.resize(len - 1);
+            WideCharToMultiByte(CP_UTF8, 0, buf, -1, &s.fontName[0], len, nullptr, nullptr);
+        }
+    }
+
+    cached = s;
+    lastLoad = now;
+    wcscpy_s(lastPath, iniPath);
+    return cached;
+}
+
+static bool EnsureDirectoryTree(const std::wstring& path)
+{
+    if (path.empty())
+        return false;
+
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES)
+        return (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+
+    size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos && slash > 2) {
+        std::wstring parent = path.substr(0, slash);
+        if (!parent.empty() && !EnsureDirectoryTree(parent))
+            return false;
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr))
+        return true;
+    return GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool WriteFileBytes(const std::wstring& path, const void* data, size_t size)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t remaining = size;
+    bool ok = true;
+    while (remaining > 0) {
+        DWORD chunk = static_cast<DWORD>((std::min)(remaining, static_cast<size_t>(DWORD_MAX)));
+        DWORD written = 0;
+        if (!WriteFile(h, p, chunk, &written, nullptr) || written != chunk) {
+            ok = false;
+            break;
+        }
+        p += written;
+        remaining -= written;
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+static bool ReadFileBytes(const std::wstring& path, std::vector<uint8_t>& data)
+{
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > 16 * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+
+    data.resize(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    bool ok = data.empty() ||
+              ReadFile(h, data.data(), static_cast<DWORD>(data.size()), &read, nullptr);
+    CloseHandle(h);
+    return ok && read == data.size();
+}
+
+static std::wstring DefaultSubtitleDumpDir()
+{
+    WCHAR iniPath[MAX_PATH] = {};
+    GetMmtsIniPath(iniPath, MAX_PATH);
+    WCHAR* slash = wcsrchr(iniPath, L'\\');
+    if (slash)
+        *(slash + 1) = L'\0';
+    else
+        iniPath[0] = L'\0';
+
+    std::wstring dir = iniPath;
+    dir += L"subtitle_dump";
+    return dir;
+}
+
+static void DumpSubtitleDataIfEnabled(int streamIndex, LONG callbackNo, REFERENCE_TIME normPts,
+                                      const uint8_t* data, size_t size,
+                                      const TtmlTextCue& cue, const TtmlDebugStats& stats)
+{
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (!settings.dumpSubtitleData || !data || size == 0)
+        return;
+
+    static volatile LONG s_dumpedSamples = 0;
+    LONG dumpNo = InterlockedIncrement(&s_dumpedSamples);
+    if (dumpNo > settings.dumpSubtitleMaxFiles)
+        return;
+
+    std::wstring dir = settings.dumpSubtitleDir.empty() ? DefaultSubtitleDumpDir() : settings.dumpSubtitleDir;
+    if (!EnsureDirectoryTree(dir)) {
+        LogMsg(L"MMT/TLV Subtitle dump: cannot create dir \"%s\"\n", dir.c_str());
+        return;
+    }
+
+    WCHAR baseName[192] = {};
+    StringCchPrintfW(baseName, ARRAYSIZE(baseName),
+                    L"subtitle_s%d_cb%06ld_pts%I64d", streamIndex, callbackNo, normPts / 10000);
+
+    std::wstring ttmlPath = dir + L"\\" + baseName + L".ttml";
+    if (!WriteFileBytes(ttmlPath, data, size)) {
+        LogMsg(L"MMT/TLV Subtitle dump: failed to write \"%s\"\n", ttmlPath.c_str());
+        return;
+    }
+
+    char meta[512] = {};
+    std::snprintf(meta, sizeof(meta),
+                  "streamIndex=%d\ncallback=%ld\nptsMs=%lld\nsize=%zu\n"
+                  "ttmlBeginMs=%lld\nhasBegin=%d\nttmlEndMs=%lld\nhasEnd=%d\n"
+                  "divs=%zu\nparagraphs=%zu\nspans=%zu\ntextBytes=%zu\n",
+                  streamIndex, callbackNo, static_cast<long long>(normPts / 10000), size,
+                  static_cast<long long>(cue.begin / 10000), cue.hasBegin ? 1 : 0,
+                  static_cast<long long>(cue.end / 10000), cue.hasEnd ? 1 : 0,
+                  stats.divs, stats.paragraphs, stats.spans, stats.textBytes);
+    std::wstring metaPath = dir + L"\\" + baseName + L".txt";
+    WriteFileBytes(metaPath, meta, strlen(meta));
+
+    if (dumpNo <= 5 || (dumpNo % 50) == 0) {
+        LogMsg(L"MMT/TLV Subtitle dump #%ld: \"%s\"\n", dumpNo, ttmlPath.c_str());
+    }
+}
+
+static const WCHAR* GuessSubtitleResourceExtension(const uint8_t* data, size_t size)
+{
+    if (!data || size == 0)
+        return L".bin";
+
+    const size_t probe = (std::min)(size, static_cast<size_t>(64));
+    size_t i = 0;
+    while (i < probe && (data[i] == 0xEF || data[i] == 0xBB || data[i] == 0xBF ||
+                         data[i] == ' ' || data[i] == '\t' || data[i] == '\r' || data[i] == '\n')) {
+        ++i;
+    }
+
+    if (i < probe && data[i] == '<') {
+        if (i + 4 < size && std::memcmp(data + i, "<svg", 4) == 0)
+            return L".svg";
+        if (i + 5 < size && std::memcmp(data + i, "<?xml", 5) == 0)
+            return L".svg";
+    }
+    if (size >= 2 && data[0] == 0x1F && data[1] == 0x8B)
+        return L".gz";
+    return L".bin";
+}
+
+static void DumpSubtitleResourceIfEnabled(int streamIndex, LONG callbackNo, REFERENCE_TIME normPts,
+                                          int dataType, int subsampleNumber, int lastSubsampleNumber,
+                                          const uint8_t* data, size_t size)
+{
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (!settings.dumpSubtitleData || !data || size == 0)
+        return;
+
+    static volatile LONG s_dumpedResources = 0;
+    LONG dumpNo = InterlockedIncrement(&s_dumpedResources);
+    if (dumpNo > settings.dumpSubtitleMaxFiles)
+        return;
+
+    std::wstring dir = settings.dumpSubtitleDir.empty() ? DefaultSubtitleDumpDir() : settings.dumpSubtitleDir;
+    if (!EnsureDirectoryTree(dir)) {
+        LogMsg(L"MMT/TLV Subtitle resource dump: cannot create dir \"%s\"\n", dir.c_str());
+        return;
+    }
+
+    WCHAR baseName[224] = {};
+    StringCchPrintfW(baseName, ARRAYSIZE(baseName),
+                    L"subtitle_resource_s%d_cb%06ld_pts%I64d_type%d_sub%d_of%d",
+                    streamIndex, callbackNo, normPts / 10000,
+                    dataType, subsampleNumber, lastSubsampleNumber);
+
+    std::wstring dataPath = dir + L"\\" + baseName + GuessSubtitleResourceExtension(data, size);
+    if (!WriteFileBytes(dataPath, data, size)) {
+        LogMsg(L"MMT/TLV Subtitle resource dump: failed to write \"%s\"\n", dataPath.c_str());
+        return;
+    }
+
+    char meta[384] = {};
+    std::snprintf(meta, sizeof(meta),
+                  "streamIndex=%d\ncallback=%ld\nptsMs=%lld\nsize=%zu\n"
+                  "dataType=%d\nsubsampleNumber=%d\nlastSubsampleNumber=%d\n",
+                  streamIndex, callbackNo, static_cast<long long>(normPts / 10000), size,
+                  dataType, subsampleNumber, lastSubsampleNumber);
+    std::wstring metaPath = dir + L"\\" + baseName + L".txt";
+    WriteFileBytes(metaPath, meta, strlen(meta));
+
+    if (dumpNo <= 5 || (dumpNo % 50) == 0) {
+        LogMsg(L"MMT/TLV Subtitle resource dump #%ld: \"%s\"\n", dumpNo, dataPath.c_str());
+    }
+}
+
+static bool ParseSvgUnicodeValue(const char* value, uint32_t& codepoint)
+{
+    if (!value || !*value)
+        return false;
+
+    std::string text(value);
+    const std::string hexEntity = "&#x";
+    size_t pos = text.find(hexEntity);
+    if (pos != std::string::npos) {
+        pos += hexEntity.size();
+        size_t end = text.find(';', pos);
+        if (end == std::string::npos)
+            end = text.size();
+        codepoint = static_cast<uint32_t>(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16));
+        return codepoint != 0;
+    }
+
+    if (text.rfind("U+", 0) == 0 || text.rfind("u+", 0) == 0) {
+        codepoint = static_cast<uint32_t>(std::strtoul(text.c_str() + 2, nullptr, 16));
+        return codepoint != 0;
+    }
+
+    int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
+    if (needed <= 0)
+        return false;
+    std::wstring wide(static_cast<size_t>(needed), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), wide.data(), needed);
+    codepoint = static_cast<uint32_t>(wide[0]);
+    return codepoint != 0;
+}
+
+static bool ParseUnicodeRangeValue(const char* value, uint32_t& codepoint)
+{
+    if (!value || !*value)
+        return false;
+    std::string text(value);
+    size_t pos = text.find("U+");
+    if (pos == std::string::npos)
+        pos = text.find("u+");
+    if (pos == std::string::npos)
+        return false;
+    pos += 2;
+    size_t end = pos;
+    while (end < text.size() && std::isxdigit(static_cast<unsigned char>(text[end])))
+        ++end;
+    if (end == pos)
+        return false;
+    codepoint = static_cast<uint32_t>(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16));
+    return codepoint != 0;
+}
+
+static void RegisterSubtitleGlyphResource(int streamIndex, const uint8_t* data, size_t size)
+{
+    if (!data || size == 0)
+        return;
+
+    pugi::xml_document doc;
+    pugi::xml_parse_result result = doc.load_buffer(data, size);
+    if (result.status != pugi::status_ok) {
+        LogDetail(L"MMT/TLV Subtitle glyph resource parse failed: streamIndex=%d status=%d\n",
+                  streamIndex, static_cast<int>(result.status));
+        return;
+    }
+
+    pugi::xml_node svg = doc.child("svg");
+    if (!svg) {
+        LogDetail(L"MMT/TLV Subtitle glyph resource ignored: streamIndex=%d no svg root\n", streamIndex);
+        return;
+    }
+
+    int registered = 0;
+    for (pugi::xml_node defs : svg.children("defs")) {
+        for (pugi::xml_node font : defs.children("font")) {
+            SubtitleGlyphResource base;
+            if (font.attribute("horiz-adv-x"))
+                base.unitsPerEm = font.attribute("horiz-adv-x").as_int(base.unitsPerEm);
+
+            pugi::xml_node face = font.child("font-face");
+            if (face) {
+                base.unitsPerEm = face.attribute("units-per-em").as_int(base.unitsPerEm);
+                base.ascent = face.attribute("ascent").as_int(base.ascent);
+                base.descent = face.attribute("descent").as_int(base.descent);
+            }
+
+            uint32_t faceCodepoint = 0;
+            ParseUnicodeRangeValue(face.attribute("unicode-range").value(), faceCodepoint);
+
+            for (pugi::xml_node glyph : font.children("glyph")) {
+                uint32_t codepoint = 0;
+                if (!ParseSvgUnicodeValue(glyph.attribute("unicode").value(), codepoint))
+                    codepoint = faceCodepoint;
+                const char* path = glyph.attribute("d").value();
+                if (codepoint == 0 || !path || !*path)
+                    continue;
+
+                SubtitleGlyphResource resource = base;
+                resource.pathData = path;
+                std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+                g_subtitleGlyphs[{streamIndex, codepoint}] = std::move(resource);
+                ++registered;
+                LogDetail(L"MMT/TLV Subtitle glyph registered: streamIndex=%d U+%04X units=%d ascent=%d descent=%d\n",
+                          streamIndex, codepoint, resource.unitsPerEm, resource.ascent, resource.descent);
+            }
+        }
+    }
+
+    if (registered == 0) {
+        LogDetail(L"MMT/TLV Subtitle glyph resource parsed but no glyph registered: streamIndex=%d\n", streamIndex);
+    }
+}
+
+static void TryLoadDumpedSubtitleGlyphResources(int streamIndex)
+{
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (!settings.dumpSubtitleData)
+        return;
+
+    std::lock_guard<std::mutex> loadLock(g_subtitleGlyphLoadMutex);
+    std::wstring dir = settings.dumpSubtitleDir.empty() ? DefaultSubtitleDumpDir() : settings.dumpSubtitleDir;
+    std::wstring pattern = dir + L"\\subtitle_resource_s*_*.svg";
+
+    WIN32_FIND_DATAW findData = {};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &findData);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do {
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        std::wstring path = dir + L"\\" + findData.cFileName;
+        if (std::find(g_loadedSubtitleGlyphFiles.begin(), g_loadedSubtitleGlyphFiles.end(), path) !=
+            g_loadedSubtitleGlyphFiles.end()) {
+            continue;
+        }
+
+        std::vector<uint8_t> data;
+        if (ReadFileBytes(path, data)) {
+            RegisterSubtitleGlyphResource(streamIndex, data.data(), data.size());
+            g_loadedSubtitleGlyphFiles.push_back(path);
+            LogDetail(L"MMT/TLV Subtitle glyph loaded from dump: streamIndex=%d file=\"%s\"\n",
+                      streamIndex, path.c_str());
+        }
+    } while (FindNextFileW(hFind, &findData));
+
+    FindClose(hFind);
+}
 
 static std::string EscapeAssText(const std::string& text);
 
@@ -291,7 +742,55 @@ static int AssFontSizeFromSpan(const TTMLSpanTag* span, double fontScale)
     return (std::max)(1, static_cast<int>(std::lround(BaseAssFontSizeFromSpan(span) * fontScale)));
 }
 
-static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale)
+// Returns true when the span text consists solely of full-width corner/black
+// brackets (U+300C-U+300F, U+3010-U+3011) that some broadcasters incorrectly
+// transmit as MSZ (half-width). All six code points share the UTF-8 prefix
+// 0xE3 0x80 and have a third byte in [0x8C, 0x91].
+static bool SpanIsMistaggedFullwidthBracket(const TTMLSpanTag* span)
+{
+    if (!span || span->text.empty())
+        return false;
+
+    const std::string& t = span->text;
+    size_t pos = 0;
+    while (pos < t.size()) {
+        unsigned char b0 = static_cast<unsigned char>(t[pos]);
+        unsigned char b1 = (pos + 1 < t.size()) ? static_cast<unsigned char>(t[pos + 1]) : 0;
+        unsigned char b2 = (pos + 2 < t.size()) ? static_cast<unsigned char>(t[pos + 2]) : 0;
+        // U+300C-U+300F, U+3010-U+3011 all encode as E3 80 [8C-91]
+        if (b0 == 0xE3 && b1 == 0x80 && b2 >= 0x8C && b2 <= 0x91) {
+            pos += 3;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span,
+                                        const MmtsCaptionSettings& settings)
+{
+    if (!span)
+        return 100;
+
+    float fontWidth = 0;
+    float fontHeight = 0;
+    if (!TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) || fontWidth <= 0 || fontHeight <= 0)
+        return 100;
+
+    // Broadcasters transmit full-width brackets as MSZ (72x144). With general
+    // fonts this causes overlap, so default to full-width (scaleX=100%).
+    // Set AribBracketSquish=1 in the INI to use ARIB-intended half-width
+    // rendering (scaleX=50%), which matches ARIB-specific font metrics.
+    if (!settings.aribBracketSquish &&
+        fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
+        return 100;
+
+    return (std::max)(1, static_cast<int>(std::lround(fontWidth * 100.0 / fontHeight)));
+}
+
+static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale,
+                                     const MmtsCaptionSettings& settings)
 {
     std::string tags;
     if (!span)
@@ -301,7 +800,18 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale)
     if (assFontSize > 0) {
         tags += FormatAssTag("\\fs%d", assFontSize);
     }
-    tags += "\\fnMS Gothic\\fsp0";
+    const int scaleX = AssFontScaleXPercentFromSpan(span, settings);
+    if (scaleX != 100)
+        tags += FormatAssTag("\\fscx%d", scaleX);
+    tags += "\\fn" + settings.fontName + "\\fsp0";
+    if (settings.captionAlpha > 0) {
+        char alphaBuf[32];
+        std::snprintf(alphaBuf, sizeof(alphaBuf), "\\1a&H%02X&",
+                      static_cast<unsigned>(settings.captionAlpha));
+        tags += alphaBuf;
+    }
+    if (settings.outlineWidth > 0)
+        tags += FormatAssTag("\\bord%d", settings.outlineWidth);
 
     if (span->style.color.has_value()) {
         try {
@@ -311,13 +821,6 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale)
     }
 
     return tags;
-}
-
-static double EstimateAssCharWidth(wchar_t ch, int fontSize)
-{
-    if ((ch >= 0x20 && ch <= 0x7e) || (ch >= 0xff61 && ch <= 0xff9f))
-        return fontSize * 0.55;
-    return fontSize * 0.95;
 }
 
 static std::wstring Utf8ToWide(const std::string& text)
@@ -333,112 +836,6 @@ static std::wstring Utf8ToWide(const std::string& text)
     return wide;
 }
 
-static bool MeasureGdiTextWidth(const std::wstring& text, int fontSize, double& width)
-{
-    if (text.empty() || fontSize <= 0)
-        return false;
-
-    static std::unordered_map<std::wstring, double> cache;
-    std::wstring key = std::to_wstring(fontSize) + L"\n" + text;
-    auto it = cache.find(key);
-    if (it != cache.end()) {
-        width = it->second;
-        return true;
-    }
-
-    HDC hdc = CreateCompatibleDC(nullptr);
-    if (!hdc)
-        return false;
-
-    HFONT font = CreateFontW(-fontSize, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Meiryo");
-    if (!font) {
-        DeleteDC(hdc);
-        return false;
-    }
-
-    HGDIOBJ oldFont = SelectObject(hdc, font);
-    SIZE size = {};
-    const BOOL ok = GetTextExtentPoint32W(hdc, text.c_str(), static_cast<int>(text.size()), &size);
-    if (oldFont)
-        SelectObject(hdc, oldFont);
-    DeleteObject(font);
-    DeleteDC(hdc);
-
-    if (!ok)
-        return false;
-
-    width = static_cast<double>(size.cx);
-    cache.emplace(std::move(key), width);
-    return true;
-}
-
-static double EstimateAssHalfLineWidth(const TTMLPTag& p)
-{
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    const int fallbackFontSize = AssFontSizeFromSpan(firstSpan, 1.0);
-    double maxWidth = 0;
-    double currentWidth = 0;
-
-    for (const auto& span : p.spanTags) {
-        const int fontSize = AssFontSizeFromSpan(&span, 1.0);
-        std::wstring wide = Utf8ToWide(span.text);
-        for (wchar_t ch : wide) {
-            if (ch == L'\r')
-                continue;
-            if (ch == L'\n') {
-                maxWidth = (std::max)(maxWidth, currentWidth);
-                currentWidth = 0;
-                continue;
-            }
-            currentWidth += EstimateAssCharWidth(ch, fontSize > 0 ? fontSize : fallbackFontSize);
-        }
-    }
-
-    maxWidth = (std::max)(maxWidth, currentWidth);
-    return maxWidth / 2.0;
-}
-
-static double MeasureAssHalfLineWidth(const TTMLPTag& p)
-{
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    const int fallbackFontSize = AssFontSizeFromSpan(firstSpan, 1.0);
-    double maxWidth = 0;
-    std::wstring currentLine;
-
-    auto finishLine = [&]() {
-        if (currentLine.empty()) {
-            maxWidth = (std::max)(maxWidth, 0.0);
-            return;
-        }
-
-        double lineWidth = 0;
-        if (!MeasureGdiTextWidth(currentLine, fallbackFontSize, lineWidth)) {
-            for (wchar_t ch : currentLine)
-                lineWidth += EstimateAssCharWidth(ch, fallbackFontSize);
-        }
-        maxWidth = (std::max)(maxWidth, lineWidth);
-        currentLine.clear();
-    };
-
-    for (const auto& span : p.spanTags) {
-        std::wstring wide = Utf8ToWide(span.text);
-        for (wchar_t ch : wide) {
-            if (ch == L'\r')
-                continue;
-            if (ch == L'\n') {
-                finishLine();
-                continue;
-            }
-            currentLine.push_back(ch);
-        }
-    }
-    finishLine();
-
-    return maxWidth / 2.0;
-}
-
 static int CountAssTextChars(const TTMLPTag& p)
 {
     int total = 0;
@@ -452,23 +849,31 @@ static int CountAssTextChars(const TTMLPTag& p)
     return total;
 }
 
-static double AssCellWidthFromSpan(const TTMLSpanTag* span)
+static double AssCellWidthFromSpan(const TTMLSpanTag* span,
+                                   const MmtsCaptionSettings& settings)
 {
     if (!span)
         return 64.0;
 
     float fontWidth = 0;
     float fontHeight = 0;
-    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontWidth > 0)
+    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontWidth > 0) {
+        // When not using ARIB font metrics, full-width brackets mis-tagged as
+        // MSZ must advance by a full cell so the next character is not overlapped.
+        if (!settings.aribBracketSquish &&
+            fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
+            return fontHeight * 1920.0 / 3840.0;
         return fontWidth * 1920.0 / 3840.0;
+    }
 
     return BaseAssFontSizeFromSpan(span);
 }
 
-static double ParagraphCellWidthAss(const TTMLPTag& p)
+static double ParagraphCellWidthAss(const TTMLPTag& p,
+                                    const MmtsCaptionSettings& settings)
 {
     const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    return AssCellWidthFromSpan(firstSpan);
+    return AssCellWidthFromSpan(firstSpan, settings);
 }
 
 static bool ParagraphOriginX(const TTMLPTag& p, float& originX)
@@ -477,48 +882,582 @@ static bool ParagraphOriginX(const TTMLPTag& p, float& originX)
     return TryGetLengthPair(p.region.origin, originX, originY);
 }
 
-static const TTMLPTag* SelectAssPositionParagraph(const TTMLDivTag& div)
+static std::string BuildAssPositionTagsFromAss(double xPos, double yPos)
 {
-    const TTMLPTag* selected = nullptr;
-    double selectedWidth = -1;
-
-    for (const auto& p : div.pTags) {
-        const double width = EstimateAssHalfLineWidth(p);
-        if (width > selectedWidth) {
-            selected = &p;
-            selectedWidth = width;
-        }
-    }
-
-    return selected;
+    const int x = static_cast<int>(std::floor(xPos));
+    const int y = static_cast<int>(std::floor(yPos));
+    return std::string("\\an7") +
+           FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
 }
 
-static std::string BuildAssPositionTags(const TTMLPTag& p, double extraYAss,
-                                        bool hasXOverride, double xOverrideAss)
+static bool ParagraphBasePositionAss(const TTMLPTag& p, double extraYAss,
+                                     bool hasXOverride, double xOverrideAss,
+                                     double& xAss, double& yAss)
 {
     float originX = 0;
     float originY = 0;
-    if (TryGetLengthPair(p.region.origin, originX, originY)) {
-        double xPos = hasXOverride ? xOverrideAss : originX * 1920.0 / 3840.0;
-        const double yPos = (originY + B24LineOffsetYFromParagraph(p)) * 1080.0 / 2160.0 + extraYAss;
-        const int x = static_cast<int>(std::lround(xPos));
-        const int y = static_cast<int>(std::lround(yPos));
-        return std::string("\\an7") +
-               FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
-    }
+    if (!TryGetLengthPair(p.region.origin, originX, originY))
+        return false;
 
-    return "\\an2\\pos(960,980)";
+    xAss = hasXOverride ? xOverrideAss : originX * 1920.0 / 3840.0;
+    yAss = (originY + B24LineOffsetYFromParagraph(p)) * 1080.0 / 2160.0 + extraYAss;
+    return true;
 }
 
-static bool CalculateRubyCellX(const TTMLPTag& ruby, const TTMLPTag& parent, double& xAss)
+static std::string WideCharSliceToUtf8(const std::wstring& text, size_t pos, size_t& nextPos)
+{
+    nextPos = pos + 1;
+    if (pos >= text.size())
+        return {};
+
+    wchar_t chars[2] = { text[pos], 0 };
+    int charCount = 1;
+    if (chars[0] >= 0xD800 && chars[0] <= 0xDBFF && pos + 1 < text.size() &&
+        text[pos + 1] >= 0xDC00 && text[pos + 1] <= 0xDFFF) {
+        chars[1] = text[pos + 1];
+        charCount = 2;
+        nextPos = pos + 2;
+    }
+
+    const int bytes = WideCharToMultiByte(CP_UTF8, 0, chars, charCount, nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0)
+        return {};
+
+    std::string utf8(static_cast<size_t>(bytes), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, chars, charCount, &utf8[0], bytes, nullptr, nullptr);
+    return utf8;
+}
+
+class SvgPathParser {
+public:
+    explicit SvgPathParser(const std::string& path) : m_path(path) {}
+
+    bool eof()
+    {
+        skipSeparators();
+        return m_pos >= m_path.size();
+    }
+
+    bool readCommand(char& command)
+    {
+        skipSeparators();
+        if (m_pos >= m_path.size())
+            return false;
+        char c = m_path[m_pos];
+        if (std::isalpha(static_cast<unsigned char>(c))) {
+            command = c;
+            ++m_pos;
+            return true;
+        }
+        return false;
+    }
+
+    bool readNumber(double& value)
+    {
+        skipSeparators();
+        if (m_pos >= m_path.size())
+            return false;
+        const char* begin = m_path.c_str() + m_pos;
+        char* end = nullptr;
+        value = std::strtod(begin, &end);
+        if (end == begin)
+            return false;
+        m_pos = static_cast<size_t>(end - m_path.c_str());
+        return true;
+    }
+
+private:
+    void skipSeparators()
+    {
+        while (m_pos < m_path.size()) {
+            const unsigned char c = static_cast<unsigned char>(m_path[m_pos]);
+            if (std::isspace(c) || c == ',') {
+                ++m_pos;
+                continue;
+            }
+            break;
+        }
+    }
+
+    const std::string& m_path;
+    size_t m_pos = 0;
+};
+
+static void AppendAssDrawingPoint(std::ostringstream& ass, double value)
+{
+    ass << static_cast<int>(std::lround(value));
+}
+
+static bool BuildAssGlyphDrawingPath(const SubtitleGlyphResource& glyph,
+                                     double xPos, double yPos,
+                                     double width, double height,
+                                     std::string& out)
+{
+    if (glyph.pathData.empty() || width <= 0 || height <= 0)
+        return false;
+
+    const double units = glyph.unitsPerEm > 0 ? glyph.unitsPerEm : 360.0;
+    const double glyphHeight = glyph.ascent > glyph.descent ? glyph.ascent - glyph.descent : units;
+    const double scaleX = width / units;
+    const double scaleY = height / glyphHeight;
+    auto tx = [&](double v) { return xPos + v * scaleX; };
+    auto ty = [&](double v) { return yPos + (glyph.ascent - v) * scaleY; };
+
+    SvgPathParser parser(glyph.pathData);
+    std::ostringstream ass;
+    char command = 0;
+    double cx = 0;
+    double cy = 0;
+    double sx = 0;
+    double sy = 0;
+
+    auto appendMove = [&](double x, double y) {
+        ass << "m ";
+        AppendAssDrawingPoint(ass, tx(x));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y));
+        ass << ' ';
+        cx = sx = x;
+        cy = sy = y;
+    };
+    auto appendLine = [&](double x, double y) {
+        ass << "l ";
+        AppendAssDrawingPoint(ass, tx(x));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y));
+        ass << ' ';
+        cx = x;
+        cy = y;
+    };
+    auto appendCubic = [&](double x1, double y1, double x2, double y2, double x, double y) {
+        ass << "b ";
+        AppendAssDrawingPoint(ass, tx(x1));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y1));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, tx(x2));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y2));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, tx(x));
+        ass << ' ';
+        AppendAssDrawingPoint(ass, ty(y));
+        ass << ' ';
+        cx = x;
+        cy = y;
+    };
+
+    bool wrote = false;
+    while (!parser.eof()) {
+        char nextCommand = 0;
+        if (parser.readCommand(nextCommand))
+            command = nextCommand;
+        if (command == 0)
+            break;
+
+        const bool relative = command >= 'a' && command <= 'z';
+        switch (command) {
+        case 'M':
+        case 'm':
+        {
+            double x = 0;
+            double y = 0;
+            if (!parser.readNumber(x) || !parser.readNumber(y))
+                return wrote;
+            if (relative) {
+                x += cx;
+                y += cy;
+            }
+            appendMove(x, y);
+            wrote = true;
+            command = relative ? 'l' : 'L';
+            break;
+        }
+        case 'L':
+        case 'l':
+        {
+            double x = 0;
+            double y = 0;
+            if (!parser.readNumber(x) || !parser.readNumber(y))
+                break;
+            if (relative) {
+                x += cx;
+                y += cy;
+            }
+            appendLine(x, y);
+            wrote = true;
+            break;
+        }
+        case 'H':
+        case 'h':
+        {
+            double x = 0;
+            if (!parser.readNumber(x))
+                break;
+            if (relative)
+                x += cx;
+            appendLine(x, cy);
+            wrote = true;
+            break;
+        }
+        case 'V':
+        case 'v':
+        {
+            double y = 0;
+            if (!parser.readNumber(y))
+                break;
+            if (relative)
+                y += cy;
+            appendLine(cx, y);
+            wrote = true;
+            break;
+        }
+        case 'C':
+        case 'c':
+        {
+            double x1 = 0;
+            double y1 = 0;
+            double x2 = 0;
+            double y2 = 0;
+            double x = 0;
+            double y = 0;
+            if (!parser.readNumber(x1) || !parser.readNumber(y1) ||
+                !parser.readNumber(x2) || !parser.readNumber(y2) ||
+                !parser.readNumber(x) || !parser.readNumber(y)) {
+                break;
+            }
+            if (relative) {
+                x1 += cx;
+                y1 += cy;
+                x2 += cx;
+                y2 += cy;
+                x += cx;
+                y += cy;
+            }
+            appendCubic(x1, y1, x2, y2, x, y);
+            wrote = true;
+            break;
+        }
+        case 'Z':
+        case 'z':
+            appendLine(sx, sy);
+            wrote = true;
+            command = 0;
+            break;
+        default:
+            return wrote;
+        }
+    }
+
+    out = ass.str();
+    return wrote && !out.empty();
+}
+
+static bool GetSubtitleGlyphResource(int streamIndex, uint32_t codepoint, SubtitleGlyphResource& glyph)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+        auto it = g_subtitleGlyphs.find({streamIndex, codepoint});
+        if (it != g_subtitleGlyphs.end()) {
+            glyph = it->second;
+            return true;
+        }
+    }
+
+    TryLoadDumpedSubtitleGlyphResources(streamIndex);
+
+    std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+    auto it = g_subtitleGlyphs.find({streamIndex, codepoint});
+    if (it != g_subtitleGlyphs.end()) {
+        glyph = it->second;
+        return true;
+    }
+
+    if (codepoint >= 0xE000 && codepoint <= 0xF8FF) {
+        LogDetail(L"MMT/TLV Subtitle glyph missing: streamIndex=%d U+%04X\n", streamIndex, codepoint);
+    }
+    return false;
+}
+
+static std::string BuildAssDrawingStyleTags(const TTMLSpanTag* span,
+                                            const MmtsCaptionSettings& settings)
+{
+    std::string tags = "\\bord0";
+    if (settings.captionAlpha > 0) {
+        char alphaBuf[32];
+        std::snprintf(alphaBuf, sizeof(alphaBuf), "\\1a&H%02X&",
+                      static_cast<unsigned>(settings.captionAlpha));
+        tags += alphaBuf;
+    }
+    if (span && span->style.color.has_value()) {
+        try {
+            tags += FormatAssColorTag(span->style.color->getValue<TTMLCssValueColor>());
+        } catch (const std::bad_variant_access&) {
+        }
+    }
+    return tags;
+}
+
+static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
+                                  uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& assAlpha)
+{
+    r = kDefaultBackgroundRgb;
+    g = kDefaultBackgroundRgb;
+    b = kDefaultBackgroundRgb;
+    bool hasColor = false;
+
+    if (span.style.backgroundColor.has_value()) {
+        try {
+            const TTMLCssValueColor color = span.style.backgroundColor->getValue<TTMLCssValueColor>();
+            r = color.r;
+            g = color.g;
+            b = color.b;
+            if (settings.backgroundAlpha < 0) {
+                if (color.a == 0)
+                    return false;
+                assAlpha = 255 - color.a;
+            }
+            hasColor = true;
+        } catch (const std::bad_variant_access&) {
+        }
+    }
+
+    if (settings.backgroundAlpha >= 0) {
+        if (settings.backgroundAlpha >= 255)
+            return false;
+        assAlpha = static_cast<uint8_t>(settings.backgroundAlpha);
+        return true;
+    }
+
+    return hasColor;
+}
+
+static void AppendAssBackgroundEvent(double xPos, double yPos, double width, double height,
+                                     const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
+                                     std::vector<std::string>& events)
+{
+    if (!settings.showBackground || width <= 0 || height <= 0)
+        return;
+
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    uint8_t assAlpha = 0;
+    if (!GetAssBackgroundColor(span, settings, r, g, b, assAlpha))
+        return;
+
+    const int x1 = static_cast<int>(std::floor(xPos));
+    const int y1 = static_cast<int>(std::floor(yPos));
+    const int x2 = static_cast<int>(std::floor(xPos + width));
+    const int y2 = static_cast<int>(std::floor(yPos + height));
+    if (x1 >= x2 || y1 >= y2)
+        return;
+
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+                  "%zu,0,Default,,0,0,0,,{\\an7\\pos(0,0)\\p1\\1c&H%02X%02X%02X&\\1a&H%02X&}"
+                  "m %d %d l %d %d %d %d %d %d{\\p0}",
+                  events.size(), b, g, r, assAlpha, x1, y1, x2, y1, x2, y2, x1, y2);
+    events.emplace_back(buf);
+}
+
+static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, double extraYAss,
+                                          bool hasXOverride, double xOverrideAss,
+                                          const MmtsCaptionSettings& settings,
+                                          std::vector<std::string>& events)
+{
+    if (!settings.showBackground)
+        return;
+
+    double baseX = 960.0;
+    double baseY = 980.0;
+    if (!ParagraphBasePositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
+        return;
+
+    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
+    const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
+    const double fallbackCellWidth = ParagraphCellWidthAss(p, settings);
+    double x = baseX;
+    double y = baseY;
+
+    // Merged run state: accumulate adjacent cells with identical background
+    // color into a single rectangle to avoid dark edge lines from alpha
+    // compositing between separately drawn same-color rectangles.
+    bool     inRun     = false;
+    double   runX      = 0;
+    double   runWidth  = 0;
+    double   runHeight = 0;
+    uint8_t  runR = 0, runG = 0, runB = 0, runA = 0;
+
+    auto flushRun = [&]() {
+        if (!inRun || runWidth <= 0) return;
+        const int x1 = static_cast<int>(std::floor(runX));
+        const int y1 = static_cast<int>(std::floor(y));
+        const int x2 = static_cast<int>(std::floor(runX + runWidth));
+        const int y2 = static_cast<int>(std::floor(y + runHeight));
+        if (x1 < x2 && y1 < y2) {
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "%zu,0,Default,,0,0,0,,{\\an7\\pos(0,0)\\p1"
+                          "\\1c&H%02X%02X%02X&\\1a&H%02X&}"
+                          "m %d %d l %d %d %d %d %d %d{\\p0}",
+                          events.size(), runB, runG, runR, runA,
+                          x1, y1, x2, y1, x2, y2, x1, y2);
+            events.emplace_back(buf);
+        }
+        inRun = false;
+        runWidth = 0;
+    };
+
+    for (const auto& span : p.spanTags) {
+        if (span.text.empty())
+            continue;
+
+        double cellWidth = AssCellWidthFromSpan(&span, settings);
+        if (cellWidth <= 0)
+            cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
+
+        const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
+        const std::wstring wide = Utf8ToWide(span.text);
+
+        uint8_t spanR = 0, spanG = 0, spanB = 0, spanA = 0;
+        const bool hasColor = GetAssBackgroundColor(span, settings, spanR, spanG, spanB, spanA);
+
+        for (wchar_t ch : wide) {
+            if (ch == L'\r')
+                continue;
+            if (ch == L'\n') {
+                flushRun();
+                x = baseX;
+                y += lineGap;
+                continue;
+            }
+
+            if (!hasColor) {
+                // No background for this cell: flush any active run and skip
+                flushRun();
+                x += cellWidth;
+                continue;
+            }
+
+            // Extend the active run if color matches; otherwise start a new one
+            if (inRun && spanR == runR && spanG == runG && spanB == runB && spanA == runA) {
+                runWidth += cellWidth;
+            } else {
+                flushRun();
+                inRun    = true;
+                runX     = x;
+                runWidth = cellWidth;
+                runHeight = spanFontSize;
+                runR = spanR; runG = spanG; runB = spanB; runA = spanA;
+            }
+            x += cellWidth;
+        }
+    }
+    flushRun();
+}
+
+static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double fontScale, double extraYAss,
+                                      bool hasXOverride, double xOverrideAss,
+                                      const MmtsCaptionSettings& settings,
+                                      std::vector<std::string>& events,
+                                      bool showBackground,
+                                      bool* missingGlyph = nullptr)
+{
+    double baseX = 960.0;
+    double baseY = 980.0;
+    if (!ParagraphBasePositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
+        return false;
+
+    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
+    const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
+    const double fallbackCellWidth = ParagraphCellWidthAss(p, settings);
+    double x = baseX;
+    double y = baseY;
+    bool wroteEvent = false;
+
+    if (showBackground)
+        AppendAssCellBackgroundEvents(p, fontScale, extraYAss, hasXOverride, xOverrideAss, settings, events);
+
+    for (const auto& span : p.spanTags) {
+        if (span.text.empty())
+            continue;
+
+        double cellWidth = AssCellWidthFromSpan(&span, settings);
+        if (cellWidth <= 0)
+            cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
+
+        const std::string spanTags = BuildAssStyleTags(&span, fontScale, settings);
+        const std::wstring wide = Utf8ToWide(span.text);
+        for (size_t i = 0; i < wide.size();) {
+            const wchar_t ch = wide[i];
+            if (ch == L'\r') {
+                ++i;
+                continue;
+            }
+            if (ch == L'\n') {
+                x = baseX;
+                y += lineGap;
+                ++i;
+                continue;
+            }
+
+            const size_t current = i;
+            size_t next = i + 1;
+            const std::string utf8 = WideCharSliceToUtf8(wide, current, next);
+            i = next;
+            if (utf8.empty())
+                continue;
+
+            uint32_t codepoint = static_cast<uint32_t>(ch);
+            if (ch >= 0xD800 && ch <= 0xDBFF && next <= wide.size() && next > current + 1) {
+                const uint32_t hi = static_cast<uint32_t>(ch) - 0xD800;
+                const uint32_t lo = static_cast<uint32_t>(wide[current + 1]) - 0xDC00;
+                codepoint = 0x10000 + ((hi << 10) | lo);
+            }
+
+            SubtitleGlyphResource glyph;
+            std::string glyphPath;
+            const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
+            if (GetSubtitleGlyphResource(streamIndex, codepoint, glyph) &&
+                BuildAssGlyphDrawingPath(glyph, x, y, cellWidth, spanFontSize, glyphPath)) {
+                std::ostringstream ass;
+                ass << events.size() << ",1,Default,,0,0,0,,{\\an7\\pos(0,0)"
+                    << BuildAssDrawingStyleTags(&span, settings)
+                    << "\\p1}" << glyphPath << "{\\p0}";
+                events.push_back(ass.str());
+                wroteEvent = true;
+                x += cellWidth;
+                continue;
+            }
+            if (missingGlyph && codepoint >= 0xE000 && codepoint <= 0xF8FF)
+                *missingGlyph = true;
+
+            std::ostringstream ass;
+            ass << events.size() << ",1,Default,,0,0,0,,{"
+                << BuildAssPositionTagsFromAss(x, y)
+                << spanTags << "}" << EscapeAssText(utf8);
+            events.push_back(ass.str());
+            wroteEvent = true;
+            x += cellWidth;
+        }
+    }
+
+    return wroteEvent;
+}
+
+static bool CalculateRubyCellX(const TTMLPTag& ruby, const TTMLPTag& parent,
+                               const MmtsCaptionSettings& settings, double& xAss)
 {
     float rubyOriginX = 0;
     float parentOriginX = 0;
     if (!ParagraphOriginX(ruby, rubyOriginX) || !ParagraphOriginX(parent, parentOriginX))
         return false;
 
-    const double parentCellAss = ParagraphCellWidthAss(parent);
-    const double rubyCellAss = ParagraphCellWidthAss(ruby);
+    const double parentCellAss = ParagraphCellWidthAss(parent, settings);
+    const double rubyCellAss = ParagraphCellWidthAss(ruby, settings);
     if (parentCellAss <= 0 || rubyCellAss <= 0)
         return false;
 
@@ -606,7 +1545,8 @@ static double AssFontScaleForParagraph(const TTMLPTag& p)
     return FitAssFontScale(baseFontSize, CountAssParagraphLines(p), yPos, hasExtent, extentY);
 }
 
-static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats)
+static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats,
+                                        int streamIndex = -1)
 {
     stats = {};
     TtmlTextCue cue;
@@ -615,6 +1555,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
 
     std::string xml(reinterpret_cast<const char*>(data), size);
     TTML ttml = TTMLPaser::parse(xml);
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
     std::ostringstream text;
 
     for (const auto& div : ttml.divTags) {
@@ -638,50 +1579,25 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 paragraphs.push_back(&p);
 
             if (paragraphs.size() <= 1) {
-                const TTMLPTag* positionP = SelectAssPositionParagraph(div);
-                const double fontScale = positionP ? AssFontScaleForParagraph(*positionP) : 1.0;
-                std::ostringstream ass;
-                bool wroteAssEvent = false;
-                bool wroteAnyLine = false;
-
-                if (positionP)
-                    LogAssParagraphLayout(*positionP, cue.assEvents.size(), fontScale, 0);
-
                 for (const auto& p : div.pTags) {
                     ++stats.paragraphs;
                     bool wroteLine = false;
-                    bool wroteAssLine = false;
-                    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+                    const double fontScale = AssFontScaleForParagraph(p);
+                    LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, 0);
                     for (const auto& span : p.spanTags) {
                         ++stats.spans;
                         if (!span.text.empty()) {
                             text << span.text;
-                            if (!wroteAssEvent) {
-                                ass << cue.assEvents.size() << ",0,Default,,0,0,0,,{"
-                                    << BuildAssPositionTags(positionP ? *positionP : p, 0, false, 0)
-                                    << BuildAssStyleTags(firstSpan, fontScale)
-                                    << "}";
-                                wroteAssEvent = true;
-                            } else if (!wroteAssLine) {
-                                ass << "\\N";
-                            }
-                            std::string spanTags = BuildAssStyleTags(&span, fontScale);
-                            if (!spanTags.empty())
-                                ass << "{" << spanTags << "}";
-                            ass << EscapeAssText(span.text);
                             stats.textBytes += span.text.size();
                             wroteLine = true;
-                            wroteAssLine = true;
                         }
                     }
                     if (wroteLine) {
                         text << "\n";
-                        wroteAnyLine = true;
+                        AppendAssCellLayoutEvents(streamIndex, p, fontScale, 0, false, 0,
+                                                  settings, cue.assEvents, true, &cue.missingGlyph);
                     }
                 }
-
-                if (wroteAnyLine && wroteAssEvent)
-                    cue.assEvents.push_back(ass.str());
             } else {
                 std::vector<double> paragraphExtraY(paragraphs.size(), 0);
                 for (size_t i = 1; i < paragraphs.size(); ++i) {
@@ -700,9 +1616,6 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     const auto& p = *paragraphs[pIndex];
                     ++stats.paragraphs;
                     bool wroteLine = false;
-                    bool wroteAssEvent = false;
-                    std::ostringstream ass;
-                    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
                     const double fontScale = AssFontScaleForParagraph(p);
                     const double extraYAss = paragraphExtraY[pIndex];
                     LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, extraYAss);
@@ -710,25 +1623,14 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                         ++stats.spans;
                         if (!span.text.empty()) {
                             text << span.text;
-                            if (!wroteAssEvent) {
-                                ass << cue.assEvents.size() << ",0,Default,,0,0,0,,{"
-                                    << BuildAssPositionTags(p, extraYAss, false, 0)
-                                    << BuildAssStyleTags(firstSpan, fontScale)
-                                    << "}";
-                                wroteAssEvent = true;
-                            }
-                            std::string spanTags = BuildAssStyleTags(&span, fontScale);
-                            if (!spanTags.empty())
-                                ass << "{" << spanTags << "}";
-                            ass << EscapeAssText(span.text);
                             stats.textBytes += span.text.size();
                             wroteLine = true;
                         }
                     }
                     if (wroteLine) {
                         text << "\n";
-                        if (wroteAssEvent)
-                            cue.assEvents.push_back(ass.str());
+                        AppendAssCellLayoutEvents(streamIndex, p, fontScale, extraYAss, false, 0,
+                                                  settings, cue.assEvents, true, &cue.missingGlyph);
                     }
                 }
             }
@@ -796,7 +1698,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                                paragraphExtraY[i], desiredGap);
                     }
                     double xAss = 0;
-                    if (CalculateRubyCellX(*paragraphs[i], *paragraphs[j], xAss)) {
+                    if (CalculateRubyCellX(*paragraphs[i], *paragraphs[j], settings, xAss)) {
                         paragraphHasXOverride[i] = true;
                         paragraphXOverride[i] = xAss;
                     }
@@ -808,9 +1710,6 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 const auto& p = *paragraphs[pIndex];
                 ++stats.paragraphs;
                 bool wroteLine = false;
-                bool wroteAssEvent = false;
-                std::ostringstream ass;
-                const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
                 const double fontScale = AssFontScaleForParagraph(p);
                 const double extraYAss = paragraphExtraY[pIndex];
                 LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, extraYAss);
@@ -818,27 +1717,18 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     ++stats.spans;
                     if (!span.text.empty()) {
                         text << span.text;
-                        if (!wroteAssEvent) {
-                            ass << cue.assEvents.size() << ",0,Default,,0,0,0,,{"
-                                << BuildAssPositionTags(p, extraYAss,
-                                                        paragraphHasXOverride[pIndex],
-                                                        paragraphXOverride[pIndex])
-                                << BuildAssStyleTags(firstSpan, fontScale)
-                                << "}";
-                            wroteAssEvent = true;
-                        }
-                        std::string spanTags = BuildAssStyleTags(&span, fontScale);
-                        if (!spanTags.empty())
-                            ass << "{" << spanTags << "}";
-                        ass << EscapeAssText(span.text);
                         stats.textBytes += span.text.size();
                         wroteLine = true;
                     }
                 }
                 if (wroteLine) {
                     text << "\n";
-                    if (wroteAssEvent)
-                        cue.assEvents.push_back(ass.str());
+                    AppendAssCellLayoutEvents(streamIndex, p, fontScale, extraYAss,
+                                              paragraphHasXOverride[pIndex],
+                                              paragraphXOverride[pIndex],
+                                              settings, cue.assEvents,
+                                              !IsRubyLikeParagraph(p, divMaxFontSize),
+                                              &cue.missingGlyph);
                 }
             }
         }
@@ -1554,9 +2444,24 @@ void CMmtTlvSplitter::CreatePins()
             LONG callbackNo = InterlockedIncrement(&s_subtitleCallbacks);
 
             TtmlDebugStats stats;
-            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
+            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, streamIndex);
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+            DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
+
+            if (cue.missingGlyph && !cue.text.empty()) {
+                DeferredSubtitleSample sample;
+                sample.streamIndex = streamIndex;
+                sample.pts = pts;
+                sample.callbackNo = callbackNo;
+                sample.data.assign(d, d + sz);
+                m_deferredSubtitleSamples.push_back(std::move(sample));
+                if (m_deferredSubtitleSamples.size() > 32)
+                    m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
+                LogDetail(L"SUBTITLE CALLBACK deferred for glyph: callback=%ld streamIndex=%d pts=%I64d ms size=%zu\n",
+                          callbackNo, streamIndex, normPts / 10000, sz);
+                return;
+            }
 
             if (callbackNo <= 20 || cue.text.empty()) {
                 std::wstring preview = Utf8Preview(cue.text);
@@ -1669,6 +2574,24 @@ void CMmtTlvSplitter::CreatePins()
             }
         });
 
+    m_handler.setSubtitleResourceCallback(
+        [this](int streamIndex, int dataType, int subsampleNumber, int lastSubsampleNumber,
+               long long pts, long long, const uint8_t* d, size_t sz) {
+            static volatile LONG s_subtitleResourceCallbacks = 0;
+            LONG callbackNo = InterlockedIncrement(&s_subtitleResourceCallbacks);
+            REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+            RegisterSubtitleGlyphResource(streamIndex, d, sz);
+            ProcessDeferredSubtitleSamples();
+            DumpSubtitleResourceIfEnabled(streamIndex, callbackNo, normPts,
+                                          dataType, subsampleNumber, lastSubsampleNumber,
+                                          d, sz);
+            if (callbackNo <= 20) {
+                LogDetail(L"SUBTITLE RESOURCE CALLBACK #%ld: streamIndex=%d, pts=%I64d ms, dataType=%d, subsample=%d/%d, size=%zu\n",
+                          callbackNo, streamIndex, normPts / 10000,
+                          dataType, subsampleNumber, lastSubsampleNumber, sz);
+            }
+        });
+
     m_demuxer.setDemuxerHandler(m_handler);
 }
 
@@ -1722,7 +2645,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
                 return;
 
             TtmlDebugStats stats;
-            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats);
+            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, si);
             if (cue.hasBegin && cue.begin > currentBegin + kMinGap) {
                 nextBegin = cue.begin;
                 found = true;
@@ -1771,6 +2694,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
 void CMmtTlvSplitter::ClearPendingSubtitleCues()
 {
     m_pendingSubtitleCues.clear();
+    m_deferredSubtitleSamples.clear();
 }
 
 void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME stopTime)
@@ -1813,6 +2737,55 @@ void CMmtTlvSplitter::FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime)
     m_pendingSubtitleCues.clear();
 }
 
+void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
+{
+    if (m_deferredSubtitleSamples.empty())
+        return;
+
+    std::vector<DeferredSubtitleSample> remaining;
+    for (const auto& sample : m_deferredSubtitleSamples) {
+        TtmlDebugStats stats;
+        TtmlTextCue cue = ExtractTtmlPlainText(sample.data.data(), sample.data.size(), stats, sample.streamIndex);
+        if (cue.missingGlyph) {
+            remaining.push_back(sample);
+            continue;
+        }
+        if (cue.text.empty())
+            continue;
+
+        REFERENCE_TIME normPts = (sample.pts >= 0 && m_firstPts >= 0) ? sample.pts - m_firstPts : sample.pts;
+        REFERENCE_TIME sampleStart = 0;
+        REFERENCE_TIME sampleStop = 0;
+        if (cue.hasBegin) {
+            REFERENCE_TIME subtitleTimeOffset = m_subtitleTimeOffset.load(std::memory_order_acquire);
+            if (subtitleTimeOffset < 0) {
+                REFERENCE_TIME anchorTime = normPts;
+                if (anchorTime <= 0)
+                    anchorTime = m_currentPts.load(std::memory_order_acquire);
+                subtitleTimeOffset = cue.begin - anchorTime;
+                m_subtitleTimeOffset.store(subtitleTimeOffset, std::memory_order_release);
+            }
+            sampleStart = cue.begin - subtitleTimeOffset;
+            sampleStop = cue.hasEnd ? cue.end - subtitleTimeOffset : sampleStart + kDefaultSubtitleDuration;
+            sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
+            sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
+        } else {
+            sampleStart = ToSegmentTime(normPts, m_segmentStart);
+            sampleStop = sampleStart + kDefaultSubtitleDuration;
+        }
+
+        if (sampleStop <= sampleStart)
+            sampleStop = sampleStart + kDefaultSubtitleDuration;
+
+        FlushPendingSubtitleCue(sample.streamIndex, sampleStart);
+        DeliverSubtitleCue(sample.streamIndex, sampleStart, sampleStop, cue.assEvents, cue.assText);
+        LogDetail(L"SUBTITLE deferred delivered: callback=%ld streamIndex=%d start=%I64d ms stop=%I64d ms\n",
+                  sample.callbackNo, sample.streamIndex, sampleStart / 10000, sampleStop / 10000);
+    }
+
+    m_deferredSubtitleSamples.swap(remaining);
+}
+
 void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
 {
     if (currentTime < 0 || m_pendingSubtitleCues.empty())
@@ -1852,6 +2825,13 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, 
                                          const std::vector<std::string>& assEvents,
                                          const std::string& assText)
 {
+    const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
+    if (settings.delayMs != 0) {
+        const REFERENCE_TIME offset = static_cast<REFERENCE_TIME>(settings.delayMs) * 10000LL;
+        start = (std::max)(static_cast<REFERENCE_TIME>(0), start + offset);
+        stop = (std::max)(start + 1, stop + offset);
+    }
+
     bool delivered = false;
     for (auto* pin : m_pins) {
         if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {
