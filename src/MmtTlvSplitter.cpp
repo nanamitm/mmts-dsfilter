@@ -736,34 +736,27 @@ static int AssFontSizeFromSpan(const TTMLSpanTag* span, double fontScale)
     return (std::max)(1, static_cast<int>(std::lround(BaseAssFontSizeFromSpan(span) * fontScale)));
 }
 
-// Returns true when the span text consists solely of full-width bracket
-// characters that some broadcasters incorrectly transmit as MSZ (72x144).
-// These must be rendered at full width (scaleX 100%) to avoid overlapping
-// the adjacent glyph.
+// Returns true when the span text consists solely of full-width corner/black
+// brackets (U+300C-U+300F, U+3010-U+3011) that some broadcasters incorrectly
+// transmit as MSZ (half-width). All six code points share the UTF-8 prefix
+// 0xE3 0x80 and have a third byte in [0x8C, 0x91].
 static bool SpanIsMistaggedFullwidthBracket(const TTMLSpanTag* span)
 {
     if (!span || span->text.empty())
         return false;
 
-    // UTF-8 encodings of the brackets to check
-    static const char* kBrackets[] = {
-        "\xe3\x80\x8e",  // U+300E 『
-        "\xe3\x80\x8f",  // U+300F 』
-        "\xe3\x80\x8c",  // U+300C 「
-        "\xe3\x80\x8d",  // U+300D 」
-        "\xe3\x80\x90",  // U+3010 【
-        "\xe3\x80\x91",  // U+3011 】
-    };
-
     const std::string& t = span->text;
     size_t pos = 0;
     while (pos < t.size()) {
-        bool matched = false;
-        for (const char* br : kBrackets) {
-            if (t.compare(pos, 3, br) == 0) { pos += 3; matched = true; break; }
-        }
-        if (!matched)
+        unsigned char b0 = static_cast<unsigned char>(t[pos]);
+        unsigned char b1 = (pos + 1 < t.size()) ? static_cast<unsigned char>(t[pos + 1]) : 0;
+        unsigned char b2 = (pos + 2 < t.size()) ? static_cast<unsigned char>(t[pos + 2]) : 0;
+        // U+300C-U+300F, U+3010-U+3011 all encode as E3 80 [8C-91]
+        if (b0 == 0xE3 && b1 == 0x80 && b2 >= 0x8C && b2 <= 0x91) {
+            pos += 3;
+        } else {
             return false;
+        }
     }
     return true;
 }
