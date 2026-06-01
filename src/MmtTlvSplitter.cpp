@@ -736,6 +736,38 @@ static int AssFontSizeFromSpan(const TTMLSpanTag* span, double fontScale)
     return (std::max)(1, static_cast<int>(std::lround(BaseAssFontSizeFromSpan(span) * fontScale)));
 }
 
+// Returns true when the span text consists solely of full-width bracket
+// characters that some broadcasters incorrectly transmit as MSZ (72x144).
+// These must be rendered at full width (scaleX 100%) to avoid overlapping
+// the adjacent glyph.
+static bool SpanIsMistaggedFullwidthBracket(const TTMLSpanTag* span)
+{
+    if (!span || span->text.empty())
+        return false;
+
+    // UTF-8 encodings of the brackets to check
+    static const char* kBrackets[] = {
+        "\xe3\x80\x8e",  // U+300E 『
+        "\xe3\x80\x8f",  // U+300F 』
+        "\xe3\x80\x8c",  // U+300C 「
+        "\xe3\x80\x8d",  // U+300D 」
+        "\xe3\x80\x90",  // U+3010 【
+        "\xe3\x80\x91",  // U+3011 】
+    };
+
+    const std::string& t = span->text;
+    size_t pos = 0;
+    while (pos < t.size()) {
+        bool matched = false;
+        for (const char* br : kBrackets) {
+            if (t.compare(pos, 3, br) == 0) { pos += 3; matched = true; break; }
+        }
+        if (!matched)
+            return false;
+    }
+    return true;
+}
+
 static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
 {
     if (!span)
@@ -744,6 +776,12 @@ static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
     float fontWidth = 0;
     float fontHeight = 0;
     if (!TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) || fontWidth <= 0 || fontHeight <= 0)
+        return 100;
+
+    // Broadcasters sometimes transmit full-width brackets (『』「」【】) as
+    // MSZ (72x144), which would produce scaleX=50% and cause visual overlap.
+    // Treat them as full-width (100%) regardless of the transmitted fontSize.
+    if (fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
         return 100;
 
     return (std::max)(1, static_cast<int>(std::lround(fontWidth * 100.0 / fontHeight)));
