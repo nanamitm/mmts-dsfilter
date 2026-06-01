@@ -21,8 +21,7 @@ audio, and ARIB B24 subtitle streams as DirectShow output pins.
 - Starts playback and seek recovery from HEVC RAP/IRAP frames.
 - Converts ARIB B24 TTML subtitles to ASS with per-character cell layout.
 - Renders cell backgrounds as merged rectangles (no edge artifacts).
-- Renders DRCS (broadcaster-defined) glyphs as ASS vector drawings when no
-  user-defined substitution is provided.
+- Renders DRCS (broadcaster-defined) glyphs as ASS vector drawings.
 
 ## Repository Layout
 
@@ -139,7 +138,6 @@ BackgroundTransparency=50
 ShowBackground=1
 OutlineWidth=0
 DelayMs=0
-AribBracketSquish=1
 DumpSubtitleData=0
 DumpSubtitleDir=
 DumpSubtitleMaxFiles=200
@@ -153,25 +151,16 @@ DumpSubtitleMaxFiles=200
 | `ShowBackground` | `1` | Show cell background rectangles (1) or hide them (0). If TTML provides no background color a dark gray cell background is used. |
 | `OutlineWidth` | `0` | Text outline width: 0 = none, 1–10 = ASS `\bord` value. |
 | `DelayMs` | `0` | Subtitle display offset in milliseconds. Negative values show earlier. |
-| `AribBracketSquish` | `1` | Corner and black brackets (`「」『』【】`) are transmitted as half-width (MSZ) in ARIB broadcasts. `1` renders them at half width (`\fscx50`) matching ARIB font metrics. `0` renders them at full width, which avoids visual overlap when using general fonts that have full-width bracket glyphs. |
 | `DumpSubtitleData` | `0` | Set to `1` to save raw TTML samples and referenced subtitle resources for investigation. |
 | `DumpSubtitleDir` | *(empty)* | Directory for subtitle dumps. Empty writes to `subtitle_dump` next to the filter. |
 | `DumpSubtitleMaxFiles` | `200` | Maximum number of subtitle samples/resources to dump. |
 
 ### DRCS (Broadcaster-Defined Characters)
 
-When a broadcaster transmits a custom glyph (DRCS), the filter first looks for
-a user-defined substitution in `[DRCSMap]` entries of the INI:
-
-```ini
-[DRCSMap]
-; <MD5 of DRCS bitmap>=<Unicode codepoint in hex>
-0123456789abcdef0123456789abcdef=6A4B
-```
-
-If no mapping is found the glyph is rendered as an ASS vector drawing scaled to
-fit the subtitle cell. Set `DumpSubtitleData=1` to capture the DRCS bitmap and
-derive its MD5 for mapping.
+When a broadcaster transmits a custom glyph (DRCS), the filter registers the
+subtitle glyph resource and renders the glyph as an ASS vector drawing scaled
+to fit the subtitle cell. Set `DumpSubtitleData=1` to capture raw TTML samples
+and subtitle resources for investigation.
 
 ## Debug Logging
 
