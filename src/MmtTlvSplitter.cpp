@@ -847,8 +847,13 @@ static double AssCellWidthFromSpan(const TTMLSpanTag* span)
 
     float fontWidth = 0;
     float fontHeight = 0;
-    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontWidth > 0)
+    if (TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight) && fontWidth > 0) {
+        // Full-width brackets mis-tagged as MSZ: use fontHeight as the cell
+        // width so the next character is positioned at the correct offset.
+        if (fontWidth < fontHeight && SpanIsMistaggedFullwidthBracket(span))
+            return fontHeight * 1920.0 / 3840.0;
         return fontWidth * 1920.0 / 3840.0;
+    }
 
     return BaseAssFontSizeFromSpan(span);
 }
