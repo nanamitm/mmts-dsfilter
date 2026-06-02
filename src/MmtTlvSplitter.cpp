@@ -123,6 +123,7 @@ struct MmtsCaptionSettings {
     int captionAlpha = 0;       // ASS alpha: 0=opaque, 255=fully transparent
     int backgroundAlpha = -1;   // -1=use TTML data, 0-255=fixed override
     bool showBackground = true;
+    bool showRubyBackground = false;
     int outlineWidth = 0;
     int delayMs = 0;
     bool dumpSubtitleData = false;
@@ -179,6 +180,8 @@ static MmtsCaptionSettings GetMmtsCaptionSettings()
     }
     if (ReadIniValue(iniPath, L"MMTS", L"ShowBackground", buf, ARRAYSIZE(buf)))
         s.showBackground = _wtoi(buf) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"ShowRubyBackground", buf, ARRAYSIZE(buf)))
+        s.showRubyBackground = _wtoi(buf) != 0;
     if (ReadIniValue(iniPath, L"MMTS", L"OutlineWidth", buf, ARRAYSIZE(buf)))
         s.outlineWidth = (std::max)(0, (std::min)(10, _wtoi(buf)));
     if (ReadIniValue(iniPath, L"MMTS", L"DelayMs", buf, ARRAYSIZE(buf)))
@@ -1552,8 +1555,14 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
             } else {
                 std::vector<double> paragraphExtraY(paragraphs.size(), 0);
                 for (size_t i = 1; i < paragraphs.size(); ++i) {
-                    const double prevY = BaseAssYFromParagraph(*paragraphs[i - 1]) + paragraphExtraY[i - 1];
-                    const double currentY = BaseAssYFromParagraph(*paragraphs[i]) + paragraphExtraY[i];
+                    const double prevRawY = BaseAssYFromParagraph(*paragraphs[i - 1]);
+                    const double currentRawY = BaseAssYFromParagraph(*paragraphs[i]);
+                    // Paragraphs sharing the same Y origin are side-by-side on the
+                    // same row (different X positions); skip vertical gap adjustment.
+                    if (std::abs(currentRawY - prevRawY) < 1.0)
+                        continue;
+                    const double prevY = prevRawY + paragraphExtraY[i - 1];
+                    const double currentY = currentRawY + paragraphExtraY[i];
                     const double minGap = AssLineGapForParagraphs(*paragraphs[i - 1], *paragraphs[i]);
                     if (currentY - prevY < minGap) {
                         paragraphExtraY[i] += minGap - (currentY - prevY);
@@ -1678,7 +1687,9 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                                               paragraphHasXOverride[pIndex],
                                               paragraphXOverride[pIndex],
                                               settings, cue.assEvents,
-                                              !IsRubyLikeParagraph(p, divMaxFontSize),
+                                              IsRubyLikeParagraph(p, divMaxFontSize)
+                                                  ? settings.showRubyBackground
+                                                  : true,
                                               &cue.missingGlyph);
                 }
             }
