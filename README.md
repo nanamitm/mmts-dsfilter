@@ -168,6 +168,8 @@ Essential lifecycle logs are emitted in all builds through `OutputDebugString`.
 Verbose sample delivery, subtitle layout, TTML lookahead, and per-stream probe
 logs are emitted only in Debug builds. Define `MMT_TLV_VERBOSE_LOG` for Release
 builds if detailed logs are needed temporarily.
+Define `MMT_TLV_FILE_LOG` only for temporary investigations that need a
+`%TEMP%\mmts_dsfilter_debug.log` file.
 
 ## Audio Notes
 

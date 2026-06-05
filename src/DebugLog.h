@@ -50,7 +50,9 @@ inline void MmtTlvLogInfo(const WCHAR* format, ...)
     StringCchVPrintfW(buf, ARRAYSIZE(buf), format, args);
     va_end(args);
     OutputDebugStringW(buf);
+#if defined(MMT_TLV_FILE_LOG)
     MmtTlvLogFileLine(buf);
+#endif
 }
 
 inline void MmtTlvLogDebug(const WCHAR* format, ...)
@@ -62,7 +64,9 @@ inline void MmtTlvLogDebug(const WCHAR* format, ...)
     StringCchVPrintfW(buf, ARRAYSIZE(buf), format, args);
     va_end(args);
     OutputDebugStringW(buf);
+#if defined(MMT_TLV_FILE_LOG)
     MmtTlvLogFileLine(buf);
+#endif
 #else
     UNREFERENCED_PARAMETER(format);
 #endif
