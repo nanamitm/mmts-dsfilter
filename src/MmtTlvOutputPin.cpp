@@ -605,8 +605,16 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
 HRESULT CMmtTlvOutputPin::DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME stop,
                                             const char* text, size_t size)
 {
-    if (!IsConnected() || !IsSubtitle() || !text || size == 0)
+    if (!IsConnected() || !IsSubtitle() || !text || size == 0) {
+        LogPinMsg(L"MMT/TLV Subtitle DeliverTextSample skipped: connected=%d subtitle=%d text=%d size=%zu start=%I64d ms stop=%I64d ms\n",
+                  IsConnected() ? 1 : 0,
+                  IsSubtitle() ? 1 : 0,
+                  text ? 1 : 0,
+                  size,
+                  start / 10000,
+                  stop / 10000);
         return S_OK;
+    }
 
     static volatile LONG s_subtitleSamples = 0;
     LONG sampleNo = InterlockedIncrement(&s_subtitleSamples);
@@ -639,7 +647,7 @@ HRESULT CMmtTlvOutputPin::DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME
         pSample->Release();
     }
 
-    if (sampleNo <= 20 || FAILED(hr)) {
+    if (sampleNo <= 160 || FAILED(hr)) {
         int chars = MultiByteToWideChar(CP_UTF8, 0, text, static_cast<int>(size), nullptr, 0);
         std::wstring preview;
         if (chars > 0) {
@@ -650,7 +658,7 @@ HRESULT CMmtTlvOutputPin::DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME
         } else {
             preview = L"<utf8-convert-failed>";
         }
-        LogPinDetail(L"MMT/TLV Subtitle DeliverTextSample #%ld: hr=0x%08X, size=%zu, start=%I64d ms, stop=%I64d ms, text=\"%s\"\n",
+        LogPinMsg(L"MMT/TLV Subtitle DeliverTextSample #%ld: hr=0x%08X, size=%zu, start=%I64d ms, stop=%I64d ms, text=\"%s\"\n",
                   sampleNo, hr, size, start / 10000, stop / 10000, preview.c_str());
     }
     return hr;

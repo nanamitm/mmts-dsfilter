@@ -12,6 +12,11 @@
 #define LogMsg MmtTlvLogInfo
 #define LogDetail MmtTlvLogDebug
 
+static bool IsCaptionComponentTag(int componentTag)
+{
+    return componentTag >= 0x30 && componentTag <= 0x37;
+}
+
 long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream& stream)
 {
     if (pts == static_cast<int64_t>(MmtTlv::NOPTS_VALUE)) {
@@ -157,6 +162,26 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
     info.packetId = stream.getPacketId();
     info.componentTag = stream.getComponentTag();
     info.hasData = true;
+
+    if (IsCaptionComponentTag(info.componentTag)) {
+        const int companionTag = info.componentTag + 8;
+        auto companion = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
+            [companionTag](const SubtitleStreamInfo& known) {
+                return !known.hasData && known.componentTag == companionTag;
+            });
+        if (companion != m_subtitleStreams.end()) {
+            LogMsg(L"MMT/TLV Subtitle replacing management stream: oldStreamIndex=%d oldPacketId=0x%04X oldComponentTag=%d -> streamIndex=%d packetId=0x%04X componentTag=%d\n",
+                   companion->streamIndex,
+                   companion->packetId,
+                   companion->componentTag,
+                   info.streamIndex,
+                   info.packetId,
+                   info.componentTag);
+            *companion = info;
+            return;
+        }
+    }
+
     m_subtitleStreams.push_back(info);
     LogDetail(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, data=1\n",
            info.streamIndex, info.packetId, info.componentTag);
@@ -560,6 +585,34 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
 
     long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);
     long long dts = toRefTime(static_cast<int64_t>(mfu.dts), stream);
+
+    static volatile LONG s_subtitleMfuLogCount = 0;
+    LONG logNo = InterlockedIncrement(&s_subtitleMfuLogCount);
+    if (logNo <= 120 || mfu.subtitleDataType != 0) {
+        WCHAR hex[96] = {};
+        WCHAR* cursor = hex;
+        size_t remaining = ARRAYSIZE(hex);
+        const size_t previewSize = (std::min)(mfu.data.size(), static_cast<size_t>(16));
+        for (size_t i = 0; i < previewSize && remaining > 4; ++i) {
+            HRESULT hr = StringCchPrintfW(cursor, remaining, L"%02X ", mfu.data[i]);
+            if (FAILED(hr))
+                break;
+            size_t used = wcslen(cursor);
+            cursor += used;
+            remaining -= used;
+        }
+        LogMsg(L"MMT/TLV Subtitle MFU #%ld: streamIndex=%u packetId=0x%04X componentTag=%d type=%u subsample=%u/%u pts=%I64d ms size=%zu first=%s\n",
+               logNo,
+               stream.getStreamIndex(),
+               stream.getPacketId(),
+               stream.getComponentTag(),
+               mfu.subtitleDataType,
+               mfu.subtitleSubsampleNumber,
+               mfu.subtitleLastSubsampleNumber,
+               pts / 10000,
+               mfu.data.size(),
+               hex);
+    }
 
     if (mfu.subtitleDataType != 0) {
         if (m_subtitleResourceCallback) {

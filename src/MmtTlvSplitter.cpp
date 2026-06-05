@@ -49,6 +49,11 @@ static REFERENCE_TIME ToSegmentTime(REFERENCE_TIME rt, REFERENCE_TIME segmentSta
     return rt < 0 ? 0 : rt;
 }
 
+static bool IsCaptionComponentTag(int componentTag)
+{
+    return componentTag >= 0x30 && componentTag <= 0x37;
+}
+
 static LPWSTR AllocStreamName(const WCHAR* format, int listIndex, const CFilterDemuxerHandler::AudioStreamInfo& info)
 {
     WCHAR buf[128];
@@ -2315,14 +2320,22 @@ void CMmtTlvSplitter::CreatePins()
     if (kEnableSubtitlePins) {
         int primarySubtitleStreamIndex = -1;
         for (const auto& info : subtitleStreams) {
-            if (info.hasData) {
+            if (info.hasData && IsCaptionComponentTag(info.componentTag)) {
                 primarySubtitleStreamIndex = info.streamIndex;
                 break;
             }
         }
         if (primarySubtitleStreamIndex < 0) {
             for (const auto& info : subtitleStreams) {
-                if (info.componentTag == 48) {
+                if (IsCaptionComponentTag(info.componentTag)) {
+                    primarySubtitleStreamIndex = info.streamIndex;
+                    break;
+                }
+            }
+        }
+        if (primarySubtitleStreamIndex < 0) {
+            for (const auto& info : subtitleStreams) {
+                if (info.hasData) {
                     primarySubtitleStreamIndex = info.streamIndex;
                     break;
                 }
@@ -2425,9 +2438,9 @@ void CMmtTlvSplitter::CreatePins()
                 return;
             }
 
-            if (callbackNo <= 20 || cue.text.empty()) {
+            if (callbackNo <= 120 || cue.text.empty()) {
                 std::wstring preview = Utf8Preview(cue.text);
-                LogDetail(L"SUBTITLE CALLBACK #%ld: streamIndex=%d, pts=%I64d ms, ttmlBegin=%s%I64d ms, ttmlEnd=%s%I64d ms, size=%zu, divs=%zu, p=%zu, spans=%zu, textBytes=%zu, text=\"%s\"\n",
+                LogMsg(L"SUBTITLE CALLBACK #%ld: streamIndex=%d, pts=%I64d ms, ttmlBegin=%s%I64d ms, ttmlEnd=%s%I64d ms, size=%zu, divs=%zu, p=%zu, spans=%zu, textBytes=%zu, assEvents=%zu, assTextBytes=%zu, text=\"%s\"\n",
                        callbackNo,
                        streamIndex,
                        normPts / 10000,
@@ -2440,6 +2453,8 @@ void CMmtTlvSplitter::CreatePins()
                        stats.paragraphs,
                        stats.spans,
                        stats.textBytes,
+                       cue.assEvents.size(),
+                       cue.assText.size(),
                        preview.c_str());
             }
 
@@ -2456,7 +2471,7 @@ void CMmtTlvSplitter::CreatePins()
                     cursor += used;
                     remaining -= used;
                 }
-                LogDetail(L"SUBTITLE CALLBACK empty text #%ld: streamIndex=%d, firstBytes=%s\n",
+                LogMsg(L"SUBTITLE CALLBACK empty text #%ld: streamIndex=%d, firstBytes=%s\n",
                        callbackNo, streamIndex, hex);
                 return;
             }
@@ -2480,7 +2495,7 @@ void CMmtTlvSplitter::CreatePins()
                     } else {
                         subtitleTimeOffset = expected;
                     }
-                    LogDetail(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, firstTtmlBegin=%I64d ms\n",
+                    LogMsg(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, firstTtmlBegin=%I64d ms\n",
                            subtitleTimeOffset / 10000,
                            anchorTime / 10000,
                            cue.begin / 10000);
@@ -2795,17 +2810,51 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, 
     }
 
     bool delivered = false;
+    size_t deliveredSamples = 0;
+    auto deliverToPin = [&](CMmtTlvOutputPin* pin) {
+        if (!assEvents.empty()) {
+            for (const auto& sampleText : assEvents) {
+                pin->DeliverTextSample(start, stop, sampleText.c_str(), sampleText.size());
+                ++deliveredSamples;
+            }
+        } else {
+            pin->DeliverTextSample(start, stop, assText.c_str(), assText.size());
+            ++deliveredSamples;
+        }
+        delivered = true;
+    };
+
     for (auto* pin : m_pins) {
         if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {
-            if (!assEvents.empty()) {
-                for (const auto& sampleText : assEvents) {
-                    pin->DeliverTextSample(start, stop, sampleText.c_str(), sampleText.size());
-                }
-            } else {
-                pin->DeliverTextSample(start, stop, assText.c_str(), assText.size());
-            }
-            delivered = true;
+            deliverToPin(pin);
         }
+    }
+
+    int fallbackStreamIndex = -1;
+    if (!delivered) {
+        for (auto* pin : m_pins) {
+            if (pin->IsSubtitle()) {
+                fallbackStreamIndex = pin->StreamIndex();
+                deliverToPin(pin);
+                break;
+            }
+        }
+    }
+
+    static volatile LONG s_subtitleDeliverCueLogs = 0;
+    LONG deliverLogNo = InterlockedIncrement(&s_subtitleDeliverCueLogs);
+    if (deliverLogNo <= 160 || !delivered) {
+        LogMsg(L"SUBTITLE DeliverCue #%ld: streamIndex=%d start=%I64d ms stop=%I64d ms assEvents=%zu assTextBytes=%zu delivered=%d samples=%zu pins=%zu fallbackStreamIndex=%d\n",
+               deliverLogNo,
+               streamIndex,
+               start / 10000,
+               stop / 10000,
+               assEvents.size(),
+               assText.size(),
+               delivered ? 1 : 0,
+               deliveredSamples,
+               m_pins.size(),
+               fallbackStreamIndex);
     }
     if (!delivered) {
         LogMsg(L"SUBTITLE CALLBACK: no pin for streamIndex=%d, start=%I64d ms\n",
