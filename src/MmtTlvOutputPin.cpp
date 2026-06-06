@@ -237,8 +237,8 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
             "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
             "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n"
-            "Style: Default,Noto Sans JP,96,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,"
-            "0,0,0,0,100,100,0,0,1,3,1,2,20,20,20,1\r\n"
+            "Style: Default,MS Gothic,64,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+            "0,0,0,0,100,100,0,0,1,0,0,2,20,20,20,1\r\n"
             "\r\n"
             "[Events]\r\n"
             "Format: ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n";

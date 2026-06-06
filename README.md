@@ -136,6 +136,7 @@ includes a sample INI with all options documented.
 CaptionTransparency=0
 BackgroundTransparency=50
 ShowBackground=1
+ShowRubyBackground=1
 OutlineWidth=0
 DelayMs=0
 DumpSubtitleData=0
@@ -148,7 +149,8 @@ DumpSubtitleMaxFiles=200
 | `FontName` | `MS Gothic` | Font family for ASS subtitles. Cell positions are fixed per character so changing the font does not shift later characters. |
 | `CaptionTransparency` | `0` | Caption text transparency: 0 = opaque, 100 = fully transparent. |
 | `BackgroundTransparency` | `50` | Cell background transparency: 0 = opaque, 100 = fully transparent. |
-| `ShowBackground` | `1` | Show cell background rectangles (1) or hide them (0). If TTML provides no background color a dark gray cell background is used. |
+| `ShowBackground` | `1` | Show cell background rectangles (1) or hide them (0). Background height follows TTML `lineHeight`, then region extent, then font size. If TTML provides no background color a dark gray cell background is used. |
+| `ShowRubyBackground` | `1` | Show cell background rectangles behind ruby (furigana) text. |
 | `OutlineWidth` | `0` | Text outline width: 0 = none, 1–10 = ASS `\bord` value. |
 | `DelayMs` | `0` | Subtitle display offset in milliseconds. Negative values show earlier. |
 | `DumpSubtitleData` | `0` | Set to `1` to save raw TTML samples and referenced subtitle resources for investigation. |

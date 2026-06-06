@@ -128,7 +128,7 @@ struct MmtsCaptionSettings {
     int captionAlpha = 0;       // ASS alpha: 0=opaque, 255=fully transparent
     int backgroundAlpha = -1;   // -1=use TTML data, 0-255=fixed override
     bool showBackground = true;
-    bool showRubyBackground = false;
+    bool showRubyBackground = true;
     int outlineWidth = 0;
     int delayMs = 0;
     bool dumpSubtitleData = false;
@@ -661,12 +661,6 @@ static double B24FontHeightFromSpan(const TTMLSpanTag* span)
     if (!TryGetLengthPair(span->style.fontSize, fontWidth, fontHeight))
         return 0;
 
-    if (fontWidth == 144 && fontHeight == 144)
-        return 240;
-    if (fontWidth == 72 && fontHeight == 144)
-        return 240;
-    if (fontWidth == 72 && fontHeight == 72)
-        return 120;
     return fontHeight;
 }
 
@@ -707,6 +701,29 @@ static int CountAssParagraphLines(const TTMLPTag& p)
     for (const auto& span : p.spanTags)
         lines = (std::max)(lines, CountAssTextLines(span.text));
     return lines;
+}
+
+static double AssBackgroundCellHeightFromSpan(const TTMLPTag& p, const TTMLSpanTag* span,
+                                              double fontScale)
+{
+    if (span && span->style.lineHeight.has_value()) {
+        try {
+            const TTMLCssValueLength lineHeight =
+                span->style.lineHeight->getValue<TTMLCssValueLength>();
+            if (lineHeight.unit == "px" && lineHeight.value > 0)
+                return lineHeight.value * 1080.0 / 2160.0;
+        } catch (const std::bad_variant_access&) {
+        }
+    }
+
+    float extentX = 0;
+    float extentY = 0;
+    if (TryGetLengthPair(p.region.extent, extentX, extentY) && extentY > 0) {
+        const int lines = (std::max)(1, CountAssParagraphLines(p));
+        return extentY * 1080.0 / 2160.0 / lines;
+    }
+
+    return (std::max)(1.0, BaseAssFontSizeFromSpan(span) * fontScale);
 }
 
 static double FitAssFontScale(int baseFontSize, int lineCount, double anchorYAss, bool hasExtent, float extentY)
@@ -778,8 +795,8 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale,
                       static_cast<unsigned>(settings.captionAlpha));
         tags += alphaBuf;
     }
-    if (settings.outlineWidth > 0)
-        tags += FormatAssTag("\\bord%d", settings.outlineWidth);
+    tags += FormatAssTag("\\bord%d", settings.outlineWidth);
+    tags += "\\shad0";
 
     if (span->style.color.has_value()) {
         try {
@@ -836,12 +853,6 @@ static double ParagraphCellWidthAss(const TTMLPTag& p)
     return AssCellWidthFromSpan(firstSpan);
 }
 
-static bool ParagraphOriginX(const TTMLPTag& p, float& originX)
-{
-    float originY = 0;
-    return TryGetLengthPair(p.region.origin, originX, originY);
-}
-
 static std::string BuildAssPositionTagsFromAss(double xPos, double yPos)
 {
     const int x = static_cast<int>(std::floor(xPos));
@@ -861,6 +872,20 @@ static bool ParagraphBasePositionAss(const TTMLPTag& p, double extraYAss,
 
     xAss = hasXOverride ? xOverrideAss : originX * 1920.0 / 3840.0;
     yAss = (originY + B24LineOffsetYFromParagraph(p)) * 1080.0 / 2160.0 + extraYAss;
+    return true;
+}
+
+static bool ParagraphBackgroundPositionAss(const TTMLPTag& p, double extraYAss,
+                                           bool hasXOverride, double xOverrideAss,
+                                           double& xAss, double& yAss)
+{
+    float originX = 0;
+    float originY = 0;
+    if (!TryGetLengthPair(p.region.origin, originX, originY))
+        return false;
+
+    xAss = hasXOverride ? xOverrideAss : originX * 1920.0 / 3840.0;
+    yAss = originY * 1080.0 / 2160.0 + extraYAss;
     return true;
 }
 
@@ -1142,7 +1167,7 @@ static bool GetSubtitleGlyphResource(int streamIndex, uint32_t codepoint, Subtit
 static std::string BuildAssDrawingStyleTags(const TTMLSpanTag* span,
                                             const MmtsCaptionSettings& settings)
 {
-    std::string tags = "\\bord0";
+    std::string tags = "\\bord0\\shad0";
     if (settings.captionAlpha > 0) {
         char alphaBuf[32];
         std::snprintf(alphaBuf, sizeof(alphaBuf), "\\1a&H%02X&",
@@ -1231,12 +1256,11 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
 
     double baseX = 960.0;
     double baseY = 980.0;
-    if (!ParagraphBasePositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
+    if (!ParagraphBackgroundPositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
         return;
 
     const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
-    const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
+    const double lineGap = AssBackgroundCellHeightFromSpan(p, firstSpan, fontScale);
     const double fallbackCellWidth = ParagraphCellWidthAss(p);
     double x = baseX;
     double y = baseY;
@@ -1278,7 +1302,7 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
         if (cellWidth <= 0)
             cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
 
-        const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
+        const double spanBackgroundHeight = AssBackgroundCellHeightFromSpan(p, &span, fontScale);
         const std::wstring wide = Utf8ToWide(span.text);
 
         uint8_t spanR = 0, spanG = 0, spanB = 0, spanA = 0;
@@ -1309,7 +1333,7 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
                 inRun    = true;
                 runX     = x;
                 runWidth = cellWidth;
-                runHeight = spanFontSize;
+                runHeight = spanBackgroundHeight;
                 runR = spanR; runG = spanG; runB = spanB; runA = spanA;
             }
             x += cellWidth;
@@ -1406,30 +1430,6 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double
     }
 
     return wroteEvent;
-}
-
-static bool CalculateRubyCellX(const TTMLPTag& ruby, const TTMLPTag& parent, double& xAss)
-{
-    float rubyOriginX = 0;
-    float parentOriginX = 0;
-    if (!ParagraphOriginX(ruby, rubyOriginX) || !ParagraphOriginX(parent, parentOriginX))
-        return false;
-
-    const double parentCellAss = ParagraphCellWidthAss(parent);
-    const double rubyCellAss = ParagraphCellWidthAss(ruby);
-    if (parentCellAss <= 0 || rubyCellAss <= 0)
-        return false;
-
-    const double parentCellTtml = parentCellAss * 3840.0 / 1920.0;
-    const int rubyChars = (std::max)(1, CountAssTextChars(ruby));
-    const int parentIndex = (std::max)(0, static_cast<int>(std::lround((rubyOriginX - parentOriginX) / parentCellTtml)));
-    const double parentLeftAss = parentOriginX * 1920.0 / 3840.0;
-    xAss = parentLeftAss + parentIndex * parentCellAss +
-           (parentCellAss - rubyChars * rubyCellAss) / 2.0;
-
-    LogDetail(L"MMT/TLV Subtitle ruby cell x: ruby=%S parent=%S chars=%d parentIndex=%d parentCell=%.1f rubyCell=%.1f x=%.1f\r\n",
-           ruby.id.c_str(), parent.id.c_str(), rubyChars, parentIndex, parentCellAss, rubyCellAss, xAss);
-    return true;
 }
 
 static double BaseAssYFromParagraph(const TTMLPTag& p)
@@ -1606,70 +1606,6 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 paragraphs.push_back(&p);
 
             std::vector<double> paragraphExtraY(paragraphs.size(), 0);
-            for (size_t i = 0; i < paragraphs.size(); ++i)
-                paragraphExtraY[i] = RubyLikeYOffsetAss(*paragraphs[i], divMaxFontSize);
-            std::vector<bool> paragraphHasXOverride(paragraphs.size(), false);
-            std::vector<double> paragraphXOverride(paragraphs.size(), 0);
-
-            for (size_t i = 0; i < paragraphs.size(); ++i) {
-                if (IsRubyLikeParagraph(*paragraphs[i], divMaxFontSize))
-                    continue;
-
-                bool sawRubyBetween = false;
-                int maxRubyFontBetween = 0;
-                for (size_t j = i + 1; j < paragraphs.size(); ++j) {
-                    if (IsRubyLikeParagraph(*paragraphs[j], divMaxFontSize)) {
-                        sawRubyBetween = true;
-                        maxRubyFontBetween = (std::max)(maxRubyFontBetween,
-                                                        ParagraphMaxBaseFontSize(*paragraphs[j]));
-                        continue;
-                    }
-                    if (!sawRubyBetween)
-                        break;
-
-                    const double currentY = BaseAssYFromParagraph(*paragraphs[i]) + paragraphExtraY[i];
-                    const double nextY = BaseAssYFromParagraph(*paragraphs[j]) + paragraphExtraY[j];
-                    const double desiredGap = AssLineGapForRubyCluster(*paragraphs[i], *paragraphs[j],
-                                                                       maxRubyFontBetween);
-                    const double desiredY = nextY - desiredGap;
-                    if (desiredY > currentY) {
-                        paragraphExtraY[i] += desiredY - currentY;
-                        LogDetail(L"MMT/TLV Subtitle main line fit: pId=%S next=%S extraY=%.1f gap=%.1f\r\n",
-                               paragraphs[i]->id.c_str(), paragraphs[j]->id.c_str(),
-                               paragraphExtraY[i], desiredGap);
-                    }
-                    break;
-                }
-            }
-
-            for (size_t i = 0; i < paragraphs.size(); ++i) {
-                if (!IsRubyLikeParagraph(*paragraphs[i], divMaxFontSize))
-                    continue;
-
-                for (size_t j = i + 1; j < paragraphs.size(); ++j) {
-                    if (IsRubyLikeParagraph(*paragraphs[j], divMaxFontSize))
-                        continue;
-
-                    const double currentY = BaseAssYFromParagraph(*paragraphs[i]) + paragraphExtraY[i];
-                    const double nextY = BaseAssYFromParagraph(*paragraphs[j]) + paragraphExtraY[j];
-                    const int rubyFontSize = ParagraphMaxBaseFontSize(*paragraphs[i]);
-                    const double desiredGap = (std::max)(rubyFontSize * 0.25, 8.0);
-                    const double desiredY = nextY - rubyFontSize - desiredGap;
-                    const double deltaY = desiredY - currentY;
-                    if (std::abs(deltaY) > 0.5) {
-                        paragraphExtraY[i] = (std::max)(0.0, paragraphExtraY[i] + deltaY);
-                        LogDetail(L"MMT/TLV Subtitle ruby line fit: pId=%S next=%S extraY=%.1f gap=%.1f\r\n",
-                               paragraphs[i]->id.c_str(), paragraphs[j]->id.c_str(),
-                               paragraphExtraY[i], desiredGap);
-                    }
-                    double xAss = 0;
-                    if (CalculateRubyCellX(*paragraphs[i], *paragraphs[j], xAss)) {
-                        paragraphHasXOverride[i] = true;
-                        paragraphXOverride[i] = xAss;
-                    }
-                    break;
-                }
-            }
 
             for (size_t pIndex = 0; pIndex < paragraphs.size(); ++pIndex) {
                 const auto& p = *paragraphs[pIndex];
@@ -1689,8 +1625,8 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 if (wroteLine) {
                     text << "\n";
                     AppendAssCellLayoutEvents(streamIndex, p, fontScale, extraYAss,
-                                              paragraphHasXOverride[pIndex],
-                                              paragraphXOverride[pIndex],
+                                              false,
+                                              0,
                                               settings, cue.assEvents,
                                               IsRubyLikeParagraph(p, divMaxFontSize)
                                                   ? settings.showRubyBackground
