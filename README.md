@@ -139,6 +139,8 @@ ShowBackground=1
 ShowRubyBackground=1
 OutlineWidth=0
 DelayMs=0
+DebugLogPath=
+VerboseLog=0
 DumpSubtitleData=0
 DumpSubtitleDir=
 DumpSubtitleMaxFiles=200
@@ -153,6 +155,8 @@ DumpSubtitleMaxFiles=200
 | `ShowRubyBackground` | `1` | Show cell background rectangles behind ruby (furigana) text. |
 | `OutlineWidth` | `0` | Text outline width: 0 = none, 1–10 = ASS `\bord` value. |
 | `DelayMs` | `0` | Subtitle display offset in milliseconds. Negative values show earlier. |
+| `DebugLogPath` | *(empty)* | File path for debug logs. Empty disables file logging. |
+| `VerboseLog` | `0` | Set to `1` to emit verbose debug logs in Release builds. Debug builds always emit verbose logs. |
 | `DumpSubtitleData` | `0` | Set to `1` to save raw TTML samples and referenced subtitle resources for investigation. |
 | `DumpSubtitleDir` | *(empty)* | Directory for subtitle dumps. Empty writes to `subtitle_dump` next to the filter. |
 | `DumpSubtitleMaxFiles` | `200` | Maximum number of subtitle samples/resources to dump. |
@@ -166,12 +170,12 @@ and subtitle resources for investigation.
 
 ## Debug Logging
 
-Essential lifecycle logs are emitted in all builds through `OutputDebugString`.
-Verbose sample delivery, subtitle layout, TTML lookahead, and per-stream probe
-logs are emitted only in Debug builds. Define `MMT_TLV_VERBOSE_LOG` for Release
-builds if detailed logs are needed temporarily.
-Define `MMT_TLV_FILE_LOG` only for temporary investigations that need a
-`%TEMP%\mmts_dsfilter_debug.log` file.
+`OutputDebugString` output is quiet by default in Release builds. Set
+`VerboseLog=1` in `mmts-dsfilter.ini` to emit lifecycle and verbose debug logs
+to DebugView or an attached debugger. Debug builds always emit these logs.
+File logging is disabled by default; set `DebugLogPath` to a log file path only
+for temporary investigations. With `DebugLogPath` set and `VerboseLog=0`,
+lifecycle logs are written to the file without also going to `OutputDebugString`.
 
 ## Audio Notes
 

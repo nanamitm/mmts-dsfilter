@@ -4,19 +4,56 @@
 #include <strsafe.h>
 #include <cstdarg>
 #include <new>
+#include <mutex>
+#include <string>
+
+struct MmtTlvDebugLogConfig {
+    std::wstring filePath;
+    bool verbose = false;
+};
+
+inline MmtTlvDebugLogConfig& MmtTlvDebugLogState()
+{
+    static MmtTlvDebugLogConfig state;
+    return state;
+}
+
+inline std::mutex& MmtTlvDebugLogMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline void MmtTlvConfigureDebugLog(const std::wstring& filePath, bool verbose)
+{
+    std::lock_guard<std::mutex> lock(MmtTlvDebugLogMutex());
+    MmtTlvDebugLogState().filePath = filePath;
+    MmtTlvDebugLogState().verbose = verbose;
+}
+
+inline bool MmtTlvIsVerboseLogEnabled()
+{
+#if defined(_DEBUG) || defined(DEBUG)
+    return true;
+#else
+    std::lock_guard<std::mutex> lock(MmtTlvDebugLogMutex());
+    return MmtTlvDebugLogState().verbose;
+#endif
+}
+
+inline std::wstring MmtTlvDebugLogPath()
+{
+    std::lock_guard<std::mutex> lock(MmtTlvDebugLogMutex());
+    return MmtTlvDebugLogState().filePath;
+}
 
 inline void MmtTlvLogFileLine(const WCHAR* text)
 {
-    WCHAR path[MAX_PATH] = {};
-    DWORD len = GetTempPathW(ARRAYSIZE(path), path);
-    if (len == 0 || len >= ARRAYSIZE(path))
+    std::wstring path = MmtTlvDebugLogPath();
+    if (path.empty())
         return;
 
-    HRESULT hr = StringCchCatW(path, ARRAYSIZE(path), L"mmts_dsfilter_debug.log");
-    if (FAILED(hr))
-        return;
-
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
         return;
@@ -49,25 +86,23 @@ inline void MmtTlvLogInfo(const WCHAR* format, ...)
     va_start(args, format);
     StringCchVPrintfW(buf, ARRAYSIZE(buf), format, args);
     va_end(args);
-    OutputDebugStringW(buf);
-#if defined(MMT_TLV_FILE_LOG)
+    if (MmtTlvIsVerboseLogEnabled())
+        OutputDebugStringW(buf);
     MmtTlvLogFileLine(buf);
-#endif
 }
 
 inline void MmtTlvLogDebug(const WCHAR* format, ...)
 {
-#if defined(_DEBUG) || defined(DEBUG) || defined(MMT_TLV_VERBOSE_LOG)
+    if (!MmtTlvIsVerboseLogEnabled()) {
+        UNREFERENCED_PARAMETER(format);
+        return;
+    }
+
     WCHAR buf[1024];
     va_list args;
     va_start(args, format);
     StringCchVPrintfW(buf, ARRAYSIZE(buf), format, args);
     va_end(args);
     OutputDebugStringW(buf);
-#if defined(MMT_TLV_FILE_LOG)
     MmtTlvLogFileLine(buf);
-#endif
-#else
-    UNREFERENCED_PARAMETER(format);
-#endif
 }

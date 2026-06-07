@@ -30,6 +30,25 @@ jobs:
         working-directory: mmts-dsfilter
         run: ./build.ps1 -Configuration Release
 
+      - name: Verify debug file logging is disabled by default
+        shell: pwsh
+        working-directory: mmts-dsfilter
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $project = Get-Content -LiteralPath 'msvc\mmts-dsfilter.vcxproj' -Raw
+          if ($project -match 'MMT_TLV_FILE_LOG|MMT_TLV_VERBOSE_LOG') {
+            throw 'Release project must not define debug logging preprocessor flags.'
+          }
+
+          $ini = Get-Content -LiteralPath 'settings\mmts-dsfilter.ini' -Raw
+          if ($ini -notmatch '(?m)^DebugLogPath=\s*$') {
+            throw 'Release INI must keep DebugLogPath empty by default.'
+          }
+          if ($ini -notmatch '(?m)^VerboseLog=0\s*$') {
+            throw 'Release INI must keep VerboseLog=0 by default.'
+          }
+
       - name: Create release package
         shell: pwsh
         working-directory: mmts-dsfilter

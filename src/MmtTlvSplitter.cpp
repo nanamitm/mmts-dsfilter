@@ -159,6 +159,24 @@ static bool ReadIniValue(const WCHAR* iniPath, const WCHAR* section, const WCHAR
     return GetPrivateProfileStringW(section, key, L"", buf, size, iniPath) > 0;
 }
 
+static void ConfigureMmtsDebugLoggingFromIni()
+{
+    WCHAR iniPath[MAX_PATH] = {};
+    GetMmtsIniPath(iniPath, MAX_PATH);
+
+    WCHAR path[MAX_PATH] = {};
+    WCHAR verbose[32] = {};
+    std::wstring debugLogPath;
+    bool verboseLog = false;
+
+    if (ReadIniValue(iniPath, L"MMTS", L"DebugLogPath", path, ARRAYSIZE(path)))
+        debugLogPath = path;
+    if (ReadIniValue(iniPath, L"MMTS", L"VerboseLog", verbose, ARRAYSIZE(verbose)))
+        verboseLog = _wtoi(verbose) != 0;
+
+    MmtTlvConfigureDebugLog(debugLogPath, verboseLog);
+}
+
 static MmtsCaptionSettings GetMmtsCaptionSettings()
 {
     static MmtsCaptionSettings cached;
@@ -171,6 +189,8 @@ static MmtsCaptionSettings GetMmtsCaptionSettings()
     DWORD now = GetTickCount();
     if (lastLoad != 0 && now - lastLoad <= 5000 && wcscmp(lastPath, iniPath) == 0)
         return cached;
+
+    ConfigureMmtsDebugLoggingFromIni();
 
     MmtsCaptionSettings s;
     WCHAR buf[MAX_PATH] = {};
@@ -1839,6 +1859,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
 {
     if (!pszFileName) return E_POINTER;
     CAutoLock lock(&m_pinLock);
+    ConfigureMmtsDebugLoggingFromIni();
     m_filename = pszFileName;
     m_handler.reset();
     m_handler.resetAudioSelection();
