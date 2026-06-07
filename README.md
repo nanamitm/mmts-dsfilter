@@ -73,6 +73,21 @@ The filter is produced as:
 msvc\x64\<Configuration>\mmts-dsfilter.ax
 ```
 
+## Debug Helper Tools
+
+`tools/mmts_audio_split.exe` scans MPT audio layout changes and reports whether
+ordinary AAC streams can be converted to ADTS:
+
+```powershell
+tools\mmts_audio_split.exe <input.mmts> [--split] [--max-mb N] [--progress-mb N]
+```
+
+- `--max-mb N` limits scanning to the first `N` MB for quick investigation.
+- `--progress-mb N` prints progress every `N` MB. The default is 512 MB.
+- `--split` writes one file per detected audio-layout segment. It cannot be
+  combined with `--max-mb`, because a partial scan may miss later layout
+  changes.
+
 ## GitHub Release Package
 
 The `Build Release` GitHub Actions workflow builds the Release configuration
@@ -179,10 +194,14 @@ lifecycle logs are written to the file without also going to `OutputDebugString`
 
 ## Audio Notes
 
-The splitter keeps one DirectShow audio output pin per playable audio stream so
-MPC-BE can switch tracks normally. For 8K broadcasts, 22.2ch audio is carried as
-AAC LATM/LOAS rather than the ADTS form used for ordinary AAC tracks. These
-LATM streams are passed through without ADTS conversion and are advertised as:
+The splitter keeps one DirectShow audio output pin per MPT `mp4a` audio stream
+found during pre-scan so MPC-BE can switch tracks normally. Ordinary AAC streams
+are delivered only after LATM/LOAS to ADTS conversion succeeds; candidate pins
+are still created before that conversion is confirmed so late or fragmented
+initial audio samples do not hide the track. For 8K broadcasts, 22.2ch audio is
+carried as AAC LATM/LOAS rather than the ADTS form used for ordinary AAC tracks.
+These LATM streams are passed through without ADTS conversion and are advertised
+as:
 
 ```text
 majortype:  MEDIATYPE_Audio

@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -156,10 +158,41 @@ private:
     std::string lastSignature;
 };
 
-static void demuxFile(const std::filesystem::path& path, AudioChangeHandler& handler)
+static void printUsage()
+{
+    std::printf("Usage: mmts_audio_split <input.mmts> [--split] [--max-mb N] [--progress-mb N]\n");
+}
+
+static bool parseUint64(const wchar_t* text, uint64_t& value)
+{
+    if (!text || !*text)
+        return false;
+
+    wchar_t* end = nullptr;
+    const unsigned long long parsed = std::wcstoull(text, &end, 10);
+    if (!end || *end != L'\0')
+        return false;
+
+    value = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+static void demuxFile(const std::filesystem::path& path,
+                      AudioChangeHandler& handler,
+                      uint64_t maxBytes,
+                      uint64_t progressBytes)
 {
     constexpr size_t kChunk = 1024 * 1024;
     std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        std::wprintf(L"error: cannot open %ls\n", path.c_str());
+        return;
+    }
+
+    const uint64_t fileSize = std::filesystem::file_size(path);
+    const uint64_t scanLimit = maxBytes == 0 ? fileSize : (std::min)(maxBytes, fileSize);
+    uint64_t nextProgress = progressBytes;
+
     MmtTlvDemuxer demuxer;
     demuxer.setDemuxerHandler(handler);
 
@@ -167,10 +200,12 @@ static void demuxFile(const std::filesystem::path& path, AudioChangeHandler& han
     buf.reserve(kChunk * 2);
     uint64_t totalRead = 0;
 
-    while (ifs) {
+    while (ifs && totalRead < scanLimit) {
         const size_t oldSize = buf.size();
-        buf.resize(oldSize + kChunk);
-        ifs.read(reinterpret_cast<char*>(buf.data() + oldSize), kChunk);
+        const uint64_t left = scanLimit - totalRead;
+        const size_t toRead = static_cast<size_t>((std::min<uint64_t>)(kChunk, left));
+        buf.resize(oldSize + toRead);
+        ifs.read(reinterpret_cast<char*>(buf.data() + oldSize), toRead);
         const size_t got = static_cast<size_t>(ifs.gcount());
         buf.resize(oldSize + got);
         if (got == 0)
@@ -188,7 +223,21 @@ static void demuxFile(const std::filesystem::path& path, AudioChangeHandler& han
         const size_t consumed = buf.size() - stream.leftBytes();
         if (consumed > 0)
             buf.erase(buf.begin(), buf.begin() + consumed);
+
+        if (progressBytes > 0 && totalRead >= nextProgress) {
+            std::printf("progress: %.1f/%.1f MB (%.1f%%)\n",
+                        totalRead / 1048576.0,
+                        scanLimit / 1048576.0,
+                        scanLimit > 0 ? (totalRead * 100.0 / scanLimit) : 100.0);
+            while (nextProgress <= totalRead)
+                nextProgress += progressBytes;
+        }
     }
+
+    std::printf("scan: read %.1f/%.1f MB%s\n",
+                totalRead / 1048576.0,
+                fileSize / 1048576.0,
+                totalRead < fileSize ? " (limited)" : "");
 }
 
 static bool copyRange(const std::filesystem::path& src,
@@ -254,18 +303,62 @@ static void splitAtChanges(const std::filesystem::path& path,
     }
 }
 
-int main(int argc, char** argv)
+int wmain(int argc, wchar_t** argv)
 {
     if (argc < 2) {
-        std::printf("Usage: mmts_audio_split <input.mmts> [--split]\n");
+        printUsage();
         return 1;
     }
 
-    const std::filesystem::path input = std::filesystem::u8path(argv[1]);
-    const bool doSplit = argc >= 3 && std::string(argv[2]) == "--split";
+    const std::filesystem::path input(argv[1]);
+    bool doSplit = false;
+    uint64_t maxBytes = 0;
+    uint64_t progressBytes = 512ULL * 1024 * 1024;
+
+    for (int i = 2; i < argc; ++i) {
+        if (std::wcscmp(argv[i], L"--split") == 0) {
+            doSplit = true;
+        } else if (std::wcscmp(argv[i], L"--max-mb") == 0) {
+            uint64_t mb = 0;
+            if (++i >= argc || !parseUint64(argv[i], mb)) {
+                printUsage();
+                return 1;
+            }
+            maxBytes = mb * 1024 * 1024;
+        } else if (std::wcsncmp(argv[i], L"--max-mb=", 9) == 0) {
+            uint64_t mb = 0;
+            if (!parseUint64(argv[i] + 9, mb)) {
+                printUsage();
+                return 1;
+            }
+            maxBytes = mb * 1024 * 1024;
+        } else if (std::wcscmp(argv[i], L"--progress-mb") == 0) {
+            uint64_t mb = 0;
+            if (++i >= argc || !parseUint64(argv[i], mb)) {
+                printUsage();
+                return 1;
+            }
+            progressBytes = mb * 1024 * 1024;
+        } else if (std::wcsncmp(argv[i], L"--progress-mb=", 14) == 0) {
+            uint64_t mb = 0;
+            if (!parseUint64(argv[i] + 14, mb)) {
+                printUsage();
+                return 1;
+            }
+            progressBytes = mb * 1024 * 1024;
+        } else {
+            printUsage();
+            return 1;
+        }
+    }
+
+    if (doSplit && maxBytes > 0) {
+        std::printf("error: --split cannot be used with --max-mb because the scan may miss later layout changes\n");
+        return 1;
+    }
 
     AudioChangeHandler handler;
-    demuxFile(input, handler);
+    demuxFile(input, handler, maxBytes, progressBytes);
 
     std::printf("summary: audio-layout changes=%zu\n", handler.changes.size());
     for (const auto& [streamIndex, ok] : handler.adtsConvertible) {

@@ -1999,14 +1999,13 @@ void CMmtTlvSplitter::PreScanFile()
     {
         auto discoveredAudioStreams = handler.getAudioStreams();
         auto playableAudioStreams = handler.getPlayableAudioStreams();
-        if (!discoveredAudioStreams.empty() && playableAudioStreams.empty()) {
-            m_audioUnsupported = true;
-            m_handler.setKnownAudioStreams({});
-            m_handler.setRequireAdtsConvertibleAudio(true);
-            LogMsg(L"MMT/TLV Splitter: audio streams found but no playable ADTS/LATM stream; audio pins disabled\n");
-        } else if (!playableAudioStreams.empty()) {
+        if (!playableAudioStreams.empty()) {
             m_handler.setKnownAudioStreams(playableAudioStreams);
             m_handler.setRequireAdtsConvertibleAudio(true);
+        } else if (!discoveredAudioStreams.empty()) {
+            m_handler.setKnownAudioStreams(discoveredAudioStreams);
+            m_handler.setRequireAdtsConvertibleAudio(true);
+            LogMsg(L"MMT/TLV Splitter: audio streams found before ADTS/LATM playback was confirmed; creating candidate audio pins\n");
         } else {
             m_handler.setKnownAudioStreams(discoveredAudioStreams);
             m_handler.setRequireAdtsConvertibleAudio(false);
