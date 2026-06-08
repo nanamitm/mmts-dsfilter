@@ -185,6 +185,11 @@ static std::wstring SidecarIndexPathFor(const std::wstring& mediaPath)
     return mediaPath + L"idx";
 }
 
+static std::wstring SidecarEditPathFor(const std::wstring& mediaPath)
+{
+    return mediaPath + L"edit";
+}
+
 static std::wstring SidecarMapPathFor(const std::wstring& mediaPath)
 {
     return mediaPath + L"map";
@@ -237,6 +242,29 @@ static long long ParseInt64Value(const std::string& value, long long fallback = 
     char* end = nullptr;
     long long parsed = std::strtoll(value.c_str(), &end, 0);
     return end && *end == '\0' ? parsed : fallback;
+}
+
+static bool ExtractJsonInt64Value(const std::string& text, const char* key, long long& value)
+{
+    const std::string quotedKey = std::string("\"") + key + "\"";
+    size_t pos = text.find(quotedKey);
+    if (pos == std::string::npos)
+        return false;
+    pos = text.find(':', pos + quotedKey.size());
+    if (pos == std::string::npos)
+        return false;
+    ++pos;
+    while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r' || text[pos] == '\n'))
+        ++pos;
+    if (text.compare(pos, 4, "null") == 0)
+        return false;
+
+    char* end = nullptr;
+    const long long parsed = std::strtoll(text.c_str() + pos, &end, 10);
+    if (!end || end == text.c_str() + pos)
+        return false;
+    value = parsed;
+    return true;
 }
 
 template <typename T>
@@ -1979,6 +2007,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_audioUnsupported = false;
     m_sourceDuration = 0;
     m_virtualStart = 0;
+    m_virtualEnd = 0;
     m_hasSidecarIndex = false;
     m_seekTarget = 0;
     m_currentPts = 0;
@@ -2000,7 +2029,9 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     }
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
-    LoadSidecarIndex();
+    LoadSidecarEdit();
+    if (!m_hasSidecarIndex)
+        LoadSidecarIndex();
     LoadSidecarMap();
     PreScanFile();   // sets m_hevcExtradata, m_firstPts, m_duration
     ApplySidecarMap();
@@ -2012,6 +2043,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
 void CMmtTlvSplitter::LoadSidecarIndex()
 {
     m_virtualStart = 0;
+    m_virtualEnd = 0;
     m_hasSidecarIndex = false;
 
     const std::wstring idxPath = SidecarIndexPathFor(m_filename);
@@ -2055,6 +2087,67 @@ void CMmtTlvSplitter::LoadSidecarIndex()
     m_hasSidecarIndex = true;
     LogMsg(L"MMT/TLV Splitter: sidecar loaded: %s start=%I64d ms\n",
            idxPath.c_str(), m_virtualStart / 10000);
+}
+
+void CMmtTlvSplitter::LoadSidecarEdit()
+{
+    m_virtualStart = 0;
+    m_virtualEnd = 0;
+    m_hasSidecarIndex = false;
+
+    const std::wstring editPath = SidecarEditPathFor(m_filename);
+    std::ifstream ifs(editPath, std::ios::binary | std::ios::ate);
+    if (!ifs.is_open())
+        return;
+
+    const std::streamoff size = ifs.tellg();
+    if (size <= 0 || size > 1024 * 1024) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, invalid sidecar size: %s size=%I64d\n",
+               editPath.c_str(), static_cast<long long>(size));
+        return;
+    }
+    ifs.seekg(0);
+    std::string text(static_cast<size_t>(size), '\0');
+    if (!ifs.read(text.data(), size)) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, read failed: %s\n", editPath.c_str());
+        return;
+    }
+
+    long long version = 0;
+    long long sourceSize = -1;
+    long long startMs = 0;
+    long long endMs = 0;
+    ExtractJsonInt64Value(text, "version", version);
+    ExtractJsonInt64Value(text, "sourceSize", sourceSize);
+    if (!ExtractJsonInt64Value(text, "sourceStartMs", startMs)) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, missing sourceStartMs: %s\n", editPath.c_str());
+        return;
+    }
+    const bool hasEnd = ExtractJsonInt64Value(text, "sourceEndMs", endMs);
+
+    if (version != 1) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, version=%I64d\n", version);
+        return;
+    }
+    if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, size mismatch: edit=%I64d file=%I64d\n",
+               sourceSize, static_cast<long long>(m_fileSize));
+        return;
+    }
+    if (startMs < 0 || startMs > kMaxMmtsMapTimeMs) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, sourceStartMs=%I64d\n", startMs);
+        return;
+    }
+    if (hasEnd && (endMs <= startMs || endMs > kMaxMmtsMapTimeMs)) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, sourceEndMs=%I64d start=%I64d\n", endMs, startMs);
+        return;
+    }
+
+    m_virtualStart = static_cast<REFERENCE_TIME>(startMs) * 10000LL;
+    m_virtualEnd = hasEnd ? static_cast<REFERENCE_TIME>(endMs) * 10000LL : 0;
+    m_hasSidecarIndex = m_virtualStart > 0 || m_virtualEnd > 0;
+    LogMsg(L"MMT/TLV Splitter: mmtsedit loaded: %s start=%I64d ms end=%I64d ms\n",
+           editPath.c_str(), m_virtualStart / 10000, m_virtualEnd / 10000);
 }
 
 void CMmtTlvSplitter::LoadSidecarMap()
@@ -2616,13 +2709,14 @@ bool CMmtTlvSplitter::FindSidecarMapSeekOffset(REFERENCE_TIME sourceTarget, long
 void CMmtTlvSplitter::ApplySidecarIndex()
 {
     m_sourceDuration = m_duration;
-    if (!m_hasSidecarIndex || m_virtualStart <= 0)
+    if (!m_hasSidecarIndex || (m_virtualStart <= 0 && m_virtualEnd <= 0))
         return;
 
     if (m_duration <= m_virtualStart || m_firstPts < 0) {
-        LogMsg(L"MMT/TLV Splitter: sidecar disabled after prescan, start=%I64d ms duration=%I64d ms firstPts=%I64d\n",
-               m_virtualStart / 10000, m_duration / 10000, m_firstPts / 10000);
+        LogMsg(L"MMT/TLV Splitter: sidecar disabled after prescan, start=%I64d ms end=%I64d ms duration=%I64d ms firstPts=%I64d\n",
+               m_virtualStart / 10000, m_virtualEnd / 10000, m_duration / 10000, m_firstPts / 10000);
         m_virtualStart = 0;
+        m_virtualEnd = 0;
         m_hasSidecarIndex = false;
         m_sourceDuration = m_duration;
         return;
@@ -2630,8 +2724,13 @@ void CMmtTlvSplitter::ApplySidecarIndex()
 
     m_firstPts += m_virtualStart;
     m_duration -= m_virtualStart;
-    LogMsg(L"MMT/TLV Splitter: sidecar applied: virtualStart=%I64d ms virtualDuration=%I64d ms\n",
-           m_virtualStart / 10000, m_duration / 10000);
+    if (m_virtualEnd > m_virtualStart) {
+        const REFERENCE_TIME editDuration = m_virtualEnd - m_virtualStart;
+        if (editDuration < m_duration)
+            m_duration = editDuration;
+    }
+    LogMsg(L"MMT/TLV Splitter: sidecar applied: virtualStart=%I64d ms virtualEnd=%I64d ms virtualDuration=%I64d ms\n",
+           m_virtualStart / 10000, m_virtualEnd / 10000, m_duration / 10000);
 }
 
 // ---------------------------------------------------------------------------

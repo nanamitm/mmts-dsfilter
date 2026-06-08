@@ -73,6 +73,7 @@ private:
     void StopThread();
     void SeekTo(REFERENCE_TIME pos);
     void PreScanFile();
+    void LoadSidecarEdit();
     void LoadSidecarIndex();
     void LoadSidecarMap();
     void ApplySidecarIndex();
@@ -119,6 +120,7 @@ private:
     REFERENCE_TIME m_firstPts{-1};     // absolute PTS of first video frame (100ns)
     REFERENCE_TIME m_sourceDuration{0};
     REFERENCE_TIME m_virtualStart{0};
+    REFERENCE_TIME m_virtualEnd{0};
     bool m_hasSidecarIndex{false};
     bool m_hasSidecarMap{false};
     REFERENCE_TIME m_mapDuration{0};
