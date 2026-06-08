@@ -88,6 +88,22 @@ tools\mmts_audio_split.exe <input.mmts> [--split] [--max-mb N] [--progress-mb N]
   combined with `--max-mb`, because a partial scan may miss later layout
   changes.
 
+`tools/mmts_make_index.exe` creates a lightweight `.mmtsidx` sidecar file that
+the DirectShow filter can use as a virtual edit list. The first implementation
+supports a virtual start offset, so playback can skip the beginning of a large
+`.mmts` file without rewriting the media file:
+
+```powershell
+tools\mmts_make_index.exe <input.mmts> --start-sec 20
+```
+
+This writes `<input.mmts>idx` (for example `recording.mmtsidx`). When the
+filter loads `recording.mmts`, it looks for `recording.mmtsidx`, verifies the
+recorded source size, and exposes the file as if playback started at that
+offset. The media file itself is not modified. This sidecar format is intended
+to grow into a seek/RAP index and edit decision list for future MMTS editing
+tools.
+
 ## GitHub Release Package
 
 The `Build Release` GitHub Actions workflow builds the Release configuration

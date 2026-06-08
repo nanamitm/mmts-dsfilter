@@ -73,6 +73,8 @@ private:
     void StopThread();
     void SeekTo(REFERENCE_TIME pos);
     void PreScanFile();
+    void LoadSidecarIndex();
+    void ApplySidecarIndex();
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
                                      std::vector<uint8_t>& out,
                                      int* width = nullptr,
@@ -111,6 +113,9 @@ private:
     // Seeking state
     REFERENCE_TIME m_duration{0};      // total file duration (100ns)
     REFERENCE_TIME m_firstPts{-1};     // absolute PTS of first video frame (100ns)
+    REFERENCE_TIME m_sourceDuration{0};
+    REFERENCE_TIME m_virtualStart{0};
+    bool m_hasSidecarIndex{false};
     REFERENCE_TIME m_stopPos{_I64_MAX};
     std::atomic<REFERENCE_TIME> m_currentPts{0};  // updated from video callback
     std::streamsize m_fileSize{0};

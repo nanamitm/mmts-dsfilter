@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -157,6 +158,29 @@ static bool ReadIniValue(const WCHAR* iniPath, const WCHAR* section, const WCHAR
                          WCHAR* buf, DWORD size)
 {
     return GetPrivateProfileStringW(section, key, L"", buf, size, iniPath) > 0;
+}
+
+static std::wstring SidecarIndexPathFor(const std::wstring& mediaPath)
+{
+    return mediaPath + L"idx";
+}
+
+static bool ParseKeyValueLine(const std::string& line, std::string& key, std::string& value)
+{
+    size_t eq = line.find('=');
+    if (eq == std::string::npos)
+        return false;
+    key = line.substr(0, eq);
+    value = line.substr(eq + 1);
+    while (!key.empty() && (key.back() == ' ' || key.back() == '\t'))
+        key.pop_back();
+    while (!value.empty() && (value.back() == '\r' || value.back() == '\n' ||
+                              value.back() == ' ' || value.back() == '\t'))
+        value.pop_back();
+    size_t valueStart = value.find_first_not_of(" \t");
+    if (valueStart != std::string::npos)
+        value.erase(0, valueStart);
+    return !key.empty();
 }
 
 static void ConfigureMmtsDebugLoggingFromIni()
@@ -1866,6 +1890,9 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_videoWidth = 3840;
     m_videoHeight = 2160;
     m_audioUnsupported = false;
+    m_sourceDuration = 0;
+    m_virtualStart = 0;
+    m_hasSidecarIndex = false;
     m_seekTarget = 0;
     m_currentPts = 0;
     m_segmentStart = 0;
@@ -1886,9 +1913,80 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     }
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
+    LoadSidecarIndex();
     PreScanFile();   // sets m_hevcExtradata, m_firstPts, m_duration
+    ApplySidecarIndex();
     CreatePins();
     return S_OK;
+}
+
+void CMmtTlvSplitter::LoadSidecarIndex()
+{
+    m_virtualStart = 0;
+    m_hasSidecarIndex = false;
+
+    const std::wstring idxPath = SidecarIndexPathFor(m_filename);
+    std::ifstream ifs(idxPath);
+    if (!ifs.is_open())
+        return;
+
+    std::string magic;
+    std::getline(ifs, magic);
+    if (magic != "MMTSIDX 1") {
+        LogMsg(L"MMT/TLV Splitter: sidecar ignored, bad magic: %s\n", idxPath.c_str());
+        return;
+    }
+
+    long long sourceSize = -1;
+    long long startMs = 0;
+    std::string line;
+    while (std::getline(ifs, line)) {
+        std::string key;
+        std::string value;
+        if (!ParseKeyValueLine(line, key, value))
+            continue;
+        if (key == "source_size") {
+            sourceSize = std::strtoll(value.c_str(), nullptr, 10);
+        } else if (key == "start_ms") {
+            startMs = std::strtoll(value.c_str(), nullptr, 10);
+        }
+    }
+
+    if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
+        LogMsg(L"MMT/TLV Splitter: sidecar ignored, size mismatch: idx=%I64d file=%I64d\n",
+               sourceSize, static_cast<long long>(m_fileSize));
+        return;
+    }
+    if (startMs <= 0) {
+        LogMsg(L"MMT/TLV Splitter: sidecar ignored, start_ms=%I64d\n", startMs);
+        return;
+    }
+
+    m_virtualStart = static_cast<REFERENCE_TIME>(startMs) * 10000LL;
+    m_hasSidecarIndex = true;
+    LogMsg(L"MMT/TLV Splitter: sidecar loaded: %s start=%I64d ms\n",
+           idxPath.c_str(), m_virtualStart / 10000);
+}
+
+void CMmtTlvSplitter::ApplySidecarIndex()
+{
+    m_sourceDuration = m_duration;
+    if (!m_hasSidecarIndex || m_virtualStart <= 0)
+        return;
+
+    if (m_duration <= m_virtualStart || m_firstPts < 0) {
+        LogMsg(L"MMT/TLV Splitter: sidecar disabled after prescan, start=%I64d ms duration=%I64d ms firstPts=%I64d\n",
+               m_virtualStart / 10000, m_duration / 10000, m_firstPts / 10000);
+        m_virtualStart = 0;
+        m_hasSidecarIndex = false;
+        m_sourceDuration = m_duration;
+        return;
+    }
+
+    m_firstPts += m_virtualStart;
+    m_duration -= m_virtualStart;
+    LogMsg(L"MMT/TLV Splitter: sidecar applied: virtualStart=%I64d ms virtualDuration=%I64d ms\n",
+           m_virtualStart / 10000, m_duration / 10000);
 }
 
 // ---------------------------------------------------------------------------
@@ -2932,34 +3030,36 @@ void CMmtTlvSplitter::DemuxLoop()
         return;
     }
 
-    // Seek to requested position by byte-offset approximation
     REFERENCE_TIME seekTarget = m_seekTarget;
+    REFERENCE_TIME sourceSeekTarget = seekTarget + m_virtualStart;
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
     m_subtitleTimeOffset.store(-1, std::memory_order_release);
     ClearPendingSubtitleCues();
-    const bool waitForRap = seekTarget > 0;
+    const bool waitForRap = sourceSeekTarget > 0;
     m_waitingForVideoRap.store(waitForRap, std::memory_order_release);
     for (auto* pin : m_pins) {
         if (pin->IsVideo())
             pin->SetWaitForVideoRap(waitForRap);
     }
     // Clear demuxer state for normal play; seek path already called resetStreams()
-    if (seekTarget == 0) {
+    if (sourceSeekTarget == 0) {
         m_demuxer.clear();
         m_handler.reset();
     }
 
-    if (seekTarget > 0 && m_fileSize > 0) {
-        double ratio = (m_duration > 0)
-            ? static_cast<double>(seekTarget) / m_duration
+    if (sourceSeekTarget > 0 && m_fileSize > 0) {
+        const REFERENCE_TIME sourceDuration = m_sourceDuration > 0 ? m_sourceDuration : (m_duration + m_virtualStart);
+        double ratio = (sourceDuration > 0)
+            ? static_cast<double>(sourceSeekTarget) / sourceDuration
             : 0.0;
         if (ratio > 1.0) ratio = 1.0;
         auto byteOffset = static_cast<std::streamoff>(ratio * m_fileSize);
         ifs.seekg(byteOffset);
         m_demuxByteOffset.store(static_cast<long long>(byteOffset), std::memory_order_release);
-        LogMsg(L"MMT/TLV Splitter: DemuxLoop seek target=%I64d ms ratio=%.6f byte=%I64d/%I64d ok=%d\n",
+        LogMsg(L"MMT/TLV Splitter: DemuxLoop seek target=%I64d ms source=%I64d ms ratio=%.6f byte=%I64d/%I64d ok=%d\n",
                seekTarget / 10000,
+               sourceSeekTarget / 10000,
                ratio,
                static_cast<long long>(byteOffset),
                static_cast<long long>(m_fileSize),
