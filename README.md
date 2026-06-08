@@ -104,6 +104,12 @@ offset. The media file itself is not modified. This sidecar format is intended
 to grow into a seek/RAP index and edit decision list for future MMTS editing
 tools.
 
+If a dantto4k-generated `.mmtsmap` exists next to the MMTS file
+(`recording.mmtsmap`), the filter also loads it during prescan. The map is used
+to supplement audio/subtitle track candidates and duration information, so
+tracks that appear after the first prescan window can still get output pins
+when playback starts.
+
 ## GitHub Release Package
 
 The `Build Release` GitHub Actions workflow builds the Release configuration

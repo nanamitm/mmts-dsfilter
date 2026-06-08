@@ -165,6 +165,11 @@ static std::wstring SidecarIndexPathFor(const std::wstring& mediaPath)
     return mediaPath + L"idx";
 }
 
+static std::wstring SidecarMapPathFor(const std::wstring& mediaPath)
+{
+    return mediaPath + L"map";
+}
+
 static bool ParseKeyValueLine(const std::string& line, std::string& key, std::string& value)
 {
     size_t eq = line.find('=');
@@ -181,6 +186,27 @@ static bool ParseKeyValueLine(const std::string& line, std::string& key, std::st
     if (valueStart != std::string::npos)
         value.erase(0, valueStart);
     return !key.empty();
+}
+
+static std::map<std::string, std::string> ParseSpaceKeyValues(const std::string& text)
+{
+    std::map<std::string, std::string> values;
+    std::istringstream iss(text);
+    std::string token;
+    while (iss >> token) {
+        std::string key;
+        std::string value;
+        if (ParseKeyValueLine(token, key, value))
+            values[key] = value;
+    }
+    return values;
+}
+
+static long long ParseInt64Value(const std::string& value, long long fallback = 0)
+{
+    char* end = nullptr;
+    long long parsed = std::strtoll(value.c_str(), &end, 0);
+    return end && *end == '\0' ? parsed : fallback;
 }
 
 static void ConfigureMmtsDebugLoggingFromIni()
@@ -1914,7 +1940,9 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
     LoadSidecarIndex();
+    LoadSidecarMap();
     PreScanFile();   // sets m_hevcExtradata, m_firstPts, m_duration
+    ApplySidecarMap();
     ApplySidecarIndex();
     CreatePins();
     return S_OK;
@@ -1966,6 +1994,156 @@ void CMmtTlvSplitter::LoadSidecarIndex()
     m_hasSidecarIndex = true;
     LogMsg(L"MMT/TLV Splitter: sidecar loaded: %s start=%I64d ms\n",
            idxPath.c_str(), m_virtualStart / 10000);
+}
+
+void CMmtTlvSplitter::LoadSidecarMap()
+{
+    m_hasSidecarMap = false;
+    m_mapDuration = 0;
+    m_sidecarMapTracks.clear();
+
+    const std::wstring mapPath = SidecarMapPathFor(m_filename);
+    std::ifstream ifs(mapPath);
+    if (!ifs.is_open())
+        return;
+
+    std::string magic;
+    std::getline(ifs, magic);
+    if (magic != "MMTSMAP 1") {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, bad magic: %s\n", mapPath.c_str());
+        return;
+    }
+
+    long long sourceSize = -1;
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty())
+            continue;
+
+        if (line.rfind("track ", 0) == 0) {
+            auto values = ParseSpaceKeyValues(line.substr(6));
+            SidecarMapTrack track;
+            auto it = values.find("type");
+            if (it != values.end())
+                track.type = it->second;
+            it = values.find("streamIndex");
+            if (it != values.end())
+                track.streamIndex = static_cast<int>(ParseInt64Value(it->second, -1));
+            it = values.find("packetId");
+            if (it != values.end())
+                track.packetId = static_cast<uint16_t>(ParseInt64Value(it->second, 0));
+            it = values.find("componentTag");
+            if (it != values.end())
+                track.componentTag = static_cast<int>(ParseInt64Value(it->second, -1));
+            it = values.find("rate");
+            if (it != values.end())
+                track.samplingRate = static_cast<uint32_t>(ParseInt64Value(it->second, 0));
+            it = values.find("latm");
+            if (it != values.end())
+                track.latm = ParseInt64Value(it->second, 0) != 0;
+
+            if ((track.type == "audio" || track.type == "subtitle") &&
+                track.streamIndex >= 0 && track.packetId != 0) {
+                m_sidecarMapTracks.push_back(track);
+            }
+            continue;
+        }
+
+        std::string key;
+        std::string value;
+        if (!ParseKeyValueLine(line, key, value))
+            continue;
+        if (key == "source_size") {
+            sourceSize = ParseInt64Value(value, -1);
+        } else if (key == "duration_ms") {
+            long long durationMs = ParseInt64Value(value, 0);
+            if (durationMs > 0)
+                m_mapDuration = static_cast<REFERENCE_TIME>(durationMs) * 10000LL;
+        }
+    }
+
+    if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, size mismatch: map=%I64d file=%I64d\n",
+               sourceSize, static_cast<long long>(m_fileSize));
+        m_sidecarMapTracks.clear();
+        m_mapDuration = 0;
+        return;
+    }
+
+    m_hasSidecarMap = !m_sidecarMapTracks.empty() || m_mapDuration > 0;
+    if (m_hasSidecarMap) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap loaded: %s tracks=%zu duration=%I64d ms\n",
+               mapPath.c_str(), m_sidecarMapTracks.size(), m_mapDuration / 10000);
+    }
+}
+
+void CMmtTlvSplitter::ApplySidecarMap()
+{
+    if (!m_hasSidecarMap)
+        return;
+
+    if (m_mapDuration > m_duration) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap duration applied: prescan=%I64d ms map=%I64d ms\n",
+               m_duration / 10000, m_mapDuration / 10000);
+        m_duration = m_mapDuration;
+    }
+
+    auto audioStreams = m_handler.getAudioStreams();
+    auto subtitleStreams = m_handler.getSubtitleStreams();
+    size_t addedAudio = 0;
+    size_t addedSubtitle = 0;
+
+    for (const auto& track : m_sidecarMapTracks) {
+        if (track.type == "audio") {
+            auto it = std::find_if(audioStreams.begin(), audioStreams.end(),
+                [&track](const CFilterDemuxerHandler::AudioStreamInfo& info) {
+                    return info.streamIndex == track.streamIndex ||
+                           (info.packetId == track.packetId && info.componentTag == track.componentTag);
+                });
+            if (it != audioStreams.end())
+                continue;
+
+            CFilterDemuxerHandler::AudioStreamInfo info;
+            info.streamIndex = track.streamIndex;
+            info.packetId = track.packetId;
+            info.componentTag = track.componentTag;
+            info.samplingRate = track.samplingRate;
+            info.channels = track.latm ? 24 : 2;
+            info.latm = track.latm;
+            audioStreams.push_back(info);
+            ++addedAudio;
+        } else if (track.type == "subtitle") {
+            auto it = std::find_if(subtitleStreams.begin(), subtitleStreams.end(),
+                [&track](const CFilterDemuxerHandler::SubtitleStreamInfo& info) {
+                    return info.streamIndex == track.streamIndex ||
+                           (info.packetId == track.packetId && info.componentTag == track.componentTag);
+                });
+            if (it != subtitleStreams.end())
+                continue;
+
+            CFilterDemuxerHandler::SubtitleStreamInfo info;
+            info.streamIndex = track.streamIndex;
+            info.packetId = track.packetId;
+            info.componentTag = track.componentTag;
+            info.hasData = false;
+            subtitleStreams.push_back(info);
+            ++addedSubtitle;
+        }
+    }
+
+    if (addedAudio > 0) {
+        m_handler.setKnownAudioStreams(audioStreams);
+        m_handler.setRequireAdtsConvertibleAudio(true);
+        m_handler.setAudioStreamListLocked(true);
+    }
+    if (addedSubtitle > 0) {
+        m_handler.setKnownSubtitleStreams(subtitleStreams);
+    }
+
+    if (addedAudio > 0 || addedSubtitle > 0) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap tracks merged: audio+%zu subtitle+%zu totalAudio=%zu totalSubtitle=%zu\n",
+               addedAudio, addedSubtitle, audioStreams.size(), subtitleStreams.size());
+    }
 }
 
 void CMmtTlvSplitter::ApplySidecarIndex()
