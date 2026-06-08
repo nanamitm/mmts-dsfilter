@@ -55,6 +55,17 @@ static bool IsCaptionComponentTag(int componentTag)
     return componentTag >= 0x30 && componentTag <= 0x37;
 }
 
+static int SubtitlePinPriority(const CFilterDemuxerHandler::SubtitleStreamInfo& info)
+{
+    if (info.hasData && IsCaptionComponentTag(info.componentTag))
+        return 0;
+    if (IsCaptionComponentTag(info.componentTag))
+        return 1;
+    if (info.hasData)
+        return 2;
+    return 3;
+}
+
 static LPWSTR AllocStreamName(const WCHAR* format, int listIndex, const CFilterDemuxerHandler::AudioStreamInfo& info)
 {
     WCHAR buf[128];
@@ -2746,6 +2757,11 @@ void CMmtTlvSplitter::CreatePins()
     }
     constexpr bool kEnableSubtitlePins = true;
     auto subtitleStreams = m_handler.getSubtitleStreams();
+    std::stable_sort(subtitleStreams.begin(), subtitleStreams.end(),
+        [](const CFilterDemuxerHandler::SubtitleStreamInfo& a,
+           const CFilterDemuxerHandler::SubtitleStreamInfo& b) {
+            return SubtitlePinPriority(a) < SubtitlePinPriority(b);
+        });
     if (kEnableSubtitlePins) {
         int primarySubtitleStreamIndex = -1;
         for (const auto& info : subtitleStreams) {
