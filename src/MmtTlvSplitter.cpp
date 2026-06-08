@@ -230,6 +230,22 @@ static long long ParseInt64Value(const std::string& value, long long fallback = 
     return end && *end == '\0' ? parsed : fallback;
 }
 
+template <typename T>
+static bool ReadPod(std::ifstream& ifs, T& value)
+{
+    return static_cast<bool>(ifs.read(reinterpret_cast<char*>(&value), sizeof(value)));
+}
+
+static std::string MmtsMapTrackTypeName(uint8_t type)
+{
+    switch (type) {
+    case 1: return "video";
+    case 2: return "audio";
+    case 3: return "subtitle";
+    default: return {};
+    }
+}
+
 static void ConfigureMmtsDebugLoggingFromIni()
 {
     WCHAR iniPath[MAX_PATH] = {};
@@ -2028,18 +2044,136 @@ void CMmtTlvSplitter::LoadSidecarMap()
     m_sidecarMapSeekPoints.clear();
 
     const std::wstring mapPath = SidecarMapPathFor(m_filename);
-    std::ifstream ifs(mapPath);
+    std::ifstream ifs(mapPath, std::ios::binary);
     if (!ifs.is_open())
         return;
 
+    long long sourceSize = -1;
     std::string magic;
-    std::getline(ifs, magic);
-    if (magic != "MMTSMAP 1") {
+    char binaryMagic[8] = {};
+    ifs.read(binaryMagic, sizeof(binaryMagic));
+    if (ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
+        std::memcmp(binaryMagic, "MMTSMAP2", 8) == 0) {
+        uint32_t version = 0;
+        uint32_t flags = 0;
+        uint64_t binarySourceSize = 0;
+        int64_t durationMs = 0;
+        int64_t firstVideoPtsMs = -1;
+        int64_t lastVideoPtsMs = -1;
+        uint32_t trackCount = 0;
+        uint32_t mptCount = 0;
+        uint32_t rapCount = 0;
+        uint32_t seekCount = 0;
+        if (!ReadPod(ifs, version) || !ReadPod(ifs, flags) ||
+            !ReadPod(ifs, binarySourceSize) || !ReadPod(ifs, durationMs) ||
+            !ReadPod(ifs, firstVideoPtsMs) || !ReadPod(ifs, lastVideoPtsMs) ||
+            !ReadPod(ifs, trackCount) || !ReadPod(ifs, mptCount) ||
+            !ReadPod(ifs, rapCount) || !ReadPod(ifs, seekCount) ||
+            version != 2) {
+            LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, bad binary header: %s\n", mapPath.c_str());
+            return;
+        }
+
+        sourceSize = static_cast<long long>(binarySourceSize);
+        if (durationMs > 0)
+            m_mapDuration = static_cast<REFERENCE_TIME>(durationMs) * 10000LL;
+        if (firstVideoPtsMs >= 0)
+            m_mapFirstVideoPts = static_cast<REFERENCE_TIME>(firstVideoPtsMs) * 10000LL;
+
+        std::vector<SidecarMapTrack> binaryTracks;
+        binaryTracks.reserve(trackCount);
+        for (uint32_t i = 0; i < trackCount; ++i) {
+            uint8_t type = 0;
+            uint8_t trackFlags = 0;
+            uint16_t reserved = 0;
+            int32_t streamIndex = -1;
+            uint16_t packetId = 0;
+            int16_t componentTag = -1;
+            uint32_t samplingRate = 0;
+            uint32_t reserved2 = 0;
+            if (!ReadPod(ifs, type) || !ReadPod(ifs, trackFlags) || !ReadPod(ifs, reserved) ||
+                !ReadPod(ifs, streamIndex) || !ReadPod(ifs, packetId) ||
+                !ReadPod(ifs, componentTag) || !ReadPod(ifs, samplingRate) ||
+                !ReadPod(ifs, reserved2)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                return;
+            }
+
+            SidecarMapTrack track;
+            track.type = MmtsMapTrackTypeName(type);
+            track.streamIndex = streamIndex;
+            track.packetId = packetId;
+            track.componentTag = componentTag;
+            track.samplingRate = samplingRate;
+            track.latm = (trackFlags & 1) != 0;
+            binaryTracks.push_back(track);
+            if ((track.type == "audio" || track.type == "subtitle") &&
+                track.streamIndex >= 0 && track.packetId != 0) {
+                m_sidecarMapTracks.push_back(track);
+            }
+        }
+
+        for (uint32_t i = 0; i < mptCount; ++i) {
+            int64_t timeMs = -1;
+            uint64_t offset = 0;
+            uint32_t mptTrackCount = 0;
+            if (!ReadPod(ifs, timeMs) || !ReadPod(ifs, offset) || !ReadPod(ifs, mptTrackCount)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary mpt table: %s\n", mapPath.c_str());
+                return;
+            }
+
+            SidecarMapMptChange change;
+            change.time = static_cast<REFERENCE_TIME>(timeMs) * 10000LL;
+            change.offset = static_cast<long long>(offset);
+            for (uint32_t j = 0; j < mptTrackCount; ++j) {
+                uint32_t trackIndex = UINT32_MAX;
+                if (!ReadPod(ifs, trackIndex)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary mpt tracks: %s\n", mapPath.c_str());
+                    return;
+                }
+                if (trackIndex < binaryTracks.size())
+                    change.tracks.push_back(binaryTracks[trackIndex]);
+            }
+            if (change.offset >= 0 && !change.tracks.empty())
+                m_sidecarMapMptChanges.push_back(change);
+        }
+
+        auto readPoint = [&ifs, &mapPath](SidecarMapPoint& point) {
+            int64_t timeMs = -1;
+            uint64_t offset = 0;
+            if (!ReadPod(ifs, timeMs) || !ReadPod(ifs, offset))
+                return false;
+            point.time = static_cast<REFERENCE_TIME>(timeMs) * 10000LL;
+            point.offset = static_cast<long long>(offset);
+            return true;
+        };
+        for (uint32_t i = 0; i < rapCount; ++i) {
+            SidecarMapPoint point;
+            if (!readPoint(point)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary rap table: %s\n", mapPath.c_str());
+                return;
+            }
+            if (point.time >= 0 && point.offset >= 0)
+                m_sidecarMapRapPoints.push_back(point);
+        }
+        for (uint32_t i = 0; i < seekCount; ++i) {
+            SidecarMapPoint point;
+            if (!readPoint(point)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary seek table: %s\n", mapPath.c_str());
+                return;
+            }
+            if (point.time >= 0 && point.offset >= 0)
+                m_sidecarMapSeekPoints.push_back(point);
+        }
+    } else {
+        ifs.clear();
+        ifs.seekg(0);
+        std::getline(ifs, magic);
+        if (magic != "MMTSMAP 1") {
         LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, bad magic: %s\n", mapPath.c_str());
         return;
-    }
+        }
 
-    long long sourceSize = -1;
     std::string line;
     auto parseMptTrackList = [](const std::string& value, const char* type) {
         std::vector<SidecarMapTrack> tracks;
@@ -2160,6 +2294,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
             if (firstMs >= 0)
                 m_mapFirstVideoPts = static_cast<REFERENCE_TIME>(firstMs) * 10000LL;
         }
+    }
     }
 
     if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
