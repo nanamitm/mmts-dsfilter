@@ -108,7 +108,8 @@ If a dantto4k-generated `.mmtsmap` exists next to the MMTS file
 (`recording.mmtsmap`), the filter also loads it during prescan. The map is used
 to supplement audio/subtitle track candidates and duration information, so
 tracks that appear after the first prescan window can still get output pins
-when playback starts.
+when playback starts. Seek/RAP points from the map are also used as preferred
+byte offsets before falling back to duration-ratio seeking.
 
 ## GitHub Release Package
 

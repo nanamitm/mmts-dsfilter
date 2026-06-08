@@ -2000,7 +2000,10 @@ void CMmtTlvSplitter::LoadSidecarMap()
 {
     m_hasSidecarMap = false;
     m_mapDuration = 0;
+    m_mapFirstVideoPts = -1;
     m_sidecarMapTracks.clear();
+    m_sidecarMapRapPoints.clear();
+    m_sidecarMapSeekPoints.clear();
 
     const std::wstring mapPath = SidecarMapPathFor(m_filename);
     std::ifstream ifs(mapPath);
@@ -2049,6 +2052,25 @@ void CMmtTlvSplitter::LoadSidecarMap()
             continue;
         }
 
+        if (line.rfind("rap ", 0) == 0 || line.rfind("seek ", 0) == 0) {
+            const bool isRap = line.rfind("rap ", 0) == 0;
+            auto values = ParseSpaceKeyValues(line.substr(isRap ? 4 : 5));
+            auto timeIt = values.find("time_ms");
+            auto offsetIt = values.find("offset");
+            if (timeIt != values.end() && offsetIt != values.end()) {
+                SidecarMapPoint point;
+                point.time = static_cast<REFERENCE_TIME>(ParseInt64Value(timeIt->second, -1)) * 10000LL;
+                point.offset = ParseInt64Value(offsetIt->second, -1);
+                if (point.time >= 0 && point.offset >= 0) {
+                    if (isRap)
+                        m_sidecarMapRapPoints.push_back(point);
+                    else
+                        m_sidecarMapSeekPoints.push_back(point);
+                }
+            }
+            continue;
+        }
+
         std::string key;
         std::string value;
         if (!ParseKeyValueLine(line, key, value))
@@ -2059,6 +2081,10 @@ void CMmtTlvSplitter::LoadSidecarMap()
             long long durationMs = ParseInt64Value(value, 0);
             if (durationMs > 0)
                 m_mapDuration = static_cast<REFERENCE_TIME>(durationMs) * 10000LL;
+        } else if (key == "first_video_pts_ms") {
+            long long firstMs = ParseInt64Value(value, -1);
+            if (firstMs >= 0)
+                m_mapFirstVideoPts = static_cast<REFERENCE_TIME>(firstMs) * 10000LL;
         }
     }
 
@@ -2066,14 +2092,37 @@ void CMmtTlvSplitter::LoadSidecarMap()
         LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, size mismatch: map=%I64d file=%I64d\n",
                sourceSize, static_cast<long long>(m_fileSize));
         m_sidecarMapTracks.clear();
+        m_sidecarMapRapPoints.clear();
+        m_sidecarMapSeekPoints.clear();
         m_mapDuration = 0;
+        m_mapFirstVideoPts = -1;
         return;
     }
 
-    m_hasSidecarMap = !m_sidecarMapTracks.empty() || m_mapDuration > 0;
+    if (m_mapFirstVideoPts >= 0) {
+        for (auto& point : m_sidecarMapRapPoints)
+            point.time -= m_mapFirstVideoPts;
+        for (auto& point : m_sidecarMapSeekPoints)
+            point.time -= m_mapFirstVideoPts;
+        m_sidecarMapRapPoints.erase(std::remove_if(m_sidecarMapRapPoints.begin(), m_sidecarMapRapPoints.end(),
+            [](const SidecarMapPoint& point) { return point.time < 0; }), m_sidecarMapRapPoints.end());
+        m_sidecarMapSeekPoints.erase(std::remove_if(m_sidecarMapSeekPoints.begin(), m_sidecarMapSeekPoints.end(),
+            [](const SidecarMapPoint& point) { return point.time < 0; }), m_sidecarMapSeekPoints.end());
+    }
+
+    auto byTime = [](const SidecarMapPoint& a, const SidecarMapPoint& b) {
+        return a.time < b.time;
+    };
+    std::sort(m_sidecarMapRapPoints.begin(), m_sidecarMapRapPoints.end(), byTime);
+    std::sort(m_sidecarMapSeekPoints.begin(), m_sidecarMapSeekPoints.end(), byTime);
+
+    m_hasSidecarMap = !m_sidecarMapTracks.empty() || m_mapDuration > 0 ||
+                      !m_sidecarMapRapPoints.empty() || !m_sidecarMapSeekPoints.empty();
     if (m_hasSidecarMap) {
-        LogMsg(L"MMT/TLV Splitter: mmtsmap loaded: %s tracks=%zu duration=%I64d ms\n",
-               mapPath.c_str(), m_sidecarMapTracks.size(), m_mapDuration / 10000);
+        LogMsg(L"MMT/TLV Splitter: mmtsmap loaded: %s tracks=%zu duration=%I64d ms rap=%zu seek=%zu firstVideoPts=%I64d ms\n",
+               mapPath.c_str(), m_sidecarMapTracks.size(), m_mapDuration / 10000,
+               m_sidecarMapRapPoints.size(), m_sidecarMapSeekPoints.size(),
+               m_mapFirstVideoPts / 10000);
     }
 }
 
@@ -2144,6 +2193,34 @@ void CMmtTlvSplitter::ApplySidecarMap()
         LogMsg(L"MMT/TLV Splitter: mmtsmap tracks merged: audio+%zu subtitle+%zu totalAudio=%zu totalSubtitle=%zu\n",
                addedAudio, addedSubtitle, audioStreams.size(), subtitleStreams.size());
     }
+}
+
+bool CMmtTlvSplitter::FindSidecarMapSeekOffset(REFERENCE_TIME sourceTarget, long long& byteOffset) const
+{
+    if (!m_hasSidecarMap || sourceTarget <= 0)
+        return false;
+
+    auto findBest = [&](const std::vector<SidecarMapPoint>& points, SidecarMapPoint& best) {
+        bool found = false;
+        for (const auto& point : points) {
+            if (point.time > sourceTarget)
+                break;
+            if (point.offset >= 0 && point.offset < static_cast<long long>(m_fileSize)) {
+                best = point;
+                found = true;
+            }
+        }
+        return found;
+    };
+
+    SidecarMapPoint best;
+    if (!findBest(m_sidecarMapRapPoints, best) &&
+        !findBest(m_sidecarMapSeekPoints, best)) {
+        return false;
+    }
+
+    byteOffset = best.offset;
+    return true;
 }
 
 void CMmtTlvSplitter::ApplySidecarIndex()
@@ -3227,17 +3304,26 @@ void CMmtTlvSplitter::DemuxLoop()
     }
 
     if (sourceSeekTarget > 0 && m_fileSize > 0) {
-        const REFERENCE_TIME sourceDuration = m_sourceDuration > 0 ? m_sourceDuration : (m_duration + m_virtualStart);
-        double ratio = (sourceDuration > 0)
-            ? static_cast<double>(sourceSeekTarget) / sourceDuration
-            : 0.0;
-        if (ratio > 1.0) ratio = 1.0;
-        auto byteOffset = static_cast<std::streamoff>(ratio * m_fileSize);
+        long long mappedOffset = -1;
+        bool usedMap = FindSidecarMapSeekOffset(sourceSeekTarget, mappedOffset);
+        double ratio = 0.0;
+        std::streamoff byteOffset = 0;
+        if (usedMap) {
+            byteOffset = static_cast<std::streamoff>(mappedOffset);
+        } else {
+            const REFERENCE_TIME sourceDuration = m_sourceDuration > 0 ? m_sourceDuration : (m_duration + m_virtualStart);
+            ratio = (sourceDuration > 0)
+                ? static_cast<double>(sourceSeekTarget) / sourceDuration
+                : 0.0;
+            if (ratio > 1.0) ratio = 1.0;
+            byteOffset = static_cast<std::streamoff>(ratio * m_fileSize);
+        }
         ifs.seekg(byteOffset);
         m_demuxByteOffset.store(static_cast<long long>(byteOffset), std::memory_order_release);
-        LogMsg(L"MMT/TLV Splitter: DemuxLoop seek target=%I64d ms source=%I64d ms ratio=%.6f byte=%I64d/%I64d ok=%d\n",
+        LogMsg(L"MMT/TLV Splitter: DemuxLoop seek target=%I64d ms source=%I64d ms method=%s ratio=%.6f byte=%I64d/%I64d ok=%d\n",
                seekTarget / 10000,
                sourceSeekTarget / 10000,
+               usedMap ? L"mmtsmap" : L"ratio",
                ratio,
                static_cast<long long>(byteOffset),
                static_cast<long long>(m_fileSize),

@@ -77,6 +77,7 @@ private:
     void LoadSidecarMap();
     void ApplySidecarIndex();
     void ApplySidecarMap();
+    bool FindSidecarMapSeekOffset(REFERENCE_TIME sourceTarget, long long& byteOffset) const;
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
                                      std::vector<uint8_t>& out,
                                      int* width = nullptr,
@@ -120,6 +121,7 @@ private:
     bool m_hasSidecarIndex{false};
     bool m_hasSidecarMap{false};
     REFERENCE_TIME m_mapDuration{0};
+    REFERENCE_TIME m_mapFirstVideoPts{-1};
     REFERENCE_TIME m_stopPos{_I64_MAX};
     std::atomic<REFERENCE_TIME> m_currentPts{0};  // updated from video callback
     std::streamsize m_fileSize{0};
@@ -157,5 +159,11 @@ private:
         uint32_t samplingRate{0};
         bool latm{false};
     };
+    struct SidecarMapPoint {
+        REFERENCE_TIME time{0};
+        long long offset{0};
+    };
     std::vector<SidecarMapTrack> m_sidecarMapTracks;
+    std::vector<SidecarMapPoint> m_sidecarMapRapPoints;
+    std::vector<SidecarMapPoint> m_sidecarMapSeekPoints;
 };
