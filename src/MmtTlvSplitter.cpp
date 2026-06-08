@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -27,6 +28,14 @@ static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
+static constexpr long long kMaxMmtsMapSize = 64LL * 1024 * 1024;
+static constexpr uint32_t kMaxMmtsMapTracks = 1024;
+static constexpr uint32_t kMaxMmtsMapMptChanges = 100000;
+static constexpr uint32_t kMaxMmtsMapPoints = 1000000;
+static constexpr uint32_t kMaxMmtsMapMptTracks = 1024;
+static constexpr uint32_t kMaxMmtsMapTextLines = 2000000;
+static constexpr size_t kMaxMmtsMapTextLine = 4096;
+static constexpr long long kMaxMmtsMapTimeMs = 24LL * 60 * 60 * 1000;
 
 #define LogMsg MmtTlvLogInfo
 #define LogDetail MmtTlvLogDebug
@@ -244,6 +253,21 @@ static std::string MmtsMapTrackTypeName(uint8_t type)
     case 3: return "subtitle";
     default: return {};
     }
+}
+
+static bool IsValidMmtsMapTimeMs(long long timeMs)
+{
+    return timeMs >= -1 && timeMs <= kMaxMmtsMapTimeMs;
+}
+
+static bool IsValidMmtsMapPtsMs(long long timeMs)
+{
+    return timeMs >= -1 && timeMs <= LLONG_MAX / 10000LL;
+}
+
+static bool IsValidMmtsMapOffset(long long offset, std::streamsize fileSize)
+{
+    return offset >= 0 && offset < static_cast<long long>(fileSize);
 }
 
 static void ConfigureMmtsDebugLoggingFromIni()
@@ -2048,6 +2072,29 @@ void CMmtTlvSplitter::LoadSidecarMap()
     if (!ifs.is_open())
         return;
 
+    ifs.seekg(0, std::ios::end);
+    const std::streamoff mapSize = ifs.tellg();
+    if (mapSize < 0 || mapSize > kMaxMmtsMapSize) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid sidecar size: %s size=%I64d\n",
+               mapPath.c_str(), static_cast<long long>(mapSize));
+        return;
+    }
+    ifs.seekg(0);
+
+    auto isValidTrack = [](const SidecarMapTrack& track) {
+        if (track.type != "video" && track.type != "audio" && track.type != "subtitle")
+            return false;
+        if (track.streamIndex < 0 || track.streamIndex > 8192)
+            return false;
+        if (track.packetId == 0)
+            return false;
+        if (track.componentTag < 0 || track.componentTag > 255)
+            return false;
+        if (track.type == "audio" && track.samplingRate > 768000)
+            return false;
+        return true;
+    };
+
     long long sourceSize = -1;
     std::string magic;
     char binaryMagic[8] = {};
@@ -2071,6 +2118,29 @@ void CMmtTlvSplitter::LoadSidecarMap()
             !ReadPod(ifs, rapCount) || !ReadPod(ifs, seekCount) ||
             version != 2) {
             LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, bad binary header: %s\n", mapPath.c_str());
+            return;
+        }
+        if (flags != 0 ||
+            binarySourceSize > static_cast<uint64_t>(LLONG_MAX) ||
+            !IsValidMmtsMapTimeMs(durationMs) ||
+            !IsValidMmtsMapPtsMs(firstVideoPtsMs) ||
+            !IsValidMmtsMapPtsMs(lastVideoPtsMs) ||
+            trackCount > kMaxMmtsMapTracks ||
+            mptCount > kMaxMmtsMapMptChanges ||
+            rapCount > kMaxMmtsMapPoints ||
+            seekCount > kMaxMmtsMapPoints) {
+            LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid binary header values: %s tracks=%u mpt=%u rap=%u seek=%u flags=%u\n",
+                   mapPath.c_str(), trackCount, mptCount, rapCount, seekCount, flags);
+            return;
+        }
+        const uint64_t minBinarySize =
+            64ULL +
+            static_cast<uint64_t>(trackCount) * 20ULL +
+            static_cast<uint64_t>(mptCount) * 20ULL +
+            (static_cast<uint64_t>(rapCount) + static_cast<uint64_t>(seekCount)) * 16ULL;
+        if (minBinarySize > static_cast<uint64_t>(mapSize)) {
+            LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, binary table sizes exceed file size: %s min=%I64u size=%I64d\n",
+                   mapPath.c_str(), minBinarySize, static_cast<long long>(mapSize));
             return;
         }
 
@@ -2106,6 +2176,11 @@ void CMmtTlvSplitter::LoadSidecarMap()
             track.componentTag = componentTag;
             track.samplingRate = samplingRate;
             track.latm = (trackFlags & 1) != 0;
+            if (!isValidTrack(track)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid binary track: %s index=%u type=%u streamIndex=%d packetId=0x%04X componentTag=%d\n",
+                       mapPath.c_str(), i, type, streamIndex, packetId, componentTag);
+                return;
+            }
             binaryTracks.push_back(track);
             if ((track.type == "audio" || track.type == "subtitle") &&
                 track.streamIndex >= 0 && track.packetId != 0) {
@@ -2121,6 +2196,13 @@ void CMmtTlvSplitter::LoadSidecarMap()
                 LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary mpt table: %s\n", mapPath.c_str());
                 return;
             }
+            if (!IsValidMmtsMapPtsMs(timeMs) ||
+                !IsValidMmtsMapOffset(static_cast<long long>(offset), m_fileSize) ||
+                mptTrackCount > kMaxMmtsMapMptTracks) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid binary mpt: %s index=%u time=%I64d offset=%I64u tracks=%u\n",
+                       mapPath.c_str(), i, timeMs, offset, mptTrackCount);
+                return;
+            }
 
             SidecarMapMptChange change;
             change.time = static_cast<REFERENCE_TIME>(timeMs) * 10000LL;
@@ -2131,26 +2213,32 @@ void CMmtTlvSplitter::LoadSidecarMap()
                     LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary mpt tracks: %s\n", mapPath.c_str());
                     return;
                 }
-                if (trackIndex < binaryTracks.size())
-                    change.tracks.push_back(binaryTracks[trackIndex]);
+                if (trackIndex >= binaryTracks.size()) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid binary mpt track reference: %s mpt=%u trackIndex=%u tracks=%zu\n",
+                           mapPath.c_str(), i, trackIndex, binaryTracks.size());
+                    return;
+                }
+                change.tracks.push_back(binaryTracks[trackIndex]);
             }
             if (change.offset >= 0 && !change.tracks.empty())
                 m_sidecarMapMptChanges.push_back(change);
         }
 
-        auto readPoint = [&ifs, &mapPath](SidecarMapPoint& point) {
+        const std::streamsize mediaFileSize = m_fileSize;
+        auto readPoint = [&ifs, mediaFileSize](SidecarMapPoint& point) {
             int64_t timeMs = -1;
             uint64_t offset = 0;
             if (!ReadPod(ifs, timeMs) || !ReadPod(ifs, offset))
                 return false;
             point.time = static_cast<REFERENCE_TIME>(timeMs) * 10000LL;
             point.offset = static_cast<long long>(offset);
-            return true;
+            return timeMs >= 0 && IsValidMmtsMapPtsMs(timeMs) &&
+                   IsValidMmtsMapOffset(point.offset, mediaFileSize);
         };
         for (uint32_t i = 0; i < rapCount; ++i) {
             SidecarMapPoint point;
             if (!readPoint(point)) {
-                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary rap table: %s\n", mapPath.c_str());
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated or invalid binary rap table: %s\n", mapPath.c_str());
                 return;
             }
             if (point.time >= 0 && point.offset >= 0)
@@ -2159,7 +2247,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
         for (uint32_t i = 0; i < seekCount; ++i) {
             SidecarMapPoint point;
             if (!readPoint(point)) {
-                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary seek table: %s\n", mapPath.c_str());
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated or invalid binary seek table: %s\n", mapPath.c_str());
                 return;
             }
             if (point.time >= 0 && point.offset >= 0)
@@ -2175,7 +2263,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
         }
 
     std::string line;
-    auto parseMptTrackList = [](const std::string& value, const char* type) {
+    auto parseMptTrackList = [&isValidTrack](const std::string& value, const char* type) {
         std::vector<SidecarMapTrack> tracks;
         if (value.empty() || value == "-")
             return tracks;
@@ -2189,19 +2277,28 @@ void CMmtTlvSplitter::LoadSidecarMap()
             SidecarMapTrack track;
             track.type = type;
             track.streamIndex = static_cast<int>(ParseInt64Value(fields[0], -1));
-            track.packetId = static_cast<uint16_t>(ParseInt64Value(fields[1], 0));
+            const long long packetId = ParseInt64Value(fields[1], 0);
+            if (packetId < 0 || packetId > 0xFFFF)
+                continue;
+            track.packetId = static_cast<uint16_t>(packetId);
             track.componentTag = static_cast<int>(ParseInt64Value(fields[2], -1));
             if (isAudio) {
                 track.samplingRate = static_cast<uint32_t>(ParseInt64Value(fields[3], 0));
                 track.latm = ParseInt64Value(fields[4], 0) != 0;
             }
-            if (track.streamIndex >= 0 && track.packetId != 0)
+            if (isValidTrack(track))
                 tracks.push_back(track);
         }
         return tracks;
     };
 
+    uint32_t textLineCount = 0;
     while (std::getline(ifs, line)) {
+        if (++textLineCount > kMaxMmtsMapTextLines || line.size() > kMaxMmtsMapTextLine) {
+            LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, text sidecar is too large or has an oversized line: %s line=%u size=%zu\n",
+                   mapPath.c_str(), textLineCount, line.size());
+            return;
+        }
         if (line.empty())
             continue;
 
@@ -2215,8 +2312,15 @@ void CMmtTlvSplitter::LoadSidecarMap()
             if (it != values.end())
                 track.streamIndex = static_cast<int>(ParseInt64Value(it->second, -1));
             it = values.find("packetId");
-            if (it != values.end())
-                track.packetId = static_cast<uint16_t>(ParseInt64Value(it->second, 0));
+            if (it != values.end()) {
+                const long long packetId = ParseInt64Value(it->second, 0);
+                if (packetId < 0 || packetId > 0xFFFF) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid text track packetId: %s value=%S\n",
+                           mapPath.c_str(), it->second.c_str());
+                    return;
+                }
+                track.packetId = static_cast<uint16_t>(packetId);
+            }
             it = values.find("componentTag");
             if (it != values.end())
                 track.componentTag = static_cast<int>(ParseInt64Value(it->second, -1));
@@ -2229,6 +2333,11 @@ void CMmtTlvSplitter::LoadSidecarMap()
 
             if ((track.type == "audio" || track.type == "subtitle") &&
                 track.streamIndex >= 0 && track.packetId != 0) {
+                if (!isValidTrack(track)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid text track: %s type=%S streamIndex=%d packetId=0x%04X componentTag=%d\n",
+                           mapPath.c_str(), track.type.c_str(), track.streamIndex, track.packetId, track.componentTag);
+                    return;
+                }
                 m_sidecarMapTracks.push_back(track);
             }
             continue;
@@ -2239,9 +2348,16 @@ void CMmtTlvSplitter::LoadSidecarMap()
             auto timeIt = values.find("time_ms");
             auto offsetIt = values.find("offset");
             if (timeIt != values.end() && offsetIt != values.end()) {
+                const long long timeMs = ParseInt64Value(timeIt->second, -1);
+                const long long offset = ParseInt64Value(offsetIt->second, -1);
+                if (!IsValidMmtsMapPtsMs(timeMs) || !IsValidMmtsMapOffset(offset, m_fileSize)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid text mpt: %s time=%I64d offset=%I64d\n",
+                           mapPath.c_str(), timeMs, offset);
+                    return;
+                }
                 SidecarMapMptChange change;
-                change.time = static_cast<REFERENCE_TIME>(ParseInt64Value(timeIt->second, -1)) * 10000LL;
-                change.offset = ParseInt64Value(offsetIt->second, -1);
+                change.time = static_cast<REFERENCE_TIME>(timeMs) * 10000LL;
+                change.offset = offset;
 
                 auto audioIt = values.find("audio");
                 if (audioIt != values.end()) {
@@ -2252,6 +2368,11 @@ void CMmtTlvSplitter::LoadSidecarMap()
                 if (subtitleIt != values.end()) {
                     auto tracks = parseMptTrackList(subtitleIt->second, "subtitle");
                     change.tracks.insert(change.tracks.end(), tracks.begin(), tracks.end());
+                }
+                if (change.tracks.size() > kMaxMmtsMapMptTracks) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, text mpt has too many tracks: %s tracks=%zu\n",
+                           mapPath.c_str(), change.tracks.size());
+                    return;
                 }
 
                 if (change.offset >= 0 && !change.tracks.empty())
@@ -2266,10 +2387,13 @@ void CMmtTlvSplitter::LoadSidecarMap()
             auto timeIt = values.find("time_ms");
             auto offsetIt = values.find("offset");
             if (timeIt != values.end() && offsetIt != values.end()) {
+                const long long timeMs = ParseInt64Value(timeIt->second, -1);
+                const long long offset = ParseInt64Value(offsetIt->second, -1);
                 SidecarMapPoint point;
-                point.time = static_cast<REFERENCE_TIME>(ParseInt64Value(timeIt->second, -1)) * 10000LL;
-                point.offset = ParseInt64Value(offsetIt->second, -1);
-                if (point.time >= 0 && point.offset >= 0) {
+                point.time = static_cast<REFERENCE_TIME>(timeMs) * 10000LL;
+                point.offset = offset;
+                if (timeMs >= 0 && IsValidMmtsMapPtsMs(timeMs) &&
+                    IsValidMmtsMapOffset(point.offset, m_fileSize)) {
                     if (isRap)
                         m_sidecarMapRapPoints.push_back(point);
                     else
@@ -2287,11 +2411,11 @@ void CMmtTlvSplitter::LoadSidecarMap()
             sourceSize = ParseInt64Value(value, -1);
         } else if (key == "duration_ms") {
             long long durationMs = ParseInt64Value(value, 0);
-            if (durationMs > 0)
+            if (durationMs > 0 && IsValidMmtsMapTimeMs(durationMs))
                 m_mapDuration = static_cast<REFERENCE_TIME>(durationMs) * 10000LL;
         } else if (key == "first_video_pts_ms") {
             long long firstMs = ParseInt64Value(value, -1);
-            if (firstMs >= 0)
+            if (firstMs >= 0 && IsValidMmtsMapPtsMs(firstMs))
                 m_mapFirstVideoPts = static_cast<REFERENCE_TIME>(firstMs) * 10000LL;
         }
     }
