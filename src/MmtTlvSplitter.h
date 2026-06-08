@@ -77,6 +77,7 @@ private:
     void LoadSidecarMap();
     void ApplySidecarIndex();
     void ApplySidecarMap();
+    void ApplySidecarMapTracks(REFERENCE_TIME sourceTarget);
     bool FindSidecarMapSeekOffset(REFERENCE_TIME sourceTarget, long long& byteOffset) const;
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
                                      std::vector<uint8_t>& out,
@@ -163,7 +164,14 @@ private:
         REFERENCE_TIME time{0};
         long long offset{0};
     };
+    struct SidecarMapMptChange {
+        REFERENCE_TIME time{0};
+        long long offset{0};
+        std::vector<SidecarMapTrack> tracks;
+    };
+    const SidecarMapMptChange* FindSidecarMapMptChange(REFERENCE_TIME sourceTarget) const;
     std::vector<SidecarMapTrack> m_sidecarMapTracks;
+    std::vector<SidecarMapMptChange> m_sidecarMapMptChanges;
     std::vector<SidecarMapPoint> m_sidecarMapRapPoints;
     std::vector<SidecarMapPoint> m_sidecarMapSeekPoints;
 };
