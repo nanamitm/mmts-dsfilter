@@ -180,11 +180,6 @@ static bool ReadIniValue(const WCHAR* iniPath, const WCHAR* section, const WCHAR
     return GetPrivateProfileStringW(section, key, L"", buf, size, iniPath) > 0;
 }
 
-static std::wstring SidecarIndexPathFor(const std::wstring& mediaPath)
-{
-    return mediaPath + L"idx";
-}
-
 static std::wstring SidecarEditPathFor(const std::wstring& mediaPath)
 {
     return mediaPath + L"edit";
@@ -265,6 +260,32 @@ static bool ExtractJsonInt64Value(const std::string& text, const char* key, long
         return false;
     value = parsed;
     return true;
+}
+
+// Like ExtractJsonInt64Value but starts scanning at `from` and reports the
+// position just past the parsed number, so callers can iterate a JSON array.
+// Returns std::string::npos when the key is not found at/after `from`.
+static size_t ExtractJsonInt64ValueAt(const std::string& text, const char* key,
+                                      size_t from, long long& value)
+{
+    const std::string quotedKey = std::string("\"") + key + "\"";
+    size_t pos = text.find(quotedKey, from);
+    if (pos == std::string::npos)
+        return std::string::npos;
+    pos = text.find(':', pos + quotedKey.size());
+    if (pos == std::string::npos)
+        return std::string::npos;
+    ++pos;
+    while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '\r' || text[pos] == '\n'))
+        ++pos;
+    if (text.compare(pos, 4, "null") == 0)
+        return std::string::npos;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(text.c_str() + pos, &end, 10);
+    if (!end || end == text.c_str() + pos)
+        return std::string::npos;
+    value = parsed;
+    return static_cast<size_t>(end - text.c_str());
 }
 
 template <typename T>
@@ -2038,8 +2059,6 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
     LoadSidecarEdit();
-    if (!m_hasSidecarIndex)
-        LoadSidecarIndex();
     LoadSidecarMap();
     PreScanFile();   // sets m_hevcExtradata, m_firstPts, m_duration
     ApplySidecarMap();
@@ -2048,60 +2067,12 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     return S_OK;
 }
 
-void CMmtTlvSplitter::LoadSidecarIndex()
-{
-    m_virtualStart = 0;
-    m_virtualEnd = 0;
-    m_hasSidecarIndex = false;
-
-    const std::wstring idxPath = SidecarIndexPathFor(m_filename);
-    std::ifstream ifs(idxPath);
-    if (!ifs.is_open())
-        return;
-
-    std::string magic;
-    std::getline(ifs, magic);
-    if (magic != "MMTSIDX 1") {
-        LogMsg(L"MMT/TLV Splitter: sidecar ignored, bad magic: %s\n", idxPath.c_str());
-        return;
-    }
-
-    long long sourceSize = -1;
-    long long startMs = 0;
-    std::string line;
-    while (std::getline(ifs, line)) {
-        std::string key;
-        std::string value;
-        if (!ParseKeyValueLine(line, key, value))
-            continue;
-        if (key == "source_size") {
-            sourceSize = std::strtoll(value.c_str(), nullptr, 10);
-        } else if (key == "start_ms") {
-            startMs = std::strtoll(value.c_str(), nullptr, 10);
-        }
-    }
-
-    if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
-        LogMsg(L"MMT/TLV Splitter: sidecar ignored, size mismatch: idx=%I64d file=%I64d\n",
-               sourceSize, static_cast<long long>(m_fileSize));
-        return;
-    }
-    if (startMs <= 0) {
-        LogMsg(L"MMT/TLV Splitter: sidecar ignored, start_ms=%I64d\n", startMs);
-        return;
-    }
-
-    m_virtualStart = static_cast<REFERENCE_TIME>(startMs) * 10000LL;
-    m_hasSidecarIndex = true;
-    LogMsg(L"MMT/TLV Splitter: sidecar loaded: %s start=%I64d ms\n",
-           idxPath.c_str(), m_virtualStart / 10000);
-}
-
 void CMmtTlvSplitter::LoadSidecarEdit()
 {
     m_virtualStart = 0;
     m_virtualEnd = 0;
     m_hasSidecarIndex = false;
+    m_editSegments.clear();
 
     const std::wstring editPath = SidecarEditPathFor(m_filename);
     std::ifstream ifs(editPath, std::ios::binary | std::ios::ate);
@@ -2123,15 +2094,8 @@ void CMmtTlvSplitter::LoadSidecarEdit()
 
     long long version = 0;
     long long sourceSize = -1;
-    long long startMs = 0;
-    long long endMs = 0;
     ExtractJsonInt64Value(text, "version", version);
     ExtractJsonInt64Value(text, "sourceSize", sourceSize);
-    if (!ExtractJsonInt64Value(text, "sourceStartMs", startMs)) {
-        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, missing sourceStartMs: %s\n", editPath.c_str());
-        return;
-    }
-    const bool hasEnd = ExtractJsonInt64Value(text, "sourceEndMs", endMs);
 
     if (version != 1) {
         LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, version=%I64d\n", version);
@@ -2142,20 +2106,46 @@ void CMmtTlvSplitter::LoadSidecarEdit()
                sourceSize, static_cast<long long>(m_fileSize));
         return;
     }
-    if (startMs < 0 || startMs > kMaxMmtsMapTimeMs) {
-        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, sourceStartMs=%I64d\n", startMs);
-        return;
+
+    // Parse every timeline segment (the EDL). The edited program is their
+    // concatenation in order. A single segment keeps the original trim path.
+    std::vector<EditSeg> segs;
+    size_t scan = 0;
+    for (;;) {
+        long long startMs = 0;
+        const size_t afterStart = ExtractJsonInt64ValueAt(text, "sourceStartMs", scan, startMs);
+        if (afterStart == std::string::npos)
+            break;
+        long long endMs = 0;
+        const size_t afterEnd = ExtractJsonInt64ValueAt(text, "sourceEndMs", afterStart, endMs);
+        scan = (afterEnd != std::string::npos) ? afterEnd : afterStart;
+        if (afterEnd == std::string::npos)
+            continue; // a start without an end is not a usable cut
+        if (startMs < 0 || startMs > kMaxMmtsMapTimeMs || endMs <= startMs || endMs > kMaxMmtsMapTimeMs) {
+            LogMsg(L"MMT/TLV Splitter: mmtsedit skipping invalid segment start=%I64d end=%I64d\n", startMs, endMs);
+            continue;
+        }
+        EditSeg seg;
+        seg.start = static_cast<REFERENCE_TIME>(startMs) * 10000LL;
+        seg.end = static_cast<REFERENCE_TIME>(endMs) * 10000LL;
+        segs.push_back(seg);
     }
-    if (hasEnd && (endMs <= startMs || endMs > kMaxMmtsMapTimeMs)) {
-        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, sourceEndMs=%I64d start=%I64d\n", endMs, startMs);
+
+    if (segs.empty()) {
+        LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, no usable segments: %s\n", editPath.c_str());
         return;
     }
 
-    m_virtualStart = static_cast<REFERENCE_TIME>(startMs) * 10000LL;
-    m_virtualEnd = hasEnd ? static_cast<REFERENCE_TIME>(endMs) * 10000LL : 0;
-    m_hasSidecarIndex = m_virtualStart > 0 || m_virtualEnd > 0;
-    LogMsg(L"MMT/TLV Splitter: mmtsedit loaded: %s start=%I64d ms end=%I64d ms\n",
-           editPath.c_str(), m_virtualStart / 10000, m_virtualEnd / 10000);
+    m_editSegments = segs;
+    m_virtualStart = segs.front().start;
+    m_virtualEnd = (segs.size() == 1) ? segs.front().end : 0; // multi-seg uses its own path
+    m_hasSidecarIndex = true;
+
+    REFERENCE_TIME totalMs = 0;
+    for (const auto& s : segs)
+        totalMs += (s.end - s.start) / 10000;
+    LogMsg(L"MMT/TLV Splitter: mmtsedit loaded: %s segments=%zu totalDuration=%I64d ms\n",
+           editPath.c_str(), segs.size(), totalMs);
 }
 
 void CMmtTlvSplitter::LoadSidecarMap()
@@ -2714,9 +2704,107 @@ bool CMmtTlvSplitter::FindSidecarMapSeekOffset(REFERENCE_TIME sourceTarget, long
     return true;
 }
 
+REFERENCE_TIME CMmtTlvSplitter::EditTotalDuration() const
+{
+    REFERENCE_TIME total = 0;
+    for (const auto& s : m_editSegments)
+        if (s.end > s.start)
+            total += s.end - s.start;
+    return total;
+}
+
+REFERENCE_TIME CMmtTlvSplitter::SegmentBase(int index) const
+{
+    REFERENCE_TIME base = 0;
+    for (int i = 0; i < index && i < static_cast<int>(m_editSegments.size()); ++i)
+        base += m_editSegments[i].end - m_editSegments[i].start;
+    return base;
+}
+
+int CMmtTlvSplitter::SegmentAtProgram(REFERENCE_TIME programRT, REFERENCE_TIME& srcRelOut) const
+{
+    REFERENCE_TIME base = 0;
+    for (int i = 0; i < static_cast<int>(m_editSegments.size()); ++i) {
+        const REFERENCE_TIME dur = m_editSegments[i].end - m_editSegments[i].start;
+        if (programRT < base + dur || i == static_cast<int>(m_editSegments.size()) - 1) {
+            const REFERENCE_TIME within = programRT > base ? programRT - base : 0;
+            srcRelOut = m_editSegments[i].start + (within < dur ? within : dur);
+            return i;
+        }
+        base += dur;
+    }
+    srcRelOut = 0;
+    return 0;
+}
+
+bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut)
+{
+    if (absPts < 0 || m_origFirstPts < 0) {
+        programOut = absPts;
+        return true;
+    }
+    if (m_curSegment < 0 || m_curSegment >= static_cast<int>(m_editSegments.size())) {
+        programOut = absPts - m_origFirstPts;
+        return true;
+    }
+    const REFERENCE_TIME srcRel = absPts - m_origFirstPts;
+    const EditSeg& seg = m_editSegments[m_curSegment];
+    if (srcRel >= seg.end) {
+        const int next = m_curSegment + 1;
+        m_pendingSegmentJump.store(next < static_cast<int>(m_editSegments.size()) ? next : -2,
+                                   std::memory_order_release);
+        return false; // past this segment -> drop and trigger jump/EOS
+    }
+    if (srcRel < seg.start)
+        return false; // before this segment (pre-roll / gap) -> drop
+    programOut = m_curSegmentBase + (srcRel - seg.start);
+    return true;
+}
+
 void CMmtTlvSplitter::ApplySidecarIndex()
 {
     m_sourceDuration = m_duration;
+    m_origFirstPts = m_firstPts;
+
+    // Multi-segment EDL: the program is the concatenation of the cut segments.
+    if (IsMultiSegment()) {
+        if (m_firstPts < 0 || m_sourceDuration <= 0) {
+            m_editSegments.clear();
+            m_hasSidecarIndex = false;
+            return;
+        }
+        // Clamp each segment end to the available source duration; drop empties.
+        std::vector<EditSeg> kept;
+        for (auto seg : m_editSegments) {
+            if (seg.start >= m_sourceDuration)
+                continue;
+            if (seg.end > m_sourceDuration)
+                seg.end = m_sourceDuration;
+            if (seg.end > seg.start)
+                kept.push_back(seg);
+        }
+        m_editSegments = kept;
+        if (m_editSegments.size() <= 1) {
+            // Collapsed to one (or zero) segment: fall through to the single path.
+            if (m_editSegments.empty()) {
+                m_hasSidecarIndex = false;
+                m_virtualStart = 0;
+                m_virtualEnd = 0;
+                return;
+            }
+            m_virtualStart = m_editSegments.front().start;
+            m_virtualEnd = m_editSegments.front().end;
+        } else {
+            m_duration = EditTotalDuration();
+            m_curSegment = 0;
+            m_curSegmentBase = 0;
+            m_pendingSegmentJump.store(-1, std::memory_order_release);
+            LogMsg(L"MMT/TLV Splitter: EDL applied: segments=%zu programDuration=%I64d ms sourceDuration=%I64d ms\n",
+                   m_editSegments.size(), m_duration / 10000, m_sourceDuration / 10000);
+            return;
+        }
+    }
+
     if (!m_hasSidecarIndex || (m_virtualStart <= 0 && m_virtualEnd <= 0))
         return;
 
@@ -3190,8 +3278,16 @@ void CMmtTlvSplitter::CreatePins()
     m_handler.setVideoCallback(
         [videoPin, this](int, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
-            REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
-            REFERENCE_TIME normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
+            REFERENCE_TIME normPts, normDts;
+            if (IsMultiSegment()) {
+                if (!EditMapPts(pts, normPts))
+                    return; // sample is in a cut gap / past the segment -> drop
+                const REFERENCE_TIME off = pts - normPts;
+                normDts = (dts >= 0) ? dts - off : dts;
+            } else {
+                normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+                normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
+            }
             if (last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
@@ -3204,8 +3300,16 @@ void CMmtTlvSplitter::CreatePins()
     m_handler.setAudioCallback(
         [this](int streamIndex, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
-            REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
-            REFERENCE_TIME normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
+            REFERENCE_TIME normPts, normDts;
+            if (IsMultiSegment()) {
+                if (!EditMapPts(pts, normPts))
+                    return; // sample is in a cut gap / past the segment -> drop
+                const REFERENCE_TIME off = pts - normPts;
+                normDts = (dts >= 0) ? dts - off : dts;
+            } else {
+                normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
+                normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
+            }
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
@@ -3788,7 +3892,19 @@ void CMmtTlvSplitter::DemuxLoop()
     }
 
     REFERENCE_TIME seekTarget = m_seekTarget;
-    REFERENCE_TIME sourceSeekTarget = seekTarget + m_virtualStart;
+    REFERENCE_TIME sourceSeekTarget;
+    if (IsMultiSegment()) {
+        // Map the program seek target to the source position inside its segment.
+        REFERENCE_TIME srcRel = 0;
+        m_curSegment = SegmentAtProgram(seekTarget, srcRel);
+        m_curSegmentBase = SegmentBase(m_curSegment);
+        m_pendingSegmentJump.store(-1, std::memory_order_release);
+        sourceSeekTarget = srcRel;
+        LogMsg(L"MMT/TLV Splitter: EDL start program=%I64d ms -> seg=%d base=%I64d ms src=%I64d ms\n",
+               seekTarget / 10000, m_curSegment, m_curSegmentBase / 10000, sourceSeekTarget / 10000);
+    } else {
+        sourceSeekTarget = seekTarget + m_virtualStart;
+    }
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
     m_subtitleTimeOffset.store(-1, std::memory_order_release);
@@ -3808,7 +3924,13 @@ void CMmtTlvSplitter::DemuxLoop()
 
     if (sourceSeekTarget > 0 && m_fileSize > 0) {
         long long mappedOffset = -1;
-        bool usedMap = FindSidecarMapSeekOffset(sourceSeekTarget, mappedOffset);
+        // Map RAP offsets are keyed by absolute PTS; the single-range path passes
+        // relative time (and falls back to ratio). For the EDL path we query with
+        // absolute time so segment starts land on a real RAP at/just before them.
+        const REFERENCE_TIME mapQuery = IsMultiSegment()
+            ? sourceSeekTarget + (m_mapFirstVideoPts >= 0 ? m_mapFirstVideoPts : 0)
+            : sourceSeekTarget;
+        bool usedMap = FindSidecarMapSeekOffset(mapQuery, mappedOffset);
         double ratio = 0.0;
         std::streamoff byteOffset = 0;
         if (usedMap) {
@@ -3877,6 +3999,45 @@ void CMmtTlvSplitter::DemuxLoop()
         } else {
             // Avoid infinite loop at EOF when remaining buffer is unparseable
             if (ifs.eof() || !ifs.good()) break;
+        }
+
+        // EDL: a segment boundary was reached (a video sample past the current
+        // segment end). Jump to the next segment, or stop after the last one.
+        if (IsMultiSegment()) {
+            const int jump = m_pendingSegmentJump.exchange(-1, std::memory_order_acq_rel);
+            if (jump == -2) {
+                LogMsg(L"MMT/TLV Splitter: EDL reached end of last segment\n");
+                break; // -> EOS below
+            }
+            if (jump >= 0 && jump < static_cast<int>(m_editSegments.size())) {
+                m_curSegment = jump;
+                m_curSegmentBase = SegmentBase(jump);
+                const REFERENCE_TIME srcRel = m_editSegments[jump].start;
+                // Prefer a precise map RAP offset (absolute-time query); fall back
+                // to a duration-ratio estimate. Both land at/just before srcRel, so
+                // the RAP wait + EditMapPts drop trims to the exact segment start.
+                long long mappedOffset = -1;
+                std::streamoff byteOffset = 0;
+                const REFERENCE_TIME mapQuery = srcRel + (m_mapFirstVideoPts >= 0 ? m_mapFirstVideoPts : 0);
+                if (FindSidecarMapSeekOffset(mapQuery, mappedOffset)) {
+                    byteOffset = static_cast<std::streamoff>(mappedOffset);
+                } else if (m_sourceDuration > 0) {
+                    byteOffset = static_cast<std::streamoff>(static_cast<double>(srcRel) / m_sourceDuration * m_fileSize);
+                }
+                ifs.clear();
+                ifs.seekg(byteOffset);
+                buf.clear();
+                bufferOffset = static_cast<long long>(byteOffset);
+                m_demuxByteOffset.store(bufferOffset, std::memory_order_release);
+                m_demuxer.resetStreams();
+                m_handler.reset();
+                m_waitingForVideoRap.store(true, std::memory_order_release);
+                for (auto* pin : m_pins)
+                    if (pin->IsVideo())
+                        pin->SetWaitForVideoRap(true);
+                LogMsg(L"MMT/TLV Splitter: EDL jump to seg=%d base=%I64d ms src=%I64d ms byte=%I64d\n",
+                       jump, m_curSegmentBase / 10000, srcRel / 10000, static_cast<long long>(byteOffset));
+            }
         }
     }
 

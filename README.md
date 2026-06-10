@@ -88,21 +88,35 @@ tools\mmts_audio_split.exe <input.mmts> [--split] [--max-mb N] [--progress-mb N]
   combined with `--max-mb`, because a partial scan may miss later layout
   changes.
 
-`tools/mmts_make_index.exe` creates a lightweight `.mmtsidx` sidecar file that
-the DirectShow filter can use as a virtual edit list. The first implementation
-supports a virtual start offset, so playback can skip the beginning of a large
-`.mmts` file without rewriting the media file:
+## Non-destructive edits (`.mmtsedit`)
 
-```powershell
-tools\mmts_make_index.exe <input.mmts> --start-sec 20
+The filter supports a non-destructive edit decision list via a `.mmtsedit`
+sidecar (JSON) placed next to the media (`recording.mmts` -> `recording.mmtsedit`).
+The edited program is the concatenation of the listed source segments, played
+without rewriting the media file:
+
+```json
+{
+  "version": 1,
+  "source": "recording.mmts",
+  "sourceSize": 123456789,
+  "map": "recording.mmtsmap",
+  "timeline": [
+    { "sourceStartMs": 25000, "sourceEndMs": 1800000 },
+    { "sourceStartMs": 1860000, "sourceEndMs": 3600000 }
+  ]
+}
 ```
 
-This writes `<input.mmts>idx` (for example `recording.mmtsidx`). When the
-filter loads `recording.mmts`, it looks for `recording.mmtsidx`, verifies the
-recorded source size, and exposes the file as if playback started at that
-offset. The media file itself is not modified. This sidecar format is intended
-to grow into a seek/RAP index and edit decision list for future MMTS editing
-tools.
+When the filter loads `recording.mmts` it reads `recording.mmtsedit`, verifies
+the recorded source size, and exposes a virtual timeline whose duration is the
+sum of the segment durations. A single segment behaves as a simple in/out trim;
+multiple segments are concatenated, with the demuxer jumping across the cut
+gaps (each segment starts at the nearest RAP). Create and edit these files with
+the `mmts-edit-gui` tool.
+
+> The earlier start-only `.mmtsidx` format has been removed; use `.mmtsedit`
+> (a single segment is equivalent to the old start offset plus an end).
 
 If a dantto4k-generated `.mmtsmap` exists next to the MMTS file
 (`recording.mmtsmap`), the filter also loads it during prescan. The map is used

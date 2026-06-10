@@ -75,12 +75,21 @@ private:
     void SeekTo(REFERENCE_TIME pos);
     void PreScanFile();
     void LoadSidecarEdit();
-    void LoadSidecarIndex();
     void LoadSidecarMap();
     void ApplySidecarIndex();
     void ApplySidecarMap();
     void ApplySidecarMapTracks(REFERENCE_TIME sourceTarget);
     bool FindSidecarMapSeekOffset(REFERENCE_TIME sourceTarget, long long& byteOffset) const;
+
+    // EDL (multi-segment) helpers. Active only when m_editSegments.size() > 1.
+    bool IsMultiSegment() const { return m_editSegments.size() > 1; }
+    REFERENCE_TIME EditTotalDuration() const;       // sum of segment durations
+    REFERENCE_TIME SegmentBase(int index) const;    // program time at start of segment
+    int SegmentAtProgram(REFERENCE_TIME programRT, REFERENCE_TIME& srcRelOut) const;
+    // Maps an absolute source PTS to program time for the current segment.
+    // Returns false (drop the sample) when the PTS is past the segment end (also
+    // requests the next jump) or before the segment start.
+    bool EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut);
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
                                      std::vector<uint8_t>& out,
                                      int* width = nullptr,
@@ -122,6 +131,18 @@ private:
     REFERENCE_TIME m_sourceDuration{0};
     REFERENCE_TIME m_virtualStart{0};
     REFERENCE_TIME m_virtualEnd{0};
+
+    // EDL: ordered source cut segments concatenated into one program timeline.
+    // Each is source-relative [start,end) in 100ns. Multi-segment mode is active
+    // only when m_editSegments has >1 entry; one or zero segments keep the
+    // original single-range (m_virtualStart/m_virtualEnd) path untouched.
+    struct EditSeg { REFERENCE_TIME start{0}; REFERENCE_TIME end{0}; };
+    std::vector<EditSeg> m_editSegments;
+    REFERENCE_TIME m_origFirstPts{-1};       // first video PTS (absolute), pre-offset
+    int m_curSegment{0};                     // segment currently being delivered
+    REFERENCE_TIME m_curSegmentBase{0};      // program time at start of m_curSegment
+    std::atomic<int> m_pendingSegmentJump{-1}; // demux loop: jump to seg N, -2 = EOS, -1 = none
+
     bool m_hasSidecarIndex{false};
     bool m_hasSidecarMap{false};
     REFERENCE_TIME m_mapDuration{0};
