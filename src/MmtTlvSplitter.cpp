@@ -305,15 +305,23 @@ static void ConfigureMmtsDebugLoggingFromIni()
 
     WCHAR path[MAX_PATH] = {};
     WCHAR verbose[32] = {};
+    WCHAR traceCenter[32] = {};
+    WCHAR traceWindow[32] = {};
     std::wstring debugLogPath;
     bool verboseLog = false;
+    long long playbackTraceCenterMs = -1;
+    long long playbackTraceWindowMs = 3000;
 
     if (ReadIniValue(iniPath, L"MMTS", L"DebugLogPath", path, ARRAYSIZE(path)))
         debugLogPath = path;
     if (ReadIniValue(iniPath, L"MMTS", L"VerboseLog", verbose, ARRAYSIZE(verbose)))
         verboseLog = _wtoi(verbose) != 0;
+    if (ReadIniValue(iniPath, L"MMTS", L"PlaybackTraceCenterMs", traceCenter, ARRAYSIZE(traceCenter)))
+        playbackTraceCenterMs = _wtoi64(traceCenter);
+    if (ReadIniValue(iniPath, L"MMTS", L"PlaybackTraceWindowMs", traceWindow, ARRAYSIZE(traceWindow)))
+        playbackTraceWindowMs = _wtoi64(traceWindow);
 
-    MmtTlvConfigureDebugLog(debugLogPath, verboseLog);
+    MmtTlvConfigureDebugLog(debugLogPath, verboseLog, playbackTraceCenterMs, playbackTraceWindowMs);
 }
 
 static MmtsCaptionSettings GetMmtsCaptionSettings()

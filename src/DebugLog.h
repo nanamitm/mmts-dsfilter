@@ -10,6 +10,8 @@
 struct MmtTlvDebugLogConfig {
     std::wstring filePath;
     bool verbose = false;
+    long long playbackTraceCenterMs = -1;
+    long long playbackTraceWindowMs = 3000;
 };
 
 inline MmtTlvDebugLogConfig& MmtTlvDebugLogState()
@@ -24,11 +26,25 @@ inline std::mutex& MmtTlvDebugLogMutex()
     return mutex;
 }
 
-inline void MmtTlvConfigureDebugLog(const std::wstring& filePath, bool verbose)
+inline void MmtTlvConfigureDebugLog(const std::wstring& filePath, bool verbose,
+                                    long long playbackTraceCenterMs = -1,
+                                    long long playbackTraceWindowMs = 3000)
 {
     std::lock_guard<std::mutex> lock(MmtTlvDebugLogMutex());
     MmtTlvDebugLogState().filePath = filePath;
     MmtTlvDebugLogState().verbose = verbose;
+    MmtTlvDebugLogState().playbackTraceCenterMs = playbackTraceCenterMs;
+    MmtTlvDebugLogState().playbackTraceWindowMs = playbackTraceWindowMs > 0 ? playbackTraceWindowMs : 3000;
+}
+
+inline bool MmtTlvIsPlaybackTraceTimeMs(long long timeMs)
+{
+    std::lock_guard<std::mutex> lock(MmtTlvDebugLogMutex());
+    const auto& state = MmtTlvDebugLogState();
+    if (state.playbackTraceCenterMs < 0 || timeMs < 0)
+        return false;
+    const long long delta = timeMs - state.playbackTraceCenterMs;
+    return delta >= -state.playbackTraceWindowMs && delta <= state.playbackTraceWindowMs;
 }
 
 inline bool MmtTlvIsVerboseLogEnabled()

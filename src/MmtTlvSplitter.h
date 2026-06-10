@@ -66,6 +66,7 @@ public:
     bool IsWaitingForVideoRap() const;
     void NotifyVideoRap(REFERENCE_TIME segmentTime);
     REFERENCE_TIME GetSegmentTimeOffset() const;
+    REFERENCE_TIME GetSegmentStart() const { return m_segmentStart; }
 
 private:
     void CreatePins();

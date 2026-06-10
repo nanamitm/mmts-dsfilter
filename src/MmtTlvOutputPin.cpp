@@ -3,6 +3,7 @@
 #include "MmtTlvSplitter.h"
 #include "Guids.h"
 #include <dvdmedia.h>   // VIDEOINFOHEADER2
+#include <atomic>
 
 struct SUBTITLEINFO {
     DWORD dwOffset;
@@ -141,6 +142,7 @@ void CMmtTlvOutputPin::ResetForSeek()
     m_firstSample = true;
     m_logNextSample = true;
     m_droppedBeforeSegment = 0;
+    m_lastDeliveredPts = -1;
     if (m_isVideo) {
         m_waitForVideoRap = true;
         m_droppedUntilRap = 0;
@@ -311,6 +313,7 @@ HRESULT CMmtTlvOutputPin::Active()
     m_waitForVideoRap = false;
     m_droppedUntilRap = 0;
     m_droppedBeforeSegment = 0;
+    m_lastDeliveredPts = -1;
     m_videoFirstWallMs = 0;
     m_videoFirstPts = -1;
     m_videoLastPts = -1;
@@ -388,6 +391,8 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
 
     static volatile LONG s_videoSamples = 0;
     static volatile LONG s_audioSamples = 0;
+    static std::atomic<LONGLONG> s_lastVideoPtsMs{-1};
+    static std::atomic<LONGLONG> s_lastAudioPtsMs{-1};
 
     if (isFirstFragment) {
         m_accum.clear();
@@ -547,6 +552,15 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     const ULONGLONG deliverMs = tDeliverEnd - tDeliverStart;
     LONGLONG videoFrameStepMs = 0;
     LONGLONG videoDriftMs = 0;
+    LONGLONG sampleStepMs = 0;
+    LONGLONG avDeltaMs = 0;
+    const LONGLONG samplePtsMs = (m_accumPts >= 0) ? (m_accumPts / 10000) : -1;
+    const LONGLONG timelinePtsMs = (m_accumPts >= 0)
+        ? ((m_accumPts + Filter()->GetSegmentStart()) / 10000)
+        : -1;
+    if (m_lastDeliveredPts >= 0 && m_accumPts >= 0)
+        sampleStepMs = (m_accumPts - m_lastDeliveredPts) / 10000;
+    m_lastDeliveredPts = m_accumPts;
     if (m_isVideo && m_accumPts >= 0) {
         if (m_videoFirstWallMs == 0) {
             m_videoFirstWallMs = tDeliverEnd;
@@ -560,9 +574,39 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         const LONGLONG mediaElapsedMs = (m_accumPts - m_videoFirstPts) / 10000;
         videoDriftMs = wallElapsedMs - mediaElapsedMs;
     }
+    if (m_isVideo) {
+        const LONGLONG audioPtsMs = s_lastAudioPtsMs.load(std::memory_order_relaxed);
+        avDeltaMs = (audioPtsMs >= 0 && samplePtsMs >= 0) ? (samplePtsMs - audioPtsMs) : 0;
+        if (samplePtsMs >= 0)
+            s_lastVideoPtsMs.store(samplePtsMs, std::memory_order_relaxed);
+    } else if (IsAudio()) {
+        const LONGLONG videoPtsMs = s_lastVideoPtsMs.load(std::memory_order_relaxed);
+        avDeltaMs = (videoPtsMs >= 0 && samplePtsMs >= 0) ? (videoPtsMs - samplePtsMs) : 0;
+        if (samplePtsMs >= 0)
+            s_lastAudioPtsMs.store(samplePtsMs, std::memory_order_relaxed);
+    }
     const bool forceLog = m_logNextSample;
     m_logNextSample = false;
     const bool logFailure = FAILED(hr) && m_isVideo;
+    const bool traceSample = MmtTlvIsPlaybackTraceTimeMs(samplePtsMs) ||
+                             MmtTlvIsPlaybackTraceTimeMs(timelinePtsMs);
+    if (traceSample && (m_isVideo || IsAudio())) {
+        LogPinMsg(L"MMT/TLV TRACE %s sample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, timeline=%I64d ms, dts=%I64d ms, step=%I64d ms, avDelta=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms, wall=%I64u ms\n",
+                  m_isVideo ? L"Video" : L"Audio",
+                  sampleNo,
+                  hr,
+                  m_accum.size(),
+                  samplePtsMs,
+                  timelinePtsMs,
+                  m_accumDts / 10000,
+                  sampleStepMs,
+                  avDeltaMs,
+                  m_accumKey,
+                  wasFirstSample,
+                  bufferMs,
+                  deliverMs,
+                  tDeliverEnd);
+    }
     if (forceLog || sampleNo <= 10 || (sampleNo % 100) == 0 || bufferMs >= 20 || deliverMs >= 20 || logFailure) {
         if (m_isVideo) {
             LogPinDetail(L"MMT/TLV Video DeliverSample #%ld: hr=0x%08X, size=%zu, pts=%I64d ms, dts=%I64d ms, key=%d, disc=%d, getbuf=%I64u ms, deliver=%I64u ms, frameStep=%I64d ms, drift=%I64d ms\n",

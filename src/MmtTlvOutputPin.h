@@ -130,6 +130,7 @@ private:
     ULONGLONG m_videoFirstWallMs{0};
     REFERENCE_TIME m_videoFirstPts{-1};
     REFERENCE_TIME m_videoLastPts{-1};
+    REFERENCE_TIME m_lastDeliveredPts{-1};
 
     COutputQueue* m_pQueue{nullptr};
 };
