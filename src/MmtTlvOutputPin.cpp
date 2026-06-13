@@ -324,7 +324,13 @@ HRESULT CMmtTlvOutputPin::Active()
     delete m_pQueue;
     m_pQueue = nullptr;
 
-    if (m_Connected && !IsSubtitle()) {
+    if (m_Connected) {
+        // All pins (including subtitle) use a queued delivery thread. The
+        // downstream Receive() can block for clock/decoder pacing (e.g. a
+        // subtitle renderer holding a future-timestamped sample until its
+        // presentation time); without a queue that block would freeze the demux
+        // thread and starve the video/audio queues, stalling playback right
+        // before a caption appears.
         m_pQueue = new COutputQueue(
             m_Connected,
             &hr,
