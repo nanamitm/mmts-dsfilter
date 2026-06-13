@@ -25,6 +25,11 @@ static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
 static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuration;
 static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
+// Subtitle MFUs carry no PTS, so cue placement is anchored to the current video
+// position. The cached TTML->media offset is re-synced when a cue would land far
+// from the current playback position (a TTML timeline jump at a program boundary).
+static constexpr REFERENCE_TIME kSubtitleResyncBackTolerance = 5 * 10000000LL;   // 5 s in the past
+static constexpr REFERENCE_TIME kSubtitleResyncAheadTolerance = 30 * 10000000LL; // 30 s in the future
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
@@ -2042,7 +2047,8 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_currentPts = 0;
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
-    m_subtitleTimeOffset.store(-1, std::memory_order_release);
+    m_subtitleTimeOffset.store(0, std::memory_order_release);
+    m_subtitleOffsetValid.store(false, std::memory_order_release);
     m_demuxByteOffset.store(0, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
     ClearPendingSubtitleCues();
@@ -3395,26 +3401,7 @@ void CMmtTlvSplitter::CreatePins()
             REFERENCE_TIME sampleStop;
             bool repeatUntilNextCue = false;
             if (cue.hasBegin) {
-                REFERENCE_TIME subtitleTimeOffset = m_subtitleTimeOffset.load(std::memory_order_acquire);
-                if (subtitleTimeOffset < 0) {
-                    REFERENCE_TIME anchorTime = normPts;
-                    if (anchorTime <= 0) {
-                        anchorTime = m_currentPts.load(std::memory_order_acquire);
-                    }
-                    if (anchorTime < 0)
-                        anchorTime = 0;
-                    REFERENCE_TIME newOffset = cue.begin - anchorTime;
-                    REFERENCE_TIME expected = -1;
-                    if (m_subtitleTimeOffset.compare_exchange_strong(expected, newOffset, std::memory_order_acq_rel)) {
-                        subtitleTimeOffset = newOffset;
-                    } else {
-                        subtitleTimeOffset = expected;
-                    }
-                    LogMsg(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, firstTtmlBegin=%I64d ms\n",
-                           subtitleTimeOffset / 10000,
-                           anchorTime / 10000,
-                           cue.begin / 10000);
-                }
+                const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin);
                 sampleStart = cue.begin - subtitleTimeOffset;
                 if (cue.hasEnd) {
                     sampleStop = cue.end - subtitleTimeOffset;
@@ -3440,7 +3427,12 @@ void CMmtTlvSplitter::CreatePins()
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
                 sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
             } else {
-                sampleStart = ToSegmentTime(normPts, m_segmentStart);
+                // No TTML begin: subtitles have no PTS, so anchor to the current
+                // video position rather than the (always invalid) sample PTS.
+                REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
+                if (anchor < 0)
+                    anchor = 0;
+                sampleStart = ToSegmentTime(anchor, m_segmentStart);
                 sampleStop = sampleStart + kDefaultSubtitleDuration;
             }
             if (sampleStop <= sampleStart)
@@ -3506,6 +3498,42 @@ void CMmtTlvSplitter::NotifyVideoRap(REFERENCE_TIME segmentTime)
 REFERENCE_TIME CMmtTlvSplitter::GetSegmentTimeOffset() const
 {
     return m_segmentTimeOffset.load(std::memory_order_acquire);
+}
+
+REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin)
+{
+    // Subtitle samples have no PTS, so anchor TTML times to the current video
+    // position. offset maps TTML begin -> normalized media time:
+    //   mediaStart = ttmlBegin - offset
+    REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
+    if (anchor < 0)
+        anchor = 0;
+
+    REFERENCE_TIME offset = m_subtitleTimeOffset.load(std::memory_order_acquire);
+    bool valid = m_subtitleOffsetValid.load(std::memory_order_acquire);
+
+    if (valid) {
+        // Detect a TTML timeline jump (e.g. a program boundary): with a stale
+        // offset the cue would be scheduled far in the past or far ahead of the
+        // current playback position. Re-sync so it shows at "now" instead.
+        const REFERENCE_TIME candidate = ttmlBegin - offset;
+        if (candidate < anchor - kSubtitleResyncBackTolerance ||
+            candidate > anchor + kSubtitleResyncAheadTolerance) {
+            LogMsg(L"SUBTITLE timing resync: oldOffset=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
+                   offset / 10000, candidate / 10000, anchor / 10000, ttmlBegin / 10000);
+            valid = false;
+        }
+    }
+
+    if (!valid) {
+        offset = ttmlBegin - anchor;
+        m_subtitleTimeOffset.store(offset, std::memory_order_release);
+        m_subtitleOffsetValid.store(true, std::memory_order_release);
+        LogMsg(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
+               offset / 10000, anchor / 10000, ttmlBegin / 10000);
+    }
+
+    return offset;
 }
 
 bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME currentBegin,
@@ -3645,24 +3673,20 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
         if (cue.text.empty())
             continue;
 
-        REFERENCE_TIME normPts = (sample.pts >= 0 && m_firstPts >= 0) ? sample.pts - m_firstPts : sample.pts;
         REFERENCE_TIME sampleStart = 0;
         REFERENCE_TIME sampleStop = 0;
         if (cue.hasBegin) {
-            REFERENCE_TIME subtitleTimeOffset = m_subtitleTimeOffset.load(std::memory_order_acquire);
-            if (subtitleTimeOffset < 0) {
-                REFERENCE_TIME anchorTime = normPts;
-                if (anchorTime <= 0)
-                    anchorTime = m_currentPts.load(std::memory_order_acquire);
-                subtitleTimeOffset = cue.begin - anchorTime;
-                m_subtitleTimeOffset.store(subtitleTimeOffset, std::memory_order_release);
-            }
+            const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin);
             sampleStart = cue.begin - subtitleTimeOffset;
             sampleStop = cue.hasEnd ? cue.end - subtitleTimeOffset : sampleStart + kDefaultSubtitleDuration;
             sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
             sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
         } else {
-            sampleStart = ToSegmentTime(normPts, m_segmentStart);
+            // No TTML begin / no subtitle PTS: anchor to the current video position.
+            REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
+            if (anchor < 0)
+                anchor = 0;
+            sampleStart = ToSegmentTime(anchor, m_segmentStart);
             sampleStop = sampleStart + kDefaultSubtitleDuration;
         }
 
@@ -3907,7 +3931,8 @@ void CMmtTlvSplitter::DemuxLoop()
     }
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
-    m_subtitleTimeOffset.store(-1, std::memory_order_release);
+    m_subtitleTimeOffset.store(0, std::memory_order_release);
+    m_subtitleOffsetValid.store(false, std::memory_order_release);
     ClearPendingSubtitleCues();
     const bool waitForRap = sourceSeekTarget > 0;
     m_waitingForVideoRap.store(waitForRap, std::memory_order_release);
