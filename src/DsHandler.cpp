@@ -17,6 +17,35 @@ static bool IsCaptionComponentTag(int componentTag)
     return componentTag >= 0x30 && componentTag <= 0x37;
 }
 
+static uint16_t AudioModeToChannels(uint8_t audioMode)
+{
+    switch (audioMode) {
+    case 0b00001: return 1;   // single mono
+    case 0b00010: return 2;   // dual mono
+    case 0b00011: return 2;   // stereo
+    case 0b00100: return 3;   // 2/1
+    case 0b00101: return 3;   // 3ch
+    case 0b00110: return 4;   // 2/2
+    case 0b00111: return 4;   // 4ch
+    case 0b01000: return 5;   // 5ch
+    case 0b01001: return 6;   // 5.1ch
+    case 0b01010: return 7;   // 3/3.1
+    case 0b01011: return 7;   // 6.1ch
+    case 0b01100:
+    case 0b01101:
+    case 0b01110:
+    case 0b01111: return 8;   // 7.1ch variants
+    case 0b10000: return 12;  // 10.2ch
+    case 0b10001: return 24;  // 22.2ch
+    default: return 2;
+    }
+}
+
+static uint16_t AudioDescriptorChannels(const MmtTlv::MhAudioComponentDescriptor& audio)
+{
+    return AudioModeToChannels(audio.getAudioMode());
+}
+
 long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream& stream)
 {
     if (pts == static_cast<int64_t>(MmtTlv::NOPTS_VALUE)) {
@@ -65,7 +94,10 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
     info.packetId = stream.getPacketId();
     info.componentTag = stream.getComponentTag();
     info.samplingRate = stream.getSamplingRate();
-    info.channels = stream.is22_2chAudio() ? 24 : 2;
+    if (auto desc = stream.getMhAudioComponentDescriptor())
+        info.channels = AudioDescriptorChannels(desc->get());
+    else
+        info.channels = stream.is22_2chAudio() ? 24 : 2;
     info.latm = stream.is22_2chAudio();
     m_audioStreams.push_back(info);
     LogDetail(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u\n",
@@ -233,7 +265,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                     const auto* audio = static_cast<const MmtTlv::MhAudioComponentDescriptor*>(descriptor.get());
                     info.componentTag = audio->componentTag;
                     info.samplingRate = audio->getConvertedSamplingRate();
-                    info.channels = audio->is22_2chAudio() ? 24 : 2;
+                    info.channels = AudioDescriptorChannels(*audio);
                     info.latm = audio->is22_2chAudio();
                     break;
                 }

@@ -3850,7 +3850,8 @@ void CMmtTlvSplitter::CreatePins()
         [this](int streamIndex, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
             const int selectedStreamIndex = m_handler.getSelectedAudioStreamIndex();
-            if (selectedStreamIndex >= 0 && selectedStreamIndex != streamIndex)
+            const bool useSelectedAudioOnly = !m_latmPcmDecoders.empty();
+            if (useSelectedAudioOnly && selectedStreamIndex >= 0 && selectedStreamIndex != streamIndex)
                 return;
 
             REFERENCE_TIME normPts, normDts;
