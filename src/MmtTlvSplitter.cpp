@@ -78,6 +78,11 @@ static bool IsCaptionComponentTag(int componentTag)
     return componentTag >= 0x30 && componentTag <= 0x37;
 }
 
+static bool ShouldDecodeLatmToPcm(bool latm, uint32_t channels)
+{
+    return latm && channels == 24;
+}
+
 static int SubtitlePinPriority(const CFilterDemuxerHandler::SubtitleStreamInfo& info)
 {
     if (info.hasData && IsCaptionComponentTag(info.componentTag))
@@ -3698,14 +3703,15 @@ void CMmtTlvSplitter::CreatePins()
         int preferredPcmAudioStreamIndex = -1;
         bool hasLatmPcmAudio = false;
         for (const auto& info : audioStreams) {
-            if (info.latm && info.channels > 2) {
+            if (ShouldDecodeLatmToPcm(info.latm, info.channels)) {
                 hasLatmPcmAudio = true;
                 preferredPcmAudioStreamIndex = info.streamIndex;
                 break;
             }
         }
         for (size_t i = 0; i < audioStreams.size(); ++i) {
-            const bool decodeLatmToPcm = audioStreams[i].latm && audioStreams[i].channels > 2;
+            const bool decodeLatmToPcm =
+                ShouldDecodeLatmToPcm(audioStreams[i].latm, audioStreams[i].channels);
             if (hasLatmPcmAudio && !decodeLatmToPcm)
                 continue;
 
@@ -4882,7 +4888,7 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
     if (pdwGroup) *pdwGroup = 1;
     if (ppszName) {
         WCHAR formatName[32];
-        const bool pcmOutput = info.latm && info.channels > 2;
+        const bool pcmOutput = ShouldDecodeLatmToPcm(info.latm, info.channels);
         StringCchCopyW(formatName, ARRAYSIZE(formatName),
                        pcmOutput ? L"LATM -> PCM" : (info.latm ? L"LATM" : L"ADTS"));
         WCHAR buf[160];
