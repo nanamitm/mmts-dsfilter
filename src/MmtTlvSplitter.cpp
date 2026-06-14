@@ -2203,6 +2203,8 @@ void CMmtTlvSplitter::LoadSidecarMap()
             return false;
         if (track.type == "audio" && track.samplingRate > 768000)
             return false;
+        if (track.type == "audio" && track.channels > 64)
+            return false;
         return true;
     };
 
@@ -2210,8 +2212,14 @@ void CMmtTlvSplitter::LoadSidecarMap()
     std::string magic;
     char binaryMagic[8] = {};
     ifs.read(binaryMagic, sizeof(binaryMagic));
-    if (ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
-        std::memcmp(binaryMagic, "MMTSMAP2", 8) == 0) {
+    const bool isBinaryMap2 =
+        ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
+        std::memcmp(binaryMagic, "MMTSMAP2", 8) == 0;
+    const bool isBinaryMap3 =
+        ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
+        std::memcmp(binaryMagic, "MMTSMAP3", 8) == 0;
+    if (isBinaryMap2 || isBinaryMap3) {
+        const uint32_t expectedVersion = isBinaryMap3 ? 3 : 2;
         uint32_t version = 0;
         uint32_t flags = 0;
         uint64_t binarySourceSize = 0;
@@ -2227,7 +2235,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
             !ReadPod(ifs, firstVideoPtsMs) || !ReadPod(ifs, lastVideoPtsMs) ||
             !ReadPod(ifs, trackCount) || !ReadPod(ifs, mptCount) ||
             !ReadPod(ifs, rapCount) || !ReadPod(ifs, seekCount) ||
-            version != 2) {
+            version != expectedVersion) {
             LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, bad binary header: %s\n", mapPath.c_str());
             return;
         }
@@ -2266,14 +2274,30 @@ void CMmtTlvSplitter::LoadSidecarMap()
         for (uint32_t i = 0; i < trackCount; ++i) {
             uint8_t type = 0;
             uint8_t trackFlags = 0;
-            uint16_t reserved = 0;
+            uint8_t audioMode = 0;
+            uint8_t channels = 0;
             int32_t streamIndex = -1;
             uint16_t packetId = 0;
             int16_t componentTag = -1;
             uint32_t samplingRate = 0;
             uint32_t reserved2 = 0;
-            if (!ReadPod(ifs, type) || !ReadPod(ifs, trackFlags) || !ReadPod(ifs, reserved) ||
-                !ReadPod(ifs, streamIndex) || !ReadPod(ifs, packetId) ||
+            if (!ReadPod(ifs, type) || !ReadPod(ifs, trackFlags)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                return;
+            }
+            if (isBinaryMap3) {
+                if (!ReadPod(ifs, audioMode) || !ReadPod(ifs, channels)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                    return;
+                }
+            } else {
+                uint16_t reserved = 0;
+                if (!ReadPod(ifs, reserved)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                    return;
+                }
+            }
+            if (!ReadPod(ifs, streamIndex) || !ReadPod(ifs, packetId) ||
                 !ReadPod(ifs, componentTag) || !ReadPod(ifs, samplingRate) ||
                 !ReadPod(ifs, reserved2)) {
                 LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
@@ -2287,6 +2311,8 @@ void CMmtTlvSplitter::LoadSidecarMap()
             track.componentTag = componentTag;
             track.samplingRate = samplingRate;
             track.latm = (trackFlags & 1) != 0;
+            track.audioMode = audioMode;
+            track.channels = channels;
             if (!isValidTrack(track)) {
                 LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid binary track: %s index=%u type=%u streamIndex=%d packetId=0x%04X componentTag=%d\n",
                        mapPath.c_str(), i, type, streamIndex, packetId, componentTag);
@@ -2382,7 +2408,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
         for (const auto& spec : SplitString(value, ',')) {
             const auto fields = SplitString(spec, ':');
             const bool isAudio = std::strcmp(type, "audio") == 0;
-            if ((isAudio && fields.size() != 5) || (!isAudio && fields.size() != 3))
+            if ((isAudio && fields.size() != 5 && fields.size() != 7) || (!isAudio && fields.size() != 3))
                 continue;
 
             SidecarMapTrack track;
@@ -2396,6 +2422,10 @@ void CMmtTlvSplitter::LoadSidecarMap()
             if (isAudio) {
                 track.samplingRate = static_cast<uint32_t>(ParseInt64Value(fields[3], 0));
                 track.latm = ParseInt64Value(fields[4], 0) != 0;
+                if (fields.size() >= 7) {
+                    track.audioMode = static_cast<uint8_t>(ParseInt64Value(fields[5], 0));
+                    track.channels = static_cast<uint16_t>(ParseInt64Value(fields[6], 0));
+                }
             }
             if (isValidTrack(track))
                 tracks.push_back(track);
@@ -2441,6 +2471,12 @@ void CMmtTlvSplitter::LoadSidecarMap()
             it = values.find("latm");
             if (it != values.end())
                 track.latm = ParseInt64Value(it->second, 0) != 0;
+            it = values.find("audioMode");
+            if (it != values.end())
+                track.audioMode = static_cast<uint8_t>(ParseInt64Value(it->second, 0));
+            it = values.find("channels");
+            if (it != values.end())
+                track.channels = static_cast<uint16_t>(ParseInt64Value(it->second, 0));
 
             if ((track.type == "audio" || track.type == "subtitle") &&
                 track.streamIndex >= 0 && track.packetId != 0) {
@@ -2640,7 +2676,7 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
             info.packetId = track.packetId;
             info.componentTag = track.componentTag;
             info.samplingRate = track.samplingRate;
-            info.channels = track.latm ? 24 : 2;
+            info.channels = track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
             info.latm = track.latm;
             audioStreams.push_back(info);
             ++addedAudio;

@@ -195,6 +195,8 @@ private:
         int componentTag{-1};
         uint32_t samplingRate{0};
         bool latm{false};
+        uint8_t audioMode{0};
+        uint16_t channels{0};
     };
     struct SidecarMapPoint {
         REFERENCE_TIME time{0};
