@@ -14,6 +14,8 @@ struct SUBTITLEINFO {
 #define LogPinMsg MmtTlvLogInfo
 #define LogPinDetail MmtTlvLogDebug
 
+static constexpr REFERENCE_TIME kDiscontinuityGap = 2 * 10000000LL;
+
 static bool IsHevcRapNal(uint8_t nalType)
 {
     // HEVC IRAP NAL units: BLA(16-18), IDR(19-20), CRA(21).
@@ -538,11 +540,19 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     }
 
     const bool wasFirstSample = m_firstSample;
+    const REFERENCE_TIME previousDeliveredPts = m_lastDeliveredPts;
+    const bool timestampDiscontinuity =
+        !m_isVideo &&
+        previousDeliveredPts >= 0 &&
+        m_accumPts >= 0 &&
+        (m_accumPts < previousDeliveredPts ||
+         m_accumPts - previousDeliveredPts > kDiscontinuityGap);
+    const bool sampleDiscontinuity = wasFirstSample || timestampDiscontinuity;
     pSample->SetSyncPoint(m_isVideo
         ? ((m_accumKey || wasFirstSample) ? TRUE : FALSE)
         : TRUE);
     pSample->SetPreroll(FALSE);
-    pSample->SetDiscontinuity(wasFirstSample ? TRUE : FALSE);
+    pSample->SetDiscontinuity(sampleDiscontinuity ? TRUE : FALSE);
     m_firstSample = false;
 
     const ULONGLONG tDeliverStart = GetTickCount64();
@@ -564,8 +574,8 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     const LONGLONG timelinePtsMs = (m_accumPts >= 0)
         ? ((m_accumPts + Filter()->GetSegmentStart()) / 10000)
         : -1;
-    if (m_lastDeliveredPts >= 0 && m_accumPts >= 0)
-        sampleStepMs = (m_accumPts - m_lastDeliveredPts) / 10000;
+    if (previousDeliveredPts >= 0 && m_accumPts >= 0)
+        sampleStepMs = (m_accumPts - previousDeliveredPts) / 10000;
     m_lastDeliveredPts = m_accumPts;
     if (m_isVideo && m_accumPts >= 0) {
         if (m_videoFirstWallMs == 0) {
@@ -608,7 +618,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
                   sampleStepMs,
                   avDeltaMs,
                   m_accumKey,
-                  wasFirstSample,
+                  sampleDiscontinuity,
                   bufferMs,
                   deliverMs,
                   tDeliverEnd);
@@ -622,7 +632,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
                       m_accumPts / 10000,
                       m_accumDts / 10000,
                       m_accumKey,
-                      wasFirstSample,
+                      sampleDiscontinuity,
                       bufferMs,
                       deliverMs,
                       videoFrameStepMs,
@@ -638,7 +648,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
                       m_accumPts / 10000,
                       m_accumDts / 10000,
                       m_accumKey,
-                      wasFirstSample,
+                      sampleDiscontinuity,
                       bufferMs,
                       deliverMs);
         }
