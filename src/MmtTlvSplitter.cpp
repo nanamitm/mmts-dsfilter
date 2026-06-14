@@ -3259,21 +3259,22 @@ struct CMmtTlvSplitter::LatmPcmDecoder {
         return true;
     }
 
-    void Reset()
+    void Reset(bool preserveLatmContext = false)
     {
         loasBuffer.clear();
         adtsBuffer.clear();
         pendingPts = -1;
         adtsPendingPts = -1;
         nextPts = -1;
-        if (latmCtx)
+        if (latmCtx && !preserveLatmContext)
             avcodec_flush_buffers(latmCtx);
         if (adtsCtx)
             avcodec_flush_buffers(adtsCtx);
-        if (swr)
+        if (swr && !preserveLatmContext)
             swr_close(swr);
         currentInputKind = InputKind::Unknown;
-        LogDetail(L"MMT/TLV LATM PCM decoder: reset streamIndex=%d\n", streamIndex);
+        LogDetail(L"MMT/TLV LATM PCM decoder: reset streamIndex=%d preserveLatm=%d\n",
+                  streamIndex, preserveLatmContext ? 1 : 0);
     }
 
     bool Decode(bool, REFERENCE_TIME pts, bool first, bool last,
@@ -4442,7 +4443,7 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
         pin->ResetForSeek();
     for (const auto& decoder : m_latmPcmDecoders)
         if (decoder)
-            decoder->Reset();
+            decoder->Reset(true);
 
     m_seekTarget = pos;
     m_currentPts = pos;   // normalised position (0-based)
