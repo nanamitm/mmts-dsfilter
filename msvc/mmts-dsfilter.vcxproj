@@ -57,6 +57,7 @@
         ..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses;
         ..\..\dantto4k\src;
         ..\..\dantto4k\thirdparty\asio\asio\include;
+        C:\vcpkg\packages\ffmpeg_x64-windows\include;
         %(AdditionalIncludeDirectories)
       </AdditionalIncludeDirectories>
       <PreprocessorDefinitions>
@@ -71,12 +72,22 @@
     </ClCompile>
     <Link>
       <ModuleDefinitionFile>..\msvc\mmts-dsfilter.def</ModuleDefinitionFile>
+      <AdditionalLibraryDirectories>
+        C:\vcpkg\packages\ffmpeg_x64-windows\lib;
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
       <AdditionalDependencies>
         strmiids.lib;winmm.lib;ole32.lib;oleaut32.lib;uuid.lib;
         Winscard.lib;ws2_32.lib;
+        avcodec.lib;avutil.lib;swresample.lib;
         %(AdditionalDependencies)
       </AdditionalDependencies>
     </Link>
+    <PostBuildEvent>
+      <Command>copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avcodec-62.dll "$(OutDir)"
+copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avutil-60.dll "$(OutDir)"
+copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-6.dll "$(OutDir)"</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
 
   <!-- ==================== Debug ==================== -->

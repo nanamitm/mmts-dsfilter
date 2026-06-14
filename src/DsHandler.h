@@ -71,6 +71,7 @@ public:
     void setAudioStreamListLocked(bool locked);
     int getSelectedAudioStreamIndex() const;
     bool selectAudioStreamByListIndex(size_t listIndex);
+    bool selectAudioStreamByStreamIndex(int streamIndex);
 
 private:
     long long toRefTime(int64_t pts, const MmtTlv::MmtStream& stream);

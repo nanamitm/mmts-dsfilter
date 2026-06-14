@@ -21,6 +21,15 @@
 #include <string>
 #include <vector>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
+}
+
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
 static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuration;
@@ -3173,6 +3182,498 @@ STDMETHODIMP CMmtTlvSplitter::GetCurFile(LPOLESTR* ppszFileName, AM_MEDIA_TYPE* 
     return S_OK;
 }
 
+static std::wstring AvErrorString(int err)
+{
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_strerror(err, buf, sizeof(buf));
+    const int len = MultiByteToWideChar(CP_UTF8, 0, buf, -1, nullptr, 0);
+    if (len <= 1)
+        return L"unknown";
+    std::wstring out(static_cast<size_t>(len - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, buf, -1, out.data(), len);
+    return out;
+}
+
+struct CMmtTlvSplitter::LatmPcmDecoder {
+    struct PcmFrame {
+        std::vector<uint8_t> data;
+        REFERENCE_TIME pts = -1;
+        REFERENCE_TIME duration = 0;
+    };
+
+    explicit LatmPcmDecoder(int streamIndex)
+        : streamIndex(streamIndex)
+    {
+    }
+
+    int StreamIndex() const { return streamIndex; }
+
+    ~LatmPcmDecoder()
+    {
+        av_channel_layout_uninit(&lastInLayout);
+        if (swr)
+            swr_free(&swr);
+        if (frame)
+            av_frame_free(&frame);
+        if (packet)
+            av_packet_free(&packet);
+        if (latmCtx)
+            avcodec_free_context(&latmCtx);
+        if (adtsCtx)
+            avcodec_free_context(&adtsCtx);
+    }
+
+    bool EnsureOpen(AVCodecID codecId, AVCodecContext*& targetCtx, const wchar_t* codecName)
+    {
+        if (targetCtx)
+            return true;
+
+        const AVCodec* codec = avcodec_find_decoder(codecId);
+        if (!codec) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: %s decoder not found for streamIndex=%d\n",
+                   codecName, streamIndex);
+            return false;
+        }
+
+        targetCtx = avcodec_alloc_context3(codec);
+        if (!packet)
+            packet = av_packet_alloc();
+        if (!frame)
+            frame = av_frame_alloc();
+        if (!targetCtx || !packet || !frame) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: allocation failed for streamIndex=%d\n",
+                   streamIndex);
+            return false;
+        }
+
+        targetCtx->pkt_timebase = AVRational{1, 10000000};
+        const int ret = avcodec_open2(targetCtx, codec, nullptr);
+        if (ret < 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: avcodec_open2 failed codec=%s streamIndex=%d err=%s\n",
+                   codecName, streamIndex, AvErrorString(ret).c_str());
+            return false;
+        }
+
+        LogMsg(L"MMT/TLV LATM PCM decoder: opened %s decoder for streamIndex=%d\n",
+               codecName, streamIndex);
+        return true;
+    }
+
+    void Reset()
+    {
+        loasBuffer.clear();
+        adtsBuffer.clear();
+        pendingPts = -1;
+        adtsPendingPts = -1;
+        nextPts = -1;
+        if (latmCtx)
+            avcodec_flush_buffers(latmCtx);
+        if (adtsCtx)
+            avcodec_flush_buffers(adtsCtx);
+        if (swr)
+            swr_close(swr);
+        currentInputKind = InputKind::Unknown;
+        LogDetail(L"MMT/TLV LATM PCM decoder: reset streamIndex=%d\n", streamIndex);
+    }
+
+    bool Decode(bool, REFERENCE_TIME pts, bool first, bool last,
+                const uint8_t* data, size_t size, std::vector<PcmFrame>& outFrames)
+    {
+        (void)first;
+        (void)last;
+        outFrames.clear();
+        if (!data || size == 0)
+            return true;
+
+        static volatile LONG s_decodeInputs = 0;
+        const LONG inputNo = InterlockedIncrement(&s_decodeInputs);
+        if (inputNo <= 80 || (inputNo % 200) == 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: input #%ld streamIndex=%d size=%zu pts=%I64d ms first=%d last=%d firstBytes=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   inputNo, streamIndex, size, pts / 10000,
+                   first ? 1 : 0, last ? 1 : 0,
+                   size > 0 ? data[0] : 0,
+                   size > 1 ? data[1] : 0,
+                   size > 2 ? data[2] : 0,
+                   size > 3 ? data[3] : 0,
+                   size > 4 ? data[4] : 0,
+                   size > 5 ? data[5] : 0,
+                   size > 6 ? data[6] : 0,
+                   size > 7 ? data[7] : 0);
+        }
+
+        if (IsAdtsFrame(data, size)) {
+            loasBuffer.clear();
+            pendingPts = -1;
+            if (currentInputKind != InputKind::Adts) {
+                currentInputKind = InputKind::Adts;
+                adtsBuffer.clear();
+                adtsPendingPts = pts;
+                nextPts = pts;
+                LogMsg(L"MMT/TLV LATM PCM decoder: input switched to ADTS streamIndex=%d pts=%I64d ms\n",
+                       streamIndex, pts / 10000);
+            }
+            if (!EnsureOpen(AV_CODEC_ID_AAC, adtsCtx, L"AAC/ADTS"))
+                return false;
+            return DecodeAdts(pts, data, size, outFrames);
+        }
+
+        if (!EnsureOpen(AV_CODEC_ID_AAC_LATM, latmCtx, L"AAC_LATM"))
+            return false;
+        if (currentInputKind != InputKind::Latm) {
+            currentInputKind = InputKind::Latm;
+            loasBuffer.clear();
+            pendingPts = pts;
+            nextPts = pts;
+            LogMsg(L"MMT/TLV LATM PCM decoder: input switched to LATM streamIndex=%d pts=%I64d ms\n",
+                   streamIndex, pts / 10000);
+        }
+
+        if (loasBuffer.empty())
+            pendingPts = pts;
+        loasBuffer.insert(loasBuffer.end(), data, data + size);
+
+        bool ok = true;
+        while (true) {
+            const size_t sync = FindLoasSync();
+            if (sync == (std::numeric_limits<size_t>::max)()) {
+                TrimUnsyncedBuffer();
+                break;
+            }
+            if (sync > 0) {
+                if (droppedSyncBytes < 20) {
+                    LogMsg(L"MMT/TLV LATM PCM decoder: dropped %zu bytes before LOAS sync streamIndex=%d\n",
+                           sync, streamIndex);
+                }
+                ++droppedSyncBytes;
+                loasBuffer.erase(loasBuffer.begin(), loasBuffer.begin() + sync);
+                pendingPts = pts;
+            }
+            if (loasBuffer.size() < 3)
+                break;
+
+            const size_t payloadSize =
+                (static_cast<size_t>(loasBuffer[1] & 0x1F) << 8) | loasBuffer[2];
+            const size_t packetSize = payloadSize + 3;
+            if (payloadSize == 0 || payloadSize > 8191) {
+                if (badHeaderCount < 20) {
+                    LogMsg(L"MMT/TLV LATM PCM decoder: invalid LOAS payload length streamIndex=%d length=%zu firstBytes=%02X %02X %02X\n",
+                           streamIndex, payloadSize, loasBuffer[0], loasBuffer[1], loasBuffer[2]);
+                }
+                ++badHeaderCount;
+                loasBuffer.erase(loasBuffer.begin());
+                pendingPts = pts;
+                continue;
+            }
+            if (loasBuffer.size() < packetSize)
+                break;
+
+            const REFERENCE_TIME packetPts = pendingPts;
+            ok = DecodePacket(latmCtx, loasBuffer.data(), packetSize, packetPts, outFrames) && ok;
+            loasBuffer.erase(loasBuffer.begin(), loasBuffer.begin() + packetSize);
+            pendingPts = nextPts >= 0 ? nextPts : pts;
+        }
+
+        if (loasBuffer.size() > 256 * 1024) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: clearing oversized LOAS buffer streamIndex=%d size=%zu\n",
+                   streamIndex, loasBuffer.size());
+            loasBuffer.clear();
+            pendingPts = -1;
+            return false;
+        }
+        return ok;
+    }
+
+private:
+    static bool IsAdtsFrame(const uint8_t* data, size_t size)
+    {
+        return size >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0;
+    }
+
+    static size_t AdtsFrameSize(const uint8_t* data, size_t size)
+    {
+        if (!IsAdtsFrame(data, size))
+            return 0;
+        return (static_cast<size_t>(data[3] & 0x03) << 11) |
+               (static_cast<size_t>(data[4]) << 3) |
+               ((data[5] & 0xE0) >> 5);
+    }
+
+    bool DecodeAdts(REFERENCE_TIME pts, const uint8_t* data, size_t size,
+                    std::vector<PcmFrame>& outFrames)
+    {
+        if (adtsBuffer.empty())
+            adtsPendingPts = pts;
+        adtsBuffer.insert(adtsBuffer.end(), data, data + size);
+
+        bool ok = true;
+        while (true) {
+            size_t sync = (std::numeric_limits<size_t>::max)();
+            for (size_t i = 0; i + 1 < adtsBuffer.size(); ++i) {
+                if (adtsBuffer[i] == 0xFF && (adtsBuffer[i + 1] & 0xF0) == 0xF0) {
+                    sync = i;
+                    break;
+                }
+            }
+            if (sync == (std::numeric_limits<size_t>::max)()) {
+                if (adtsBuffer.size() > 1) {
+                    const uint8_t last = adtsBuffer.back();
+                    adtsBuffer.clear();
+                    adtsBuffer.push_back(last);
+                }
+                break;
+            }
+            if (sync > 0) {
+                adtsBuffer.erase(adtsBuffer.begin(), adtsBuffer.begin() + sync);
+                adtsPendingPts = pts;
+            }
+            if (adtsBuffer.size() < 7)
+                break;
+
+            const size_t frameSize = AdtsFrameSize(adtsBuffer.data(), adtsBuffer.size());
+            if (frameSize < 7 || frameSize > 8191) {
+                if (badAdtsHeaderCount < 20) {
+                    LogMsg(L"MMT/TLV LATM PCM decoder: invalid ADTS frame length streamIndex=%d length=%zu firstBytes=%02X %02X %02X %02X %02X %02X %02X\n",
+                           streamIndex, frameSize,
+                           adtsBuffer[0], adtsBuffer[1], adtsBuffer[2], adtsBuffer[3],
+                           adtsBuffer[4], adtsBuffer[5], adtsBuffer[6]);
+                }
+                ++badAdtsHeaderCount;
+                adtsBuffer.erase(adtsBuffer.begin());
+                adtsPendingPts = pts;
+                continue;
+            }
+            if (adtsBuffer.size() < frameSize)
+                break;
+
+            const REFERENCE_TIME packetPts = adtsPendingPts;
+            const size_t beforeFrames = outFrames.size();
+            const bool decoded = DecodePacket(adtsCtx, adtsBuffer.data(), frameSize, packetPts, outFrames);
+            adtsBuffer.erase(adtsBuffer.begin(), adtsBuffer.begin() + frameSize);
+            if (outFrames.size() == beforeFrames && packetPts >= 0) {
+                const REFERENCE_TIME fallbackDuration = 1024LL * 10000000LL / kOutputSampleRate;
+                PcmFrame silence;
+                silence.pts = packetPts;
+                silence.duration = fallbackDuration;
+                silence.data.resize(1024 * kOutputChannels * sizeof(int16_t), 0);
+                outFrames.push_back(std::move(silence));
+                nextPts = packetPts + fallbackDuration;
+            }
+            ok = decoded && ok;
+            adtsPendingPts = nextPts >= 0 ? nextPts : pts;
+        }
+
+        if (adtsBuffer.size() > 256 * 1024) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: clearing oversized ADTS buffer streamIndex=%d size=%zu\n",
+                   streamIndex, adtsBuffer.size());
+            adtsBuffer.clear();
+            adtsPendingPts = -1;
+            return false;
+        }
+        return ok;
+    }
+
+    size_t FindLoasSync() const
+    {
+        for (size_t i = 0; i + 1 < loasBuffer.size(); ++i) {
+            if (loasBuffer[i] == 0x56 && (loasBuffer[i + 1] & 0xE0) == 0xE0)
+                return i;
+        }
+        return (std::numeric_limits<size_t>::max)();
+    }
+
+    void TrimUnsyncedBuffer()
+    {
+        if (loasBuffer.size() <= 1)
+            return;
+        const uint8_t last = loasBuffer.back();
+        if (droppedSyncBytes < 20) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: waiting for LOAS sync, dropped %zu bytes streamIndex=%d\n",
+                   loasBuffer.size() - 1, streamIndex);
+        }
+        ++droppedSyncBytes;
+        loasBuffer.clear();
+        loasBuffer.push_back(last);
+    }
+
+    bool DecodePacket(AVCodecContext* decodeCtx, const uint8_t* packetData, size_t packetSize, REFERENCE_TIME packetPts,
+                      std::vector<PcmFrame>& outFrames)
+    {
+        if (!decodeCtx || !packetData || packetSize == 0)
+            return true;
+
+        av_packet_unref(packet);
+        packet->data = const_cast<uint8_t*>(packetData);
+        packet->size = static_cast<int>(packetSize);
+        packet->pts = packetPts;
+        packet->dts = packetPts;
+
+        if (packetPts >= 0)
+            nextPts = packetPts;
+
+        int ret = avcodec_send_packet(decodeCtx, packet);
+        packet->data = nullptr;
+        packet->size = 0;
+        av_packet_unref(packet);
+        if (ret < 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: send failed streamIndex=%d size=%zu pts=%I64d ms firstBytes=%02X %02X %02X err=%s\n",
+                   streamIndex, packetSize, packetPts / 10000,
+                   packetSize > 0 ? packetData[0] : 0,
+                   packetSize > 1 ? packetData[1] : 0,
+                   packetSize > 2 ? packetData[2] : 0,
+                   AvErrorString(ret).c_str());
+            return false;
+        }
+
+        while (true) {
+            ret = avcodec_receive_frame(decodeCtx, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                break;
+            if (ret < 0) {
+                LogMsg(L"MMT/TLV LATM PCM decoder: receive failed streamIndex=%d err=%s\n",
+                       streamIndex, AvErrorString(ret).c_str());
+                return false;
+            }
+
+            PcmFrame pcm;
+            if (ConvertFrame(frame, pcm)) {
+                outFrames.push_back(std::move(pcm));
+                static volatile LONG s_outputFrames = 0;
+                const LONG outNo = InterlockedIncrement(&s_outputFrames);
+                if (outNo <= 40 || (outNo % 100) == 0) {
+                    const auto& last = outFrames.back();
+                    LogMsg(L"MMT/TLV LATM PCM decoder: output #%ld streamIndex=%d bytes=%zu pts=%I64d ms duration=%I64d ms\n",
+                           outNo, streamIndex, last.data.size(), last.pts / 10000, last.duration / 10000);
+                }
+            }
+            av_frame_unref(frame);
+        }
+        return true;
+    }
+
+    bool EnsureResampler(const AVFrame* in)
+    {
+        if (!in || in->nb_samples <= 0)
+            return false;
+
+        AVChannelLayout inLayout{};
+        if (in->ch_layout.nb_channels > 0) {
+            av_channel_layout_copy(&inLayout, &in->ch_layout);
+        } else {
+            av_channel_layout_default(&inLayout, 2);
+        }
+
+        const bool unchanged = swr &&
+            inRate == in->sample_rate &&
+            inFormat == static_cast<AVSampleFormat>(in->format) &&
+            av_channel_layout_compare(&inLayout, &lastInLayout) == 0;
+        if (unchanged) {
+            av_channel_layout_uninit(&inLayout);
+            return true;
+        }
+
+        if (swr)
+            swr_free(&swr);
+        av_channel_layout_uninit(&lastInLayout);
+        av_channel_layout_copy(&lastInLayout, &inLayout);
+        inRate = in->sample_rate;
+        inFormat = static_cast<AVSampleFormat>(in->format);
+
+        AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+        int ret = swr_alloc_set_opts2(&swr,
+                                      &outLayout,
+                                      AV_SAMPLE_FMT_S16,
+                                      kOutputSampleRate,
+                                      &inLayout,
+                                      inFormat,
+                                      inRate,
+                                      0,
+                                      nullptr);
+        av_channel_layout_uninit(&inLayout);
+        if (ret < 0 || !swr) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: swr_alloc failed streamIndex=%d err=%s\n",
+                   streamIndex, AvErrorString(ret).c_str());
+            return false;
+        }
+
+        ret = swr_init(swr);
+        if (ret < 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: swr_init failed streamIndex=%d err=%s\n",
+                   streamIndex, AvErrorString(ret).c_str());
+            swr_free(&swr);
+            return false;
+        }
+
+        LogMsg(L"MMT/TLV LATM PCM decoder: resampler configured streamIndex=%d inputChannels=%d inputRate=%d inputFormat=%d output=stereo s16 %dHz\n",
+               streamIndex, lastInLayout.nb_channels, inRate, static_cast<int>(inFormat), kOutputSampleRate);
+        return true;
+    }
+
+    bool ConvertFrame(const AVFrame* in, PcmFrame& pcm)
+    {
+        if (!EnsureResampler(in))
+            return false;
+
+        const int outSamples = swr_get_out_samples(swr, in->nb_samples);
+        if (outSamples <= 0)
+            return false;
+
+        const int outBytes = av_samples_get_buffer_size(nullptr, kOutputChannels,
+                                                       outSamples, AV_SAMPLE_FMT_S16, 1);
+        if (outBytes <= 0)
+            return false;
+
+        pcm.data.resize(static_cast<size_t>(outBytes));
+        uint8_t* outData[1] = { pcm.data.data() };
+        const int converted = swr_convert(swr,
+                                          outData,
+                                          outSamples,
+                                          const_cast<const uint8_t**>(in->extended_data),
+                                          in->nb_samples);
+        if (converted <= 0)
+            return false;
+
+        const int actualBytes = av_samples_get_buffer_size(nullptr, kOutputChannels,
+                                                          converted, AV_SAMPLE_FMT_S16, 1);
+        if (actualBytes <= 0)
+            return false;
+        pcm.data.resize(static_cast<size_t>(actualBytes));
+        pcm.duration = static_cast<REFERENCE_TIME>(converted) * 10000000LL / kOutputSampleRate;
+        const REFERENCE_TIME framePts =
+            (in->pts != AV_NOPTS_VALUE) ? static_cast<REFERENCE_TIME>(in->pts) : nextPts;
+        pcm.pts = framePts;
+        if (nextPts >= 0)
+            nextPts = ((framePts >= 0) ? framePts : nextPts) + pcm.duration;
+        return !pcm.data.empty();
+    }
+
+    static constexpr int kOutputSampleRate = 48000;
+    static constexpr int kOutputChannels = 2;
+    enum class InputKind {
+        Unknown,
+        Latm,
+        Adts,
+    };
+
+    int streamIndex = -1;
+    AVCodecContext* latmCtx = nullptr;
+    AVCodecContext* adtsCtx = nullptr;
+    AVPacket* packet = nullptr;
+    AVFrame* frame = nullptr;
+    SwrContext* swr = nullptr;
+    AVChannelLayout lastInLayout{};
+    int inRate = 0;
+    AVSampleFormat inFormat = AV_SAMPLE_FMT_NONE;
+    std::vector<uint8_t> loasBuffer;
+    std::vector<uint8_t> adtsBuffer;
+    REFERENCE_TIME pendingPts = -1;
+    REFERENCE_TIME adtsPendingPts = -1;
+    REFERENCE_TIME nextPts = -1;
+    InputKind currentInputKind = InputKind::Unknown;
+    unsigned droppedSyncBytes = 0;
+    unsigned badHeaderCount = 0;
+    unsigned badAdtsHeaderCount = 0;
+};
+
 // ---------------------------------------------------------------------------
 // Pin management
 // ---------------------------------------------------------------------------
@@ -3180,6 +3681,7 @@ void CMmtTlvSplitter::CreatePins()
 {
     for (auto* p : m_pins) delete p;
     m_pins.clear();
+    m_latmPcmDecoders.clear();
 
     HRESULT hr = S_OK;
     m_pins.push_back(new CMmtTlvOutputPin(true,  &hr, this, &m_pinLock, L"Video"));
@@ -3192,28 +3694,62 @@ void CMmtTlvSplitter::CreatePins()
             LogMsg(L"MMT/TLV Splitter: CreatePins skipped Audio pins because audio is unsupported\n");
         }
     } else {
+        int preferredPcmAudioStreamIndex = -1;
+        bool hasLatmPcmAudio = false;
+        for (const auto& info : audioStreams) {
+            if (info.latm && info.channels > 2) {
+                hasLatmPcmAudio = true;
+                preferredPcmAudioStreamIndex = info.streamIndex;
+                break;
+            }
+        }
         for (size_t i = 0; i < audioStreams.size(); ++i) {
+            const bool decodeLatmToPcm = audioStreams[i].latm && audioStreams[i].channels > 2;
+            if (hasLatmPcmAudio && !decodeLatmToPcm)
+                continue;
+
             WCHAR pinName[64];
             StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Audio %zu", i + 1);
             auto* pin = new CMmtTlvOutputPin(false, &hr, this, &m_pinLock,
                                              pinName, audioStreams[i].streamIndex);
-            if (audioStreams[i].samplingRate > 0)
+            if (decodeLatmToPcm) {
+                pin->SetPcmAudioInfo(48000, 2, 16);
+                m_latmPcmDecoders.push_back(
+                    std::make_unique<LatmPcmDecoder>(audioStreams[i].streamIndex));
+            } else if (audioStreams[i].samplingRate > 0) {
                 pin->SetAudioInfo(static_cast<int>(audioStreams[i].samplingRate),
                                   audioStreams[i].channels,
                                   16,
                                   audioStreams[i].latm,
                                   audioStreams[i].extraData);
-            pin->SetTrackName(audioStreams[i].latm ? L"AAC LATM 22.2ch" : L"AAC ADTS");
+            }
+            WCHAR trackName[64];
+            if (decodeLatmToPcm) {
+                StringCchPrintfW(trackName, ARRAYSIZE(trackName),
+                                 L"AAC LATM %uch -> PCM 2ch",
+                                 audioStreams[i].channels);
+            } else {
+                StringCchPrintfW(trackName, ARRAYSIZE(trackName),
+                                 audioStreams[i].latm ? L"AAC LATM %uch" : L"AAC ADTS %uch",
+                                 audioStreams[i].channels);
+            }
+            pin->SetTrackName(trackName);
             m_pins.push_back(pin);
-            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, format=%s, channels=%u, extra=%zu\n",
+            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, format=%s, channels=%u, output=%s, extra=%zu\n",
                    pinName,
                    audioStreams[i].streamIndex,
                    audioStreams[i].packetId,
                    audioStreams[i].componentTag,
                    audioStreams[i].latm ? L"LATM" : L"ADTS",
                    audioStreams[i].channels,
+                   decodeLatmToPcm ? L"PCM stereo" : L"passthrough",
                    audioStreams[i].extraData.size());
         }
+        if (preferredPcmAudioStreamIndex >= 0)
+            m_handler.selectAudioStreamByStreamIndex(preferredPcmAudioStreamIndex);
+        if (hasLatmPcmAudio)
+            LogMsg(L"MMT/TLV Splitter: CreatePins limited audio outputs to LATM PCM streamIndex=%d\n",
+                   preferredPcmAudioStreamIndex);
     }
     constexpr bool kEnableSubtitlePins = true;
     auto subtitleStreams = m_handler.getSubtitleStreams();
@@ -3306,6 +3842,10 @@ void CMmtTlvSplitter::CreatePins()
     m_handler.setAudioCallback(
         [this](int streamIndex, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
+            const int selectedStreamIndex = m_handler.getSelectedAudioStreamIndex();
+            if (selectedStreamIndex >= 0 && selectedStreamIndex != streamIndex)
+                return;
+
             REFERENCE_TIME normPts, normDts;
             if (IsMultiSegment()) {
                 if (!EditMapPts(pts, normPts))
@@ -3323,7 +3863,24 @@ void CMmtTlvSplitter::CreatePins()
             for (auto* pin : m_pins) {
                 if (pin->IsAudio() &&
                     (pin->AudioStreamIndex() == -1 || pin->AudioStreamIndex() == streamIndex)) {
-                    pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
+                    LatmPcmDecoder* decoder = nullptr;
+                    for (const auto& candidate : m_latmPcmDecoders) {
+                        if (candidate && candidate->StreamIndex() == streamIndex) {
+                            decoder = candidate.get();
+                            break;
+                        }
+                    }
+                    if (decoder) {
+                        std::vector<LatmPcmDecoder::PcmFrame> frames;
+                                    if (decoder->Decode(key, samplePts, first, last, d, sz, frames)) {
+                            for (const auto& frame : frames) {
+                                pin->DeliverSample(true, frame.pts, frame.pts, true, true,
+                                                   frame.data.data(), frame.data.size());
+                            }
+                        }
+                    } else {
+                        pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
+                    }
                     delivered = true;
                 }
             }
@@ -3883,6 +4440,9 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
 
     for (auto* pin : m_pins)
         pin->ResetForSeek();
+    for (const auto& decoder : m_latmPcmDecoders)
+        if (decoder)
+            decoder->Reset();
 
     m_seekTarget = pos;
     m_currentPts = pos;   // normalised position (0-based)
@@ -4056,6 +4616,9 @@ void CMmtTlvSplitter::DemuxLoop()
                 m_demuxByteOffset.store(bufferOffset, std::memory_order_release);
                 m_demuxer.resetStreams();
                 m_handler.reset();
+                for (const auto& decoder : m_latmPcmDecoders)
+                    if (decoder)
+                        decoder->Reset();
                 m_waitingForVideoRap.store(true, std::memory_order_release);
                 for (auto* pin : m_pins)
                     if (pin->IsVideo())
@@ -4317,12 +4880,15 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
     if (plcid) *plcid = 0;
     if (pdwGroup) *pdwGroup = 1;
     if (ppszName) {
-        WCHAR formatName[16];
-        StringCchCopyW(formatName, ARRAYSIZE(formatName), info.latm ? L"LATM" : L"ADTS");
+        WCHAR formatName[32];
+        const bool pcmOutput = info.latm && info.channels > 2;
+        StringCchCopyW(formatName, ARRAYSIZE(formatName),
+                       pcmOutput ? L"LATM -> PCM" : (info.latm ? L"LATM" : L"ADTS"));
         WCHAR buf[160];
         StringCchPrintfW(buf, ARRAYSIZE(buf),
-                         L"Audio %ld %s %uch (stream %d, component %d)",
+                         L"Audio %ld %s %uch%s (stream %d, component %d)",
                          lIndex + 1, formatName, info.channels,
+                         pcmOutput ? L" to 2ch" : L"",
                          info.streamIndex, info.componentTag);
         const size_t chars = wcslen(buf) + 1;
         *ppszName = static_cast<LPWSTR>(CoTaskMemAlloc(chars * sizeof(WCHAR)));

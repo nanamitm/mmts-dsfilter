@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <memory>
 #include "mmtTlvDemuxer.h"
 #include "DsHandler.h"
 #include "MmtTlvOutputPin.h"
@@ -69,6 +70,8 @@ public:
     REFERENCE_TIME GetSegmentStart() const { return m_segmentStart; }
 
 private:
+    struct LatmPcmDecoder;
+
     void CreatePins();
     void StartThread();
     void StopThread();
@@ -115,6 +118,7 @@ private:
 
     CCritSec m_pinLock;
     std::vector<CMmtTlvOutputPin*> m_pins;
+    std::vector<std::unique_ptr<LatmPcmDecoder>> m_latmPcmDecoders;
 
     MmtTlv::MmtTlvDemuxer m_demuxer;
     CFilterDemuxerHandler  m_handler;

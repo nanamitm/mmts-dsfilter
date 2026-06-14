@@ -494,6 +494,21 @@ bool CFilterDemuxerHandler::selectAudioStreamByListIndex(size_t listIndex)
     return true;
 }
 
+bool CFilterDemuxerHandler::selectAudioStreamByStreamIndex(int streamIndex)
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [streamIndex](const AudioStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (it == m_audioStreams.end())
+        return false;
+
+    m_primaryAudioStreamIndex = streamIndex;
+    LogMsg(L"MMT/TLV Audio selected by streamIndex=%d\n", m_primaryAudioStreamIndex);
+    return true;
+}
+
 void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
     if (!m_videoCallback || mfu.data.empty())
