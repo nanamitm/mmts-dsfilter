@@ -83,6 +83,26 @@ static bool ShouldDecodeLatmToPcm(bool latm, uint32_t channels)
     return latm && channels == 24;
 }
 
+static std::wstring AudioChannelLabel(uint32_t channels)
+{
+    switch (channels) {
+    case 24: return L"22.2";
+    case 6: return L"5.1";
+    case 2: return L"2.0";
+    case 1: return L"1.0";
+    default:
+        WCHAR buf[16];
+        StringCchPrintfW(buf, ARRAYSIZE(buf), L"%uch", channels);
+        return buf;
+    }
+}
+
+static std::wstring AudioSourceLabel(const CFilterDemuxerHandler::AudioStreamInfo& info)
+{
+    const std::wstring channels = AudioChannelLabel(info.channels);
+    return (info.latm ? L"LATM " : L"AAC ") + channels;
+}
+
 static int SubtitlePinPriority(const CFilterDemuxerHandler::SubtitleStreamInfo& info)
 {
     if (info.hasData && IsCaptionComponentTag(info.componentTag))
@@ -2646,14 +2666,67 @@ const CMmtTlvSplitter::SidecarMapMptChange* CMmtTlvSplitter::FindSidecarMapMptCh
     return best ? best : &m_sidecarMapMptChanges.front();
 }
 
+std::wstring CMmtTlvSplitter::AudioTimelineLabel(const CFilterDemuxerHandler::AudioStreamInfo& info) const
+{
+    std::vector<std::wstring> labels;
+    auto pushLabel = [&labels](bool latm, uint16_t channels) {
+        CFilterDemuxerHandler::AudioStreamInfo labelInfo;
+        labelInfo.latm = latm;
+        labelInfo.channels = channels;
+        const std::wstring label = AudioSourceLabel(labelInfo);
+        if (labels.empty() || labels.back() != label)
+            labels.push_back(label);
+    };
+
+    for (const auto& change : m_sidecarMapMptChanges) {
+        for (const auto& track : change.tracks) {
+            if (track.type != "audio")
+                continue;
+            if (track.streamIndex != info.streamIndex &&
+                !(track.packetId == info.packetId && track.componentTag == info.componentTag)) {
+                continue;
+            }
+            const uint16_t channels = track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
+            pushLabel(track.latm, channels);
+            break;
+        }
+    }
+
+    if (labels.empty())
+        return AudioSourceLabel(info);
+
+    std::wstring label = labels.front();
+    for (size_t i = 1; i < labels.size(); ++i) {
+        label += L" -> ";
+        label += labels[i];
+    }
+    return label;
+}
+
 void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
 {
     if (!m_hasSidecarMap)
         return;
 
+    auto mapTrackChannels = [](const SidecarMapTrack& track) -> uint16_t {
+        return track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
+    };
+    auto isBetterMapAudio = [&](const SidecarMapTrack& track,
+                                const CFilterDemuxerHandler::AudioStreamInfo& info) {
+        const uint16_t trackChannels = mapTrackChannels(track);
+        if (trackChannels > info.channels)
+            return true;
+        if (trackChannels == info.channels && track.latm && !info.latm)
+            return true;
+        if (info.samplingRate == 0 && track.samplingRate > 0)
+            return true;
+        return false;
+    };
+
     auto audioStreams = m_handler.getAudioStreams();
     auto subtitleStreams = m_handler.getSubtitleStreams();
     size_t addedAudio = 0;
+    size_t updatedAudio = 0;
     size_t addedSubtitle = 0;
 
     std::vector<SidecarMapTrack> mapTracks = m_sidecarMapTracks;
@@ -2668,15 +2741,25 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
                     return info.streamIndex == track.streamIndex ||
                            (info.packetId == track.packetId && info.componentTag == track.componentTag);
                 });
-            if (it != audioStreams.end())
+            if (it != audioStreams.end()) {
+                if (isBetterMapAudio(track, *it)) {
+                    it->streamIndex = track.streamIndex;
+                    it->packetId = track.packetId;
+                    it->componentTag = track.componentTag;
+                    it->samplingRate = track.samplingRate;
+                    it->channels = mapTrackChannels(track);
+                    it->latm = track.latm;
+                    ++updatedAudio;
+                }
                 continue;
+            }
 
             CFilterDemuxerHandler::AudioStreamInfo info;
             info.streamIndex = track.streamIndex;
             info.packetId = track.packetId;
             info.componentTag = track.componentTag;
             info.samplingRate = track.samplingRate;
-            info.channels = track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
+            info.channels = mapTrackChannels(track);
             info.latm = track.latm;
             audioStreams.push_back(info);
             ++addedAudio;
@@ -2699,7 +2782,7 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
         }
     }
 
-    if (addedAudio > 0) {
+    if (addedAudio > 0 || updatedAudio > 0) {
         m_handler.setKnownAudioStreams(audioStreams);
         m_handler.setRequireAdtsConvertibleAudio(true);
         m_handler.setAudioStreamListLocked(true);
@@ -2708,9 +2791,9 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
         m_handler.setKnownSubtitleStreams(subtitleStreams);
     }
 
-    if (addedAudio > 0 || addedSubtitle > 0) {
-        LogMsg(L"MMT/TLV Splitter: mmtsmap tracks merged: audio+%zu subtitle+%zu totalAudio=%zu totalSubtitle=%zu\n",
-               addedAudio, addedSubtitle, audioStreams.size(), subtitleStreams.size());
+    if (addedAudio > 0 || updatedAudio > 0 || addedSubtitle > 0) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap tracks merged: audio+%zu audio~%zu subtitle+%zu totalAudio=%zu totalSubtitle=%zu\n",
+               addedAudio, updatedAudio, addedSubtitle, audioStreams.size(), subtitleStreams.size());
     }
 
     const auto* active = FindSidecarMapMptChange(sourceTarget);
@@ -3724,6 +3807,7 @@ void CMmtTlvSplitter::CreatePins()
     for (auto* p : m_pins) delete p;
     m_pins.clear();
     m_latmPcmDecoders.clear();
+    m_limitAudioToSelected = false;
 
     HRESULT hr = S_OK;
     m_pins.push_back(new CMmtTlvOutputPin(true,  &hr, this, &m_pinLock, L"Video"));
@@ -3745,14 +3829,18 @@ void CMmtTlvSplitter::CreatePins()
                 break;
             }
         }
+        const bool limitToLatmPcm = hasLatmPcmAudio && audioStreams.size() == 1;
+        m_limitAudioToSelected = limitToLatmPcm;
         for (size_t i = 0; i < audioStreams.size(); ++i) {
             const bool decodeLatmToPcm =
                 ShouldDecodeLatmToPcm(audioStreams[i].latm, audioStreams[i].channels);
-            if (hasLatmPcmAudio && !decodeLatmToPcm)
+            if (limitToLatmPcm && !decodeLatmToPcm)
                 continue;
 
-            WCHAR pinName[64];
-            StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Audio %zu", i + 1);
+            WCHAR pinName[128];
+            const std::wstring sourceLabel = AudioTimelineLabel(audioStreams[i]);
+            StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Audio %zu %s",
+                             i + 1, sourceLabel.c_str());
             auto* pin = new CMmtTlvOutputPin(false, &hr, this, &m_pinLock,
                                              pinName, audioStreams[i].streamIndex);
             if (decodeLatmToPcm) {
@@ -3766,15 +3854,15 @@ void CMmtTlvSplitter::CreatePins()
                                   audioStreams[i].latm,
                                   audioStreams[i].extraData);
             }
-            WCHAR trackName[64];
+            WCHAR trackName[128];
             if (decodeLatmToPcm) {
                 StringCchPrintfW(trackName, ARRAYSIZE(trackName),
-                                 L"AAC LATM %uch -> PCM 2ch",
-                                 audioStreams[i].channels);
+                                 L"%s -> PCM 2.0",
+                                 sourceLabel.c_str());
             } else {
                 StringCchPrintfW(trackName, ARRAYSIZE(trackName),
-                                 audioStreams[i].latm ? L"AAC LATM %uch" : L"AAC ADTS %uch",
-                                 audioStreams[i].channels);
+                                 L"%s",
+                                 sourceLabel.c_str());
             }
             pin->SetTrackName(trackName);
             m_pins.push_back(pin);
@@ -3790,8 +3878,11 @@ void CMmtTlvSplitter::CreatePins()
         }
         if (preferredPcmAudioStreamIndex >= 0)
             m_handler.selectAudioStreamByStreamIndex(preferredPcmAudioStreamIndex);
-        if (hasLatmPcmAudio)
+        if (limitToLatmPcm)
             LogMsg(L"MMT/TLV Splitter: CreatePins limited audio outputs to LATM PCM streamIndex=%d\n",
+                   preferredPcmAudioStreamIndex);
+        else if (hasLatmPcmAudio)
+            LogMsg(L"MMT/TLV Splitter: CreatePins kept non-LATM audio outputs alongside LATM PCM streamIndex=%d\n",
                    preferredPcmAudioStreamIndex);
     }
     constexpr bool kEnableSubtitlePins = true;
@@ -3886,7 +3977,7 @@ void CMmtTlvSplitter::CreatePins()
         [this](int streamIndex, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
             const int selectedStreamIndex = m_handler.getSelectedAudioStreamIndex();
-            const bool useSelectedAudioOnly = !m_latmPcmDecoders.empty();
+            const bool useSelectedAudioOnly = m_limitAudioToSelected;
             if (useSelectedAudioOnly && selectedStreamIndex >= 0 && selectedStreamIndex != streamIndex)
                 return;
 
@@ -4924,15 +5015,13 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
     if (plcid) *plcid = 0;
     if (pdwGroup) *pdwGroup = 1;
     if (ppszName) {
-        WCHAR formatName[32];
         const bool pcmOutput = ShouldDecodeLatmToPcm(info.latm, info.channels);
-        StringCchCopyW(formatName, ARRAYSIZE(formatName),
-                       pcmOutput ? L"LATM -> PCM" : (info.latm ? L"LATM" : L"ADTS"));
-        WCHAR buf[160];
+        const std::wstring sourceLabel = AudioTimelineLabel(info);
+        WCHAR buf[256];
         StringCchPrintfW(buf, ARRAYSIZE(buf),
-                         L"Audio %ld %s %uch%s (stream %d, component %d)",
-                         lIndex + 1, formatName, info.channels,
-                         pcmOutput ? L" to 2ch" : L"",
+                         L"Audio %ld %s%s (stream %d, component %d)",
+                         lIndex + 1, sourceLabel.c_str(),
+                         pcmOutput ? L" -> PCM 2.0" : L"",
                          info.streamIndex, info.componentTag);
         const size_t chars = wcslen(buf) + 1;
         *ppszName = static_cast<LPWSTR>(CoTaskMemAlloc(chars * sizeof(WCHAR)));

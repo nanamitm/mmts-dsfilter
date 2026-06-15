@@ -159,6 +159,7 @@ private:
     std::atomic<REFERENCE_TIME> m_currentPts{0};  // updated from video callback
     std::streamsize m_fileSize{0};
     bool m_audioUnsupported{false};
+    bool m_limitAudioToSelected{false};
     double m_rate{1.0};
     REFERENCE_TIME m_seekTarget{0};    // position to seek to (relative, 0 = start)
     REFERENCE_TIME m_segmentStart{0};  // media-time start of the active segment
@@ -208,6 +209,7 @@ private:
         std::vector<SidecarMapTrack> tracks;
     };
     const SidecarMapMptChange* FindSidecarMapMptChange(REFERENCE_TIME sourceTarget) const;
+    std::wstring AudioTimelineLabel(const CFilterDemuxerHandler::AudioStreamInfo& info) const;
     std::vector<SidecarMapTrack> m_sidecarMapTracks;
     std::vector<SidecarMapMptChange> m_sidecarMapMptChanges;
     std::vector<SidecarMapPoint> m_sidecarMapRapPoints;
