@@ -141,6 +141,9 @@ and creates a ZIP package containing:
 
 ```text
 mmts-dsfilter.ax
+avcodec-62.dll
+avutil-60.dll
+swresample-6.dll
 mmts-dsfilter.ini
 register-filter.ps1
 unregister-filter.ps1
