@@ -38,6 +38,7 @@ static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 // where that timeline is first observed, then preserve TTML spacing until a
 // clear TTML begin rollback indicates a program boundary.
 static constexpr REFERENCE_TIME kSubtitleResyncBackTolerance = 5 * 10000000LL;   // 5 s in the past
+static constexpr REFERENCE_TIME kSubtitleDriftCorrectionTolerance = 400 * 10000LL; // 400 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
@@ -2078,10 +2079,18 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_hasSidecarIndex = false;
     m_seekTarget = 0;
     m_currentPts = 0;
+    m_currentDts = -1;
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
+    m_subtitleProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitProgramStart.store(false, std::memory_order_release);
+    m_subtitleNtpRt.store(-1, std::memory_order_release);
+    m_subtitleNtpMediaRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitNtp.store(false, std::memory_order_release);
     m_subtitleTimeOffset.store(0, std::memory_order_release);
     m_lastSubtitleTtmlBegin.store(-1, std::memory_order_release);
+    m_subtitleOffsetProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleOffsetUsesNtp.store(false, std::memory_order_release);
     m_subtitleOffsetValid.store(false, std::memory_order_release);
     m_demuxByteOffset.store(0, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
@@ -3966,6 +3975,8 @@ void CMmtTlvSplitter::CreatePins()
             }
             if (last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
+            if (last && normDts >= 0)
+                m_currentDts.store(normDts, std::memory_order_relaxed);
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
@@ -4025,6 +4036,37 @@ void CMmtTlvSplitter::CreatePins()
             }
         });
 
+    m_handler.setProgramStartCallback(
+        [this](long long programStartRt) {
+            const REFERENCE_TIME oldStart = m_subtitleProgramStartRt.exchange(
+                programStartRt, std::memory_order_acq_rel);
+            m_subtitleAwaitProgramStart.store(false, std::memory_order_release);
+            if (oldStart != programStartRt) {
+                LogMsg(L"SUBTITLE EIT program start updated: old=%I64d ms, new=%I64d ms\n",
+                       oldStart / 10000,
+                       programStartRt / 10000);
+            }
+            ProcessDeferredSubtitleSamples();
+        });
+
+    m_handler.setNtpCallback(
+        [this](long long ntpRt) {
+            const REFERENCE_TIME mediaRt = SubtitleTimingAnchor();
+            m_subtitleNtpRt.store(ntpRt, std::memory_order_release);
+            m_subtitleNtpMediaRt.store(mediaRt, std::memory_order_release);
+            m_subtitleAwaitNtp.store(false, std::memory_order_release);
+            static volatile LONG s_ntpLogCount = 0;
+            LONG logNo = InterlockedIncrement(&s_ntpLogCount);
+            if (logNo <= 40 || m_subtitleAwaitProgramStart.load(std::memory_order_acquire)) {
+                LogDetail(L"SUBTITLE NTP anchor #%ld: ntp=%I64d ms, media=%I64d ms, current=%I64d ms\n",
+                          logNo,
+                          ntpRt / 10000,
+                          mediaRt / 10000,
+                          m_currentPts.load(std::memory_order_acquire) / 10000);
+            }
+            ProcessDeferredSubtitleSamples();
+        });
+
     m_handler.setSubtitleCallback(
         [this](int streamIndex, bool, long long pts, long long,
                bool, bool, const uint8_t* d, size_t sz) {
@@ -4036,6 +4078,27 @@ void CMmtTlvSplitter::CreatePins()
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
             DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
+
+            const bool waitingForProgramStart =
+                m_subtitleAwaitProgramStart.load(std::memory_order_acquire) &&
+                m_subtitleProgramStartRt.load(std::memory_order_acquire) < 0;
+            if (cue.hasBegin && waitingForProgramStart) {
+                DeferredSubtitleSample sample;
+                sample.streamIndex = streamIndex;
+                sample.pts = pts;
+                sample.callbackNo = callbackNo;
+                sample.data.assign(d, d + sz);
+                m_deferredSubtitleSamples.push_back(std::move(sample));
+                if (m_deferredSubtitleSamples.size() > 32)
+                    m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
+                LogDetail(L"SUBTITLE CALLBACK deferred for EIT: callback=%ld streamIndex=%d waitEit=%d ttmlBegin=%I64d ms size=%zu\n",
+                          callbackNo,
+                          streamIndex,
+                          waitingForProgramStart ? 1 : 0,
+                          cue.begin / 10000,
+                          sz);
+                return;
+            }
 
             if (cue.missingGlyph && !cue.text.empty()) {
                 DeferredSubtitleSample sample;
@@ -4093,15 +4156,16 @@ void CMmtTlvSplitter::CreatePins()
             REFERENCE_TIME sampleStop;
             bool repeatUntilNextCue = false;
             if (cue.hasBegin) {
-                const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin);
-                sampleStart = cue.begin - subtitleTimeOffset;
+                const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
+                const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
+                sampleStart = sourceBegin - subtitleTimeOffset;
                 if (cue.hasEnd) {
-                    sampleStop = cue.end - subtitleTimeOffset;
+                    sampleStop = SubtitleSourceTime(cue.end) - subtitleTimeOffset;
                 } else {
                     REFERENCE_TIME nextBegin = -1;
                     const long long lookaheadOffset = m_demuxByteOffset.load(std::memory_order_acquire);
                     if (FindNextSubtitleBegin(streamIndex, cue.begin, lookaheadOffset, nextBegin)) {
-                        sampleStop = nextBegin - subtitleTimeOffset;
+                        sampleStop = SubtitleSourceTime(nextBegin) - subtitleTimeOffset;
                         LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d\n",
                                   streamIndex,
                                   cue.begin / 10000,
@@ -4191,52 +4255,114 @@ REFERENCE_TIME CMmtTlvSplitter::GetSegmentTimeOffset() const
 
 REFERENCE_TIME CMmtTlvSplitter::SubtitleTimingAnchor() const
 {
-    REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
+    REFERENCE_TIME anchor = m_currentDts.load(std::memory_order_acquire);
+    if (anchor < 0)
+        anchor = m_currentPts.load(std::memory_order_acquire);
     if (anchor < 0)
         anchor = 0;
     return anchor;
 }
 
-REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin)
+REFERENCE_TIME CMmtTlvSplitter::SubtitleSourceTime(REFERENCE_TIME ttmlTime, REFERENCE_TIME* programStartRt) const
 {
-    // Subtitle samples have no PTS, so anchor TTML times to the video position
-    // where the current TTML timeline is first observed. offset maps TTML begin
+    const REFERENCE_TIME start = m_subtitleProgramStartRt.load(std::memory_order_acquire);
+    if (programStartRt)
+        *programStartRt = start;
+    if (start >= 0)
+        return start + ttmlTime;
+    return ttmlTime;
+}
+
+REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, REFERENCE_TIME sourceBegin)
+{
+    // Subtitle samples have no MFU PTS, so synthesize a source timeline from
+    // EIT program start + TTML begin when possible. If an NTP/PCR anchor is
+    // available, calibrate like dantto4k: align the first cue of each program
+    // to the latest PCR-derived media time and keep that offset for TTML spacing.
+    // offset maps subtitle source time
     // -> normalized media time:
-    //   mediaStart = ttmlBegin - offset
+    //   mediaStart = sourceBegin - offset
     const REFERENCE_TIME anchor = SubtitleTimingAnchor();
+    const REFERENCE_TIME programStartRt = m_subtitleProgramStartRt.load(std::memory_order_acquire);
+    const REFERENCE_TIME ntpRt = m_subtitleNtpRt.load(std::memory_order_acquire);
+    const REFERENCE_TIME ntpMediaRt = m_subtitleNtpMediaRt.load(std::memory_order_acquire);
+    const bool canUseNtp = (programStartRt >= 0 && ntpRt >= 0 && ntpMediaRt >= 0);
 
     REFERENCE_TIME offset = m_subtitleTimeOffset.load(std::memory_order_acquire);
     bool valid = m_subtitleOffsetValid.load(std::memory_order_acquire);
+    bool usesNtp = m_subtitleOffsetUsesNtp.load(std::memory_order_acquire);
 
     if (valid) {
         // Detect a TTML timeline reset (e.g. a program boundary). With the
         // cached offset, normal cue times can be far from the current delivered
         // video PTS, so only a clear TTML begin rollback is a resync signal.
-        const REFERENCE_TIME candidate = ttmlBegin - offset;
+        const REFERENCE_TIME candidate = sourceBegin - offset;
         const REFERENCE_TIME lastTtmlBegin = m_lastSubtitleTtmlBegin.load(std::memory_order_acquire);
+        const REFERENCE_TIME calibratedProgramStart =
+            m_subtitleOffsetProgramStartRt.load(std::memory_order_acquire);
+        if (programStartRt >= 0 && calibratedProgramStart != programStartRt) {
+            LogMsg(L"SUBTITLE timing resync: programStart changed old=%I64d ms, new=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
+                   calibratedProgramStart / 10000,
+                   programStartRt / 10000,
+                   candidate / 10000,
+                   anchor / 10000,
+                   ttmlBegin / 10000);
+            valid = false;
+        }
+        if (canUseNtp && !usesNtp) {
+            LogMsg(L"SUBTITLE timing resync: switching to NTP anchor oldOffset=%I64d ms, ntp=%I64d ms, ntpMedia=%I64d ms, ttmlBegin=%I64d ms\n",
+                   offset / 10000,
+                   ntpRt / 10000,
+                   ntpMediaRt / 10000,
+                   ttmlBegin / 10000);
+            valid = false;
+        }
         if (lastTtmlBegin >= 0 && ttmlBegin + kSubtitleResyncBackTolerance < lastTtmlBegin) {
-            LogMsg(L"SUBTITLE timing resync: oldOffset=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, current=%I64d ms, lastTtmlBegin=%I64d ms, ttmlBegin=%I64d ms\n",
+            LogMsg(L"SUBTITLE timing resync: oldOffset=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, current=%I64d ms, programStart=%I64d ms, lastTtmlBegin=%I64d ms, ttmlBegin=%I64d ms\n",
                    offset / 10000,
                    candidate / 10000,
                    anchor / 10000,
                    m_currentPts.load(std::memory_order_acquire) / 10000,
+                   programStartRt / 10000,
                    lastTtmlBegin / 10000,
                    ttmlBegin / 10000);
             valid = false;
         }
+        if (valid) {
+            const REFERENCE_TIME drift = candidate - anchor;
+            if (drift > kSubtitleDriftCorrectionTolerance) {
+                LogMsg(L"SUBTITLE timing drift correction: oldOffset=%I64d ms, drift=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, programStart=%I64d ms, ttmlBegin=%I64d ms\n",
+                       offset / 10000,
+                       drift / 10000,
+                       candidate / 10000,
+                       anchor / 10000,
+                       programStartRt / 10000,
+                       ttmlBegin / 10000);
+                valid = false;
+            }
+        }
     }
 
     if (!valid) {
-        offset = ttmlBegin - anchor;
+        const REFERENCE_TIME baseAnchor = canUseNtp ? ntpMediaRt : anchor;
+        offset = sourceBegin - baseAnchor;
         m_subtitleTimeOffset.store(offset, std::memory_order_release);
+        m_subtitleOffsetProgramStartRt.store(programStartRt, std::memory_order_release);
+        m_subtitleOffsetUsesNtp.store(canUseNtp, std::memory_order_release);
         m_subtitleOffsetValid.store(true, std::memory_order_release);
-        LogMsg(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, current=%I64d ms, segmentStart=%I64d ms, rapOffset=%I64d ms, ttmlBegin=%I64d ms\n",
+        LogMsg(L"SUBTITLE timing base set: sourceOffset=%I64d ms, anchor=%I64d ms, current=%I64d ms, currentDts=%I64d ms, segmentStart=%I64d ms, rapOffset=%I64d ms, programStart=%I64d ms, ntp=%I64d ms, ntpMedia=%I64d ms, useNtp=%d, ttmlBegin=%I64d ms, sourceBegin=%I64d ms\n",
                offset / 10000,
-               anchor / 10000,
+               baseAnchor / 10000,
                m_currentPts.load(std::memory_order_acquire) / 10000,
+               m_currentDts.load(std::memory_order_acquire) / 10000,
                m_segmentStart / 10000,
                m_segmentTimeOffset.load(std::memory_order_acquire) / 10000,
-               ttmlBegin / 10000);
+               programStartRt / 10000,
+               ntpRt / 10000,
+               ntpMediaRt / 10000,
+               canUseNtp ? 1 : 0,
+               ttmlBegin / 10000,
+               sourceBegin / 10000);
     }
 
     m_lastSubtitleTtmlBegin.store(ttmlBegin, std::memory_order_release);
@@ -4373,6 +4499,15 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
     for (const auto& sample : m_deferredSubtitleSamples) {
         TtmlDebugStats stats;
         TtmlTextCue cue = ExtractTtmlPlainText(sample.data.data(), sample.data.size(), stats, sample.streamIndex);
+        if (cue.hasBegin) {
+            const bool waitingForProgramStart =
+                m_subtitleAwaitProgramStart.load(std::memory_order_acquire) &&
+                m_subtitleProgramStartRt.load(std::memory_order_acquire) < 0;
+            if (waitingForProgramStart) {
+                remaining.push_back(sample);
+                continue;
+            }
+        }
         if (cue.missingGlyph) {
             remaining.push_back(sample);
             continue;
@@ -4383,9 +4518,11 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
         REFERENCE_TIME sampleStart = 0;
         REFERENCE_TIME sampleStop = 0;
         if (cue.hasBegin) {
-            const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin);
-            sampleStart = cue.begin - subtitleTimeOffset;
-            sampleStop = cue.hasEnd ? cue.end - subtitleTimeOffset : sampleStart + kDefaultSubtitleDuration;
+            const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
+            const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
+            sampleStart = sourceBegin - subtitleTimeOffset;
+            sampleStop = cue.hasEnd ? SubtitleSourceTime(cue.end) - subtitleTimeOffset
+                                    : sampleStart + kDefaultSubtitleDuration;
             sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
             sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
         } else {
@@ -4594,6 +4731,15 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
 
     m_seekTarget = pos;
     m_currentPts = pos;   // normalised position (0-based)
+    m_currentDts = -1;
+    m_subtitleProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitProgramStart.store(pos > 0, std::memory_order_release);
+    m_subtitleNtpRt.store(-1, std::memory_order_release);
+    m_subtitleNtpMediaRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitNtp.store(false, std::memory_order_release);
+    m_subtitleOffsetProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleOffsetUsesNtp.store(false, std::memory_order_release);
+    m_subtitleOffsetValid.store(false, std::memory_order_release);
     ClearPendingSubtitleCues();
 
     // Keep stream registration intact across seek so video starts faster.
@@ -4639,8 +4785,15 @@ void CMmtTlvSplitter::DemuxLoop()
     }
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
+    m_subtitleProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitProgramStart.store(sourceSeekTarget > 0, std::memory_order_release);
+    m_subtitleNtpRt.store(-1, std::memory_order_release);
+    m_subtitleNtpMediaRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitNtp.store(false, std::memory_order_release);
     m_subtitleTimeOffset.store(0, std::memory_order_release);
     m_lastSubtitleTtmlBegin.store(-1, std::memory_order_release);
+    m_subtitleOffsetProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleOffsetUsesNtp.store(false, std::memory_order_release);
     m_subtitleOffsetValid.store(false, std::memory_order_release);
     ClearPendingSubtitleCues();
     const bool waitForRap = sourceSeekTarget > 0;
@@ -4947,6 +5100,7 @@ STDMETHODIMP CMmtTlvSplitter::SetPositions(
         } else {
             m_seekTarget = pos;
             m_currentPts = pos;
+            m_currentDts = -1;
         }
         *pCurrent = pos;
     }

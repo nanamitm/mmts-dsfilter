@@ -2,13 +2,17 @@
 #include "DebugLog.h"
 #include "mmtStream.h"
 #include "mpt.h"
+#include "mhEit.h"
+#include "ntp.h"
 #include "mmtDescriptors.h"
 #include "mhStreamIdentificationDescriptor.h"
 #include "mhAudioComponentDescriptor.h"
 #include "mpuProcessorBase.h"  // NOPTS_VALUE
+#include "timeUtil.h"
 #include <windows.h>
 #include <strsafe.h>
 #include <algorithm>
+#include <ctime>
 
 #define LogMsg MmtTlvLogInfo
 #define LogDetail MmtTlvLogDebug
@@ -40,6 +44,13 @@ static uint16_t AudioModeToChannels(uint8_t audioMode)
     case 0b10001: return 24;  // 22.2ch
     default: return 2;
     }
+}
+
+static long long Pcr27ToRefTime(int64_t pcr27)
+{
+    if (pcr27 < 0)
+        return -1;
+    return static_cast<long long>((static_cast<double>(pcr27) * 10000000.0) / 27000000.0);
 }
 
 static uint16_t AudioDescriptorChannels(const MmtTlv::MhAudioComponentDescriptor& audio)
@@ -685,4 +696,49 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
     m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
                        true, pts, dts, true, true,
                        mfu.data.data(), mfu.data.size());
+}
+
+void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
+{
+    if (!mhEit.isPf() || mhEit.sectionNumber != 0)
+        return;
+
+    for (const auto& mhEvent : mhEit.events) {
+        if (!mhEvent)
+            continue;
+
+        std::tm startTime = EITConvertStartTime(mhEvent->startTime);
+        if (!isValidEITStartTime(startTime))
+            continue;
+
+        const std::time_t startSec = std::mktime(&startTime);
+        if (startSec < 0)
+            continue;
+
+        const long long programStartSec = static_cast<long long>(startSec);
+        if (programStartSec == m_programStartTimeSec)
+            return;
+
+        m_programStartTimeSec = programStartSec;
+        const long long programStartRt = programStartSec * 10000000LL;
+        LogMsg(L"MMT/TLV EIT program start: unix=%I64d, rt=%I64d ms, eventId=%u\n",
+               programStartSec,
+               programStartRt / 10000,
+               mhEvent->eventId);
+        if (m_programStartCallback)
+            m_programStartCallback(programStartRt);
+        return;
+    }
+}
+
+void CFilterDemuxerHandler::onNtp(const MmtTlv::NTPv4& ntp)
+{
+    if (!m_ntpCallback)
+        return;
+
+    const long long ntpRt = Pcr27ToRefTime(ntp.transmit_timestamp.toPcrValue());
+    if (ntpRt < 0)
+        return;
+
+    m_ntpCallback(ntpRt);
 }

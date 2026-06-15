@@ -6,7 +6,7 @@
 #include "demuxerHandler.h"
 #include "adtsConverter.h"
 
-namespace MmtTlv { class MmtStream; struct MfuData; }
+namespace MmtTlv { class MmtStream; struct MfuData; class MhEit; class NTPv4; }
 
 // Bridges dantto4k demuxer callbacks to DirectShow sample delivery.
 // Uses long long (= REFERENCE_TIME = 100ns units) to avoid windows.h dependency here.
@@ -49,17 +49,24 @@ public:
         const uint8_t* data,
         size_t size)>;
 
+    using ProgramStartCallback = std::function<void(long long programStartRt)>;
+    using NtpCallback = std::function<void(long long ntpRt)>;
+
     void setVideoCallback(SampleCallback cb) { m_videoCallback = std::move(cb); }
     void setAudioCallback(SampleCallback cb) { m_audioCallback = std::move(cb); }
     void setSubtitleCallback(SampleCallback cb) { m_subtitleCallback = std::move(cb); }
     void setSubtitleResourceCallback(SubtitleResourceCallback cb) { m_subtitleResourceCallback = std::move(cb); }
+    void setProgramStartCallback(ProgramStartCallback cb) { m_programStartCallback = std::move(cb); }
+    void setNtpCallback(NtpCallback cb) { m_ntpCallback = std::move(cb); }
 
     void onVideoData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu) override;
     void onAudioData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu) override;
     void onSubtitleData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu) override;
+    void onMhEit(const MmtTlv::MhEit& mhEit) override;
+    void onNtp(const MmtTlv::NTPv4& ntp) override;
     void onMpt(const MmtTlv::Mpt& mpt) override;
 
-    void reset() { m_basePts = -1; }
+    void reset() { m_basePts = -1; m_programStartTimeSec = -1; }
     void resetAudioSelection();
     std::vector<AudioStreamInfo> getAudioStreams() const;
     std::vector<SubtitleStreamInfo> getSubtitleStreams() const;
@@ -85,8 +92,11 @@ private:
     SampleCallback m_audioCallback;
     SampleCallback m_subtitleCallback;
     SubtitleResourceCallback m_subtitleResourceCallback;
+    ProgramStartCallback m_programStartCallback;
+    NtpCallback m_ntpCallback;
     ADTSConverter  m_adtsConverter;
     long long m_basePts{-1};  // first valid PTS seen, in 100ns units
+    long long m_programStartTimeSec{-1};
     int m_primaryAudioStreamIndex{-1};
     mutable std::mutex m_audioMutex;
     std::vector<AudioStreamInfo> m_audioStreams;
