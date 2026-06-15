@@ -68,7 +68,7 @@
       <DisableSpecificWarnings>4996;4244;4267;4800;4018;4312;4311;4302;4596;4099</DisableSpecificWarnings>
       <MultiProcessorCompilation>true</MultiProcessorCompilation>
       <!-- /permissive needed for old BaseClasses code (qualified dtor names, etc.) -->
-      <AdditionalOptions>/permissive %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /permissive %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <ModuleDefinitionFile>..\msvc\mmts-dsfilter.def</ModuleDefinitionFile>
@@ -136,7 +136,9 @@ copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-6.dll "$(OutDir)"</C
     <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\dllsetup.cpp" />
     <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\mtype.cpp" />
     <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\outputq.cpp" />
-    <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\wxdebug.cpp" />
+    <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\wxdebug.cpp">
+      <DisableSpecificWarnings>4005;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
     <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\wxlist.cpp" />
     <ClCompile Include="..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses\wxutil.cpp" />
   </ItemGroup>
