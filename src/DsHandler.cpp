@@ -7,6 +7,7 @@
 #include "mhAudioComponentDescriptor.h"
 #include "mpuProcessorBase.h"  // NOPTS_VALUE
 #include <windows.h>
+#include <strsafe.h>
 #include <algorithm>
 
 #define LogMsg MmtTlvLogInfo
@@ -648,7 +649,12 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
             cursor += used;
             remaining -= used;
         }
-        LogMsg(L"MMT/TLV Subtitle MFU #%ld: streamIndex=%u packetId=0x%04X componentTag=%d type=%u subsample=%u/%u pts=%I64d ms size=%zu first=%s\n",
+        WCHAR ptsText[32] = {};
+        if (pts >= 0)
+            StringCchPrintfW(ptsText, ARRAYSIZE(ptsText), L"%I64d ms", pts / 10000);
+        else
+            StringCchCopyW(ptsText, ARRAYSIZE(ptsText), L"none");
+        LogMsg(L"MMT/TLV Subtitle MFU #%ld: streamIndex=%u packetId=0x%04X componentTag=%d type=%u subsample=%u/%u pts=%s size=%zu first=%s\n",
                logNo,
                stream.getStreamIndex(),
                stream.getPacketId(),
@@ -656,7 +662,7 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
                mfu.subtitleDataType,
                mfu.subtitleSubsampleNumber,
                mfu.subtitleLastSubsampleNumber,
-               pts / 10000,
+               ptsText,
                mfu.data.size(),
                hex);
     }

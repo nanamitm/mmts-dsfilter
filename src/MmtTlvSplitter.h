@@ -112,9 +112,10 @@ private:
                             const std::string& assText);
     void ProcessDeferredSubtitleSamples();
     // Maps a TTML begin time to the media (normalized, pre-segment) timeline.
-    // Subtitles have no PTS, so the offset is anchored to the current video
-    // position and re-synced on TTML timeline jumps (program boundaries).
+    // Subtitles have no PTS, so the offset is anchored once per TTML timeline
+    // to the video position where that timeline is first observed.
     REFERENCE_TIME ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin);
+    REFERENCE_TIME SubtitleTimingAnchor() const;
 
     CCritSec m_pinLock;
     std::vector<CMmtTlvOutputPin*> m_pins;
@@ -166,6 +167,7 @@ private:
     std::atomic<bool> m_waitingForVideoRap{false};
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
     std::atomic<REFERENCE_TIME> m_subtitleTimeOffset{0};
+    std::atomic<REFERENCE_TIME> m_lastSubtitleTtmlBegin{-1};
     // Whether m_subtitleTimeOffset holds a calibrated value. A separate flag is
     // required because a legitimate offset can be negative (TTML begin < media PTS),
     // so the previous "< 0 means unset" sentinel mis-fired on every cue.
