@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <memory>
 #include "mmtTlvDemuxer.h"
 #include "DsHandler.h"
 #include "MmtTlvOutputPin.h"
@@ -69,6 +70,8 @@ public:
     REFERENCE_TIME GetSegmentStart() const { return m_segmentStart; }
 
 private:
+    struct LatmPcmDecoder;
+
     void CreatePins();
     void StartThread();
     void StopThread();
@@ -108,13 +111,16 @@ private:
                             const std::vector<std::string>& assEvents,
                             const std::string& assText);
     void ProcessDeferredSubtitleSamples();
-    // Maps a TTML begin time to the media (normalized, pre-segment) timeline.
-    // Subtitles have no PTS, so the offset is anchored to the current video
-    // position and re-synced on TTML timeline jumps (program boundaries).
-    REFERENCE_TIME ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin);
+    // Maps subtitle source time to the media (normalized, pre-segment) timeline.
+    // When EIT is available, source time is programStart + TTML begin, similar
+    // to dantto4k's synthetic subtitle PTS. Otherwise TTML begin is used alone.
+    REFERENCE_TIME SubtitleSourceTime(REFERENCE_TIME ttmlTime, REFERENCE_TIME* programStartRt = nullptr) const;
+    REFERENCE_TIME ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, REFERENCE_TIME sourceBegin);
+    REFERENCE_TIME SubtitleTimingAnchor() const;
 
     CCritSec m_pinLock;
     std::vector<CMmtTlvOutputPin*> m_pins;
+    std::vector<std::unique_ptr<LatmPcmDecoder>> m_latmPcmDecoders;
 
     MmtTlv::MmtTlvDemuxer m_demuxer;
     CFilterDemuxerHandler  m_handler;
@@ -153,14 +159,24 @@ private:
     REFERENCE_TIME m_mapFirstVideoPts{-1};
     REFERENCE_TIME m_stopPos{_I64_MAX};
     std::atomic<REFERENCE_TIME> m_currentPts{0};  // updated from video callback
+    std::atomic<REFERENCE_TIME> m_currentDts{-1}; // updated from video callback; subtitle PCR anchor
     std::streamsize m_fileSize{0};
     bool m_audioUnsupported{false};
+    bool m_limitAudioToSelected{false};
     double m_rate{1.0};
     REFERENCE_TIME m_seekTarget{0};    // position to seek to (relative, 0 = start)
     REFERENCE_TIME m_segmentStart{0};  // media-time start of the active segment
     std::atomic<bool> m_waitingForVideoRap{false};
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
+    std::atomic<REFERENCE_TIME> m_subtitleProgramStartRt{-1};
+    std::atomic<bool> m_subtitleAwaitProgramStart{false};
+    std::atomic<REFERENCE_TIME> m_subtitleNtpRt{-1};
+    std::atomic<REFERENCE_TIME> m_subtitleNtpMediaRt{-1};
+    std::atomic<bool> m_subtitleAwaitNtp{false};
     std::atomic<REFERENCE_TIME> m_subtitleTimeOffset{0};
+    std::atomic<REFERENCE_TIME> m_lastSubtitleTtmlBegin{-1};
+    std::atomic<REFERENCE_TIME> m_subtitleOffsetProgramStartRt{-1};
+    std::atomic<bool> m_subtitleOffsetUsesNtp{false};
     // Whether m_subtitleTimeOffset holds a calibrated value. A separate flag is
     // required because a legitimate offset can be negative (TTML begin < media PTS),
     // so the previous "< 0 means unset" sentinel mis-fired on every cue.
@@ -191,6 +207,8 @@ private:
         int componentTag{-1};
         uint32_t samplingRate{0};
         bool latm{false};
+        uint8_t audioMode{0};
+        uint16_t channels{0};
     };
     struct SidecarMapPoint {
         REFERENCE_TIME time{0};
@@ -202,6 +220,7 @@ private:
         std::vector<SidecarMapTrack> tracks;
     };
     const SidecarMapMptChange* FindSidecarMapMptChange(REFERENCE_TIME sourceTarget) const;
+    std::wstring AudioTimelineLabel(const CFilterDemuxerHandler::AudioStreamInfo& info) const;
     std::vector<SidecarMapTrack> m_sidecarMapTracks;
     std::vector<SidecarMapMptChange> m_sidecarMapMptChanges;
     std::vector<SidecarMapPoint> m_sidecarMapRapPoints;

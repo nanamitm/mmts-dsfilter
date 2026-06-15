@@ -21,15 +21,24 @@
 #include <string>
 #include <vector>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
+}
+
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
 static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuration;
 static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
-// Subtitle MFUs carry no PTS, so cue placement is anchored to the current video
-// position. The cached TTML->media offset is re-synced when a cue would land far
-// from the current playback position (a TTML timeline jump at a program boundary).
+// Subtitle MFUs carry no PTS. Anchor each TTML timeline to the video position
+// where that timeline is first observed, then preserve TTML spacing until a
+// clear TTML begin rollback indicates a program boundary.
 static constexpr REFERENCE_TIME kSubtitleResyncBackTolerance = 5 * 10000000LL;   // 5 s in the past
-static constexpr REFERENCE_TIME kSubtitleResyncAheadTolerance = 30 * 10000000LL; // 30 s in the future
+static constexpr REFERENCE_TIME kSubtitleDriftCorrectionTolerance = 400 * 10000LL; // 400 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
@@ -67,6 +76,31 @@ static REFERENCE_TIME ToSegmentTime(REFERENCE_TIME rt, REFERENCE_TIME segmentSta
 static bool IsCaptionComponentTag(int componentTag)
 {
     return componentTag >= 0x30 && componentTag <= 0x37;
+}
+
+static bool ShouldDecodeLatmToPcm(bool latm, uint32_t channels)
+{
+    return latm && channels == 24;
+}
+
+static std::wstring AudioChannelLabel(uint32_t channels)
+{
+    switch (channels) {
+    case 24: return L"22.2";
+    case 6: return L"5.1";
+    case 2: return L"2.0";
+    case 1: return L"1.0";
+    default:
+        WCHAR buf[16];
+        StringCchPrintfW(buf, ARRAYSIZE(buf), L"%uch", channels);
+        return buf;
+    }
+}
+
+static std::wstring AudioSourceLabel(const CFilterDemuxerHandler::AudioStreamInfo& info)
+{
+    const std::wstring channels = AudioChannelLabel(info.channels);
+    return (info.latm ? L"LATM " : L"AAC ") + channels;
 }
 
 static int SubtitlePinPriority(const CFilterDemuxerHandler::SubtitleStreamInfo& info)
@@ -2045,9 +2079,18 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_hasSidecarIndex = false;
     m_seekTarget = 0;
     m_currentPts = 0;
+    m_currentDts = -1;
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
+    m_subtitleProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitProgramStart.store(false, std::memory_order_release);
+    m_subtitleNtpRt.store(-1, std::memory_order_release);
+    m_subtitleNtpMediaRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitNtp.store(false, std::memory_order_release);
     m_subtitleTimeOffset.store(0, std::memory_order_release);
+    m_lastSubtitleTtmlBegin.store(-1, std::memory_order_release);
+    m_subtitleOffsetProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleOffsetUsesNtp.store(false, std::memory_order_release);
     m_subtitleOffsetValid.store(false, std::memory_order_release);
     m_demuxByteOffset.store(0, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
@@ -2189,6 +2232,8 @@ void CMmtTlvSplitter::LoadSidecarMap()
             return false;
         if (track.type == "audio" && track.samplingRate > 768000)
             return false;
+        if (track.type == "audio" && track.channels > 64)
+            return false;
         return true;
     };
 
@@ -2196,8 +2241,14 @@ void CMmtTlvSplitter::LoadSidecarMap()
     std::string magic;
     char binaryMagic[8] = {};
     ifs.read(binaryMagic, sizeof(binaryMagic));
-    if (ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
-        std::memcmp(binaryMagic, "MMTSMAP2", 8) == 0) {
+    const bool isBinaryMap2 =
+        ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
+        std::memcmp(binaryMagic, "MMTSMAP2", 8) == 0;
+    const bool isBinaryMap3 =
+        ifs.gcount() == static_cast<std::streamsize>(sizeof(binaryMagic)) &&
+        std::memcmp(binaryMagic, "MMTSMAP3", 8) == 0;
+    if (isBinaryMap2 || isBinaryMap3) {
+        const uint32_t expectedVersion = isBinaryMap3 ? 3 : 2;
         uint32_t version = 0;
         uint32_t flags = 0;
         uint64_t binarySourceSize = 0;
@@ -2213,7 +2264,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
             !ReadPod(ifs, firstVideoPtsMs) || !ReadPod(ifs, lastVideoPtsMs) ||
             !ReadPod(ifs, trackCount) || !ReadPod(ifs, mptCount) ||
             !ReadPod(ifs, rapCount) || !ReadPod(ifs, seekCount) ||
-            version != 2) {
+            version != expectedVersion) {
             LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, bad binary header: %s\n", mapPath.c_str());
             return;
         }
@@ -2252,14 +2303,30 @@ void CMmtTlvSplitter::LoadSidecarMap()
         for (uint32_t i = 0; i < trackCount; ++i) {
             uint8_t type = 0;
             uint8_t trackFlags = 0;
-            uint16_t reserved = 0;
+            uint8_t audioMode = 0;
+            uint8_t channels = 0;
             int32_t streamIndex = -1;
             uint16_t packetId = 0;
             int16_t componentTag = -1;
             uint32_t samplingRate = 0;
             uint32_t reserved2 = 0;
-            if (!ReadPod(ifs, type) || !ReadPod(ifs, trackFlags) || !ReadPod(ifs, reserved) ||
-                !ReadPod(ifs, streamIndex) || !ReadPod(ifs, packetId) ||
+            if (!ReadPod(ifs, type) || !ReadPod(ifs, trackFlags)) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                return;
+            }
+            if (isBinaryMap3) {
+                if (!ReadPod(ifs, audioMode) || !ReadPod(ifs, channels)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                    return;
+                }
+            } else {
+                uint16_t reserved = 0;
+                if (!ReadPod(ifs, reserved)) {
+                    LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
+                    return;
+                }
+            }
+            if (!ReadPod(ifs, streamIndex) || !ReadPod(ifs, packetId) ||
                 !ReadPod(ifs, componentTag) || !ReadPod(ifs, samplingRate) ||
                 !ReadPod(ifs, reserved2)) {
                 LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, truncated binary track table: %s\n", mapPath.c_str());
@@ -2273,6 +2340,8 @@ void CMmtTlvSplitter::LoadSidecarMap()
             track.componentTag = componentTag;
             track.samplingRate = samplingRate;
             track.latm = (trackFlags & 1) != 0;
+            track.audioMode = audioMode;
+            track.channels = channels;
             if (!isValidTrack(track)) {
                 LogMsg(L"MMT/TLV Splitter: mmtsmap ignored, invalid binary track: %s index=%u type=%u streamIndex=%d packetId=0x%04X componentTag=%d\n",
                        mapPath.c_str(), i, type, streamIndex, packetId, componentTag);
@@ -2368,7 +2437,7 @@ void CMmtTlvSplitter::LoadSidecarMap()
         for (const auto& spec : SplitString(value, ',')) {
             const auto fields = SplitString(spec, ':');
             const bool isAudio = std::strcmp(type, "audio") == 0;
-            if ((isAudio && fields.size() != 5) || (!isAudio && fields.size() != 3))
+            if ((isAudio && fields.size() != 5 && fields.size() != 7) || (!isAudio && fields.size() != 3))
                 continue;
 
             SidecarMapTrack track;
@@ -2382,6 +2451,10 @@ void CMmtTlvSplitter::LoadSidecarMap()
             if (isAudio) {
                 track.samplingRate = static_cast<uint32_t>(ParseInt64Value(fields[3], 0));
                 track.latm = ParseInt64Value(fields[4], 0) != 0;
+                if (fields.size() >= 7) {
+                    track.audioMode = static_cast<uint8_t>(ParseInt64Value(fields[5], 0));
+                    track.channels = static_cast<uint16_t>(ParseInt64Value(fields[6], 0));
+                }
             }
             if (isValidTrack(track))
                 tracks.push_back(track);
@@ -2427,6 +2500,12 @@ void CMmtTlvSplitter::LoadSidecarMap()
             it = values.find("latm");
             if (it != values.end())
                 track.latm = ParseInt64Value(it->second, 0) != 0;
+            it = values.find("audioMode");
+            if (it != values.end())
+                track.audioMode = static_cast<uint8_t>(ParseInt64Value(it->second, 0));
+            it = values.find("channels");
+            if (it != values.end())
+                track.channels = static_cast<uint16_t>(ParseInt64Value(it->second, 0));
 
             if ((track.type == "audio" || track.type == "subtitle") &&
                 track.streamIndex >= 0 && track.packetId != 0) {
@@ -2596,14 +2675,67 @@ const CMmtTlvSplitter::SidecarMapMptChange* CMmtTlvSplitter::FindSidecarMapMptCh
     return best ? best : &m_sidecarMapMptChanges.front();
 }
 
+std::wstring CMmtTlvSplitter::AudioTimelineLabel(const CFilterDemuxerHandler::AudioStreamInfo& info) const
+{
+    std::vector<std::wstring> labels;
+    auto pushLabel = [&labels](bool latm, uint16_t channels) {
+        CFilterDemuxerHandler::AudioStreamInfo labelInfo;
+        labelInfo.latm = latm;
+        labelInfo.channels = channels;
+        const std::wstring label = AudioSourceLabel(labelInfo);
+        if (labels.empty() || labels.back() != label)
+            labels.push_back(label);
+    };
+
+    for (const auto& change : m_sidecarMapMptChanges) {
+        for (const auto& track : change.tracks) {
+            if (track.type != "audio")
+                continue;
+            if (track.streamIndex != info.streamIndex &&
+                !(track.packetId == info.packetId && track.componentTag == info.componentTag)) {
+                continue;
+            }
+            const uint16_t channels = track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
+            pushLabel(track.latm, channels);
+            break;
+        }
+    }
+
+    if (labels.empty())
+        return AudioSourceLabel(info);
+
+    std::wstring label = labels.front();
+    for (size_t i = 1; i < labels.size(); ++i) {
+        label += L" -> ";
+        label += labels[i];
+    }
+    return label;
+}
+
 void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
 {
     if (!m_hasSidecarMap)
         return;
 
+    auto mapTrackChannels = [](const SidecarMapTrack& track) -> uint16_t {
+        return track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
+    };
+    auto isBetterMapAudio = [&](const SidecarMapTrack& track,
+                                const CFilterDemuxerHandler::AudioStreamInfo& info) {
+        const uint16_t trackChannels = mapTrackChannels(track);
+        if (trackChannels > info.channels)
+            return true;
+        if (trackChannels == info.channels && track.latm && !info.latm)
+            return true;
+        if (info.samplingRate == 0 && track.samplingRate > 0)
+            return true;
+        return false;
+    };
+
     auto audioStreams = m_handler.getAudioStreams();
     auto subtitleStreams = m_handler.getSubtitleStreams();
     size_t addedAudio = 0;
+    size_t updatedAudio = 0;
     size_t addedSubtitle = 0;
 
     std::vector<SidecarMapTrack> mapTracks = m_sidecarMapTracks;
@@ -2618,15 +2750,25 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
                     return info.streamIndex == track.streamIndex ||
                            (info.packetId == track.packetId && info.componentTag == track.componentTag);
                 });
-            if (it != audioStreams.end())
+            if (it != audioStreams.end()) {
+                if (isBetterMapAudio(track, *it)) {
+                    it->streamIndex = track.streamIndex;
+                    it->packetId = track.packetId;
+                    it->componentTag = track.componentTag;
+                    it->samplingRate = track.samplingRate;
+                    it->channels = mapTrackChannels(track);
+                    it->latm = track.latm;
+                    ++updatedAudio;
+                }
                 continue;
+            }
 
             CFilterDemuxerHandler::AudioStreamInfo info;
             info.streamIndex = track.streamIndex;
             info.packetId = track.packetId;
             info.componentTag = track.componentTag;
             info.samplingRate = track.samplingRate;
-            info.channels = track.latm ? 24 : 2;
+            info.channels = mapTrackChannels(track);
             info.latm = track.latm;
             audioStreams.push_back(info);
             ++addedAudio;
@@ -2649,7 +2791,7 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
         }
     }
 
-    if (addedAudio > 0) {
+    if (addedAudio > 0 || updatedAudio > 0) {
         m_handler.setKnownAudioStreams(audioStreams);
         m_handler.setRequireAdtsConvertibleAudio(true);
         m_handler.setAudioStreamListLocked(true);
@@ -2658,9 +2800,9 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
         m_handler.setKnownSubtitleStreams(subtitleStreams);
     }
 
-    if (addedAudio > 0 || addedSubtitle > 0) {
-        LogMsg(L"MMT/TLV Splitter: mmtsmap tracks merged: audio+%zu subtitle+%zu totalAudio=%zu totalSubtitle=%zu\n",
-               addedAudio, addedSubtitle, audioStreams.size(), subtitleStreams.size());
+    if (addedAudio > 0 || updatedAudio > 0 || addedSubtitle > 0) {
+        LogMsg(L"MMT/TLV Splitter: mmtsmap tracks merged: audio+%zu audio~%zu subtitle+%zu totalAudio=%zu totalSubtitle=%zu\n",
+               addedAudio, updatedAudio, addedSubtitle, audioStreams.size(), subtitleStreams.size());
     }
 
     const auto* active = FindSidecarMapMptChange(sourceTarget);
@@ -3173,6 +3315,499 @@ STDMETHODIMP CMmtTlvSplitter::GetCurFile(LPOLESTR* ppszFileName, AM_MEDIA_TYPE* 
     return S_OK;
 }
 
+static std::wstring AvErrorString(int err)
+{
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_strerror(err, buf, sizeof(buf));
+    const int len = MultiByteToWideChar(CP_UTF8, 0, buf, -1, nullptr, 0);
+    if (len <= 1)
+        return L"unknown";
+    std::wstring out(static_cast<size_t>(len - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, buf, -1, out.data(), len);
+    return out;
+}
+
+struct CMmtTlvSplitter::LatmPcmDecoder {
+    struct PcmFrame {
+        std::vector<uint8_t> data;
+        REFERENCE_TIME pts = -1;
+        REFERENCE_TIME duration = 0;
+    };
+
+    explicit LatmPcmDecoder(int streamIndex)
+        : streamIndex(streamIndex)
+    {
+    }
+
+    int StreamIndex() const { return streamIndex; }
+
+    ~LatmPcmDecoder()
+    {
+        av_channel_layout_uninit(&lastInLayout);
+        if (swr)
+            swr_free(&swr);
+        if (frame)
+            av_frame_free(&frame);
+        if (packet)
+            av_packet_free(&packet);
+        if (latmCtx)
+            avcodec_free_context(&latmCtx);
+        if (adtsCtx)
+            avcodec_free_context(&adtsCtx);
+    }
+
+    bool EnsureOpen(AVCodecID codecId, AVCodecContext*& targetCtx, const wchar_t* codecName)
+    {
+        if (targetCtx)
+            return true;
+
+        const AVCodec* codec = avcodec_find_decoder(codecId);
+        if (!codec) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: %s decoder not found for streamIndex=%d\n",
+                   codecName, streamIndex);
+            return false;
+        }
+
+        targetCtx = avcodec_alloc_context3(codec);
+        if (!packet)
+            packet = av_packet_alloc();
+        if (!frame)
+            frame = av_frame_alloc();
+        if (!targetCtx || !packet || !frame) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: allocation failed for streamIndex=%d\n",
+                   streamIndex);
+            return false;
+        }
+
+        targetCtx->pkt_timebase = AVRational{1, 10000000};
+        const int ret = avcodec_open2(targetCtx, codec, nullptr);
+        if (ret < 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: avcodec_open2 failed codec=%s streamIndex=%d err=%s\n",
+                   codecName, streamIndex, AvErrorString(ret).c_str());
+            return false;
+        }
+
+        LogMsg(L"MMT/TLV LATM PCM decoder: opened %s decoder for streamIndex=%d\n",
+               codecName, streamIndex);
+        return true;
+    }
+
+    void Reset(bool preserveLatmContext = false)
+    {
+        loasBuffer.clear();
+        adtsBuffer.clear();
+        pendingPts = -1;
+        adtsPendingPts = -1;
+        nextPts = -1;
+        if (latmCtx && !preserveLatmContext)
+            avcodec_flush_buffers(latmCtx);
+        if (adtsCtx)
+            avcodec_flush_buffers(adtsCtx);
+        if (swr && !preserveLatmContext)
+            swr_close(swr);
+        currentInputKind = InputKind::Unknown;
+        LogDetail(L"MMT/TLV LATM PCM decoder: reset streamIndex=%d preserveLatm=%d\n",
+                  streamIndex, preserveLatmContext ? 1 : 0);
+    }
+
+    bool Decode(bool, REFERENCE_TIME pts, bool first, bool last,
+                const uint8_t* data, size_t size, std::vector<PcmFrame>& outFrames)
+    {
+        (void)first;
+        (void)last;
+        outFrames.clear();
+        if (!data || size == 0)
+            return true;
+
+        static volatile LONG s_decodeInputs = 0;
+        const LONG inputNo = InterlockedIncrement(&s_decodeInputs);
+        if (inputNo <= 80 || (inputNo % 200) == 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: input #%ld streamIndex=%d size=%zu pts=%I64d ms first=%d last=%d firstBytes=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                   inputNo, streamIndex, size, pts / 10000,
+                   first ? 1 : 0, last ? 1 : 0,
+                   size > 0 ? data[0] : 0,
+                   size > 1 ? data[1] : 0,
+                   size > 2 ? data[2] : 0,
+                   size > 3 ? data[3] : 0,
+                   size > 4 ? data[4] : 0,
+                   size > 5 ? data[5] : 0,
+                   size > 6 ? data[6] : 0,
+                   size > 7 ? data[7] : 0);
+        }
+
+        if (IsAdtsFrame(data, size)) {
+            loasBuffer.clear();
+            pendingPts = -1;
+            if (currentInputKind != InputKind::Adts) {
+                currentInputKind = InputKind::Adts;
+                adtsBuffer.clear();
+                adtsPendingPts = pts;
+                nextPts = pts;
+                LogMsg(L"MMT/TLV LATM PCM decoder: input switched to ADTS streamIndex=%d pts=%I64d ms\n",
+                       streamIndex, pts / 10000);
+            }
+            if (!EnsureOpen(AV_CODEC_ID_AAC, adtsCtx, L"AAC/ADTS"))
+                return false;
+            return DecodeAdts(pts, data, size, outFrames);
+        }
+
+        if (!EnsureOpen(AV_CODEC_ID_AAC_LATM, latmCtx, L"AAC_LATM"))
+            return false;
+        if (currentInputKind != InputKind::Latm) {
+            currentInputKind = InputKind::Latm;
+            loasBuffer.clear();
+            pendingPts = pts;
+            nextPts = pts;
+            LogMsg(L"MMT/TLV LATM PCM decoder: input switched to LATM streamIndex=%d pts=%I64d ms\n",
+                   streamIndex, pts / 10000);
+        }
+
+        if (loasBuffer.empty())
+            pendingPts = pts;
+        loasBuffer.insert(loasBuffer.end(), data, data + size);
+
+        bool ok = true;
+        while (true) {
+            const size_t sync = FindLoasSync();
+            if (sync == (std::numeric_limits<size_t>::max)()) {
+                TrimUnsyncedBuffer();
+                break;
+            }
+            if (sync > 0) {
+                if (droppedSyncBytes < 20) {
+                    LogMsg(L"MMT/TLV LATM PCM decoder: dropped %zu bytes before LOAS sync streamIndex=%d\n",
+                           sync, streamIndex);
+                }
+                ++droppedSyncBytes;
+                loasBuffer.erase(loasBuffer.begin(), loasBuffer.begin() + sync);
+                pendingPts = pts;
+            }
+            if (loasBuffer.size() < 3)
+                break;
+
+            const size_t payloadSize =
+                (static_cast<size_t>(loasBuffer[1] & 0x1F) << 8) | loasBuffer[2];
+            const size_t packetSize = payloadSize + 3;
+            if (payloadSize == 0 || payloadSize > 8191) {
+                if (badHeaderCount < 20) {
+                    LogMsg(L"MMT/TLV LATM PCM decoder: invalid LOAS payload length streamIndex=%d length=%zu firstBytes=%02X %02X %02X\n",
+                           streamIndex, payloadSize, loasBuffer[0], loasBuffer[1], loasBuffer[2]);
+                }
+                ++badHeaderCount;
+                loasBuffer.erase(loasBuffer.begin());
+                pendingPts = pts;
+                continue;
+            }
+            if (loasBuffer.size() < packetSize)
+                break;
+
+            const REFERENCE_TIME packetPts = pendingPts;
+            ok = DecodePacket(latmCtx, loasBuffer.data(), packetSize, packetPts, outFrames) && ok;
+            loasBuffer.erase(loasBuffer.begin(), loasBuffer.begin() + packetSize);
+            pendingPts = nextPts >= 0 ? nextPts : pts;
+        }
+
+        if (loasBuffer.size() > 256 * 1024) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: clearing oversized LOAS buffer streamIndex=%d size=%zu\n",
+                   streamIndex, loasBuffer.size());
+            loasBuffer.clear();
+            pendingPts = -1;
+            return false;
+        }
+        return ok;
+    }
+
+private:
+    static bool IsAdtsFrame(const uint8_t* data, size_t size)
+    {
+        return size >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0;
+    }
+
+    static size_t AdtsFrameSize(const uint8_t* data, size_t size)
+    {
+        if (!IsAdtsFrame(data, size))
+            return 0;
+        return (static_cast<size_t>(data[3] & 0x03) << 11) |
+               (static_cast<size_t>(data[4]) << 3) |
+               ((data[5] & 0xE0) >> 5);
+    }
+
+    bool DecodeAdts(REFERENCE_TIME pts, const uint8_t* data, size_t size,
+                    std::vector<PcmFrame>& outFrames)
+    {
+        if (adtsBuffer.empty())
+            adtsPendingPts = pts;
+        adtsBuffer.insert(adtsBuffer.end(), data, data + size);
+
+        bool ok = true;
+        while (true) {
+            size_t sync = (std::numeric_limits<size_t>::max)();
+            for (size_t i = 0; i + 1 < adtsBuffer.size(); ++i) {
+                if (adtsBuffer[i] == 0xFF && (adtsBuffer[i + 1] & 0xF0) == 0xF0) {
+                    sync = i;
+                    break;
+                }
+            }
+            if (sync == (std::numeric_limits<size_t>::max)()) {
+                if (adtsBuffer.size() > 1) {
+                    const uint8_t last = adtsBuffer.back();
+                    adtsBuffer.clear();
+                    adtsBuffer.push_back(last);
+                }
+                break;
+            }
+            if (sync > 0) {
+                adtsBuffer.erase(adtsBuffer.begin(), adtsBuffer.begin() + sync);
+                adtsPendingPts = pts;
+            }
+            if (adtsBuffer.size() < 7)
+                break;
+
+            const size_t frameSize = AdtsFrameSize(adtsBuffer.data(), adtsBuffer.size());
+            if (frameSize < 7 || frameSize > 8191) {
+                if (badAdtsHeaderCount < 20) {
+                    LogMsg(L"MMT/TLV LATM PCM decoder: invalid ADTS frame length streamIndex=%d length=%zu firstBytes=%02X %02X %02X %02X %02X %02X %02X\n",
+                           streamIndex, frameSize,
+                           adtsBuffer[0], adtsBuffer[1], adtsBuffer[2], adtsBuffer[3],
+                           adtsBuffer[4], adtsBuffer[5], adtsBuffer[6]);
+                }
+                ++badAdtsHeaderCount;
+                adtsBuffer.erase(adtsBuffer.begin());
+                adtsPendingPts = pts;
+                continue;
+            }
+            if (adtsBuffer.size() < frameSize)
+                break;
+
+            const REFERENCE_TIME packetPts = adtsPendingPts;
+            const size_t beforeFrames = outFrames.size();
+            const bool decoded = DecodePacket(adtsCtx, adtsBuffer.data(), frameSize, packetPts, outFrames);
+            adtsBuffer.erase(adtsBuffer.begin(), adtsBuffer.begin() + frameSize);
+            if (outFrames.size() == beforeFrames && packetPts >= 0) {
+                const REFERENCE_TIME fallbackDuration = 1024LL * 10000000LL / kOutputSampleRate;
+                PcmFrame silence;
+                silence.pts = packetPts;
+                silence.duration = fallbackDuration;
+                silence.data.resize(1024 * kOutputChannels * sizeof(int16_t), 0);
+                outFrames.push_back(std::move(silence));
+                nextPts = packetPts + fallbackDuration;
+            }
+            ok = decoded && ok;
+            adtsPendingPts = nextPts >= 0 ? nextPts : pts;
+        }
+
+        if (adtsBuffer.size() > 256 * 1024) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: clearing oversized ADTS buffer streamIndex=%d size=%zu\n",
+                   streamIndex, adtsBuffer.size());
+            adtsBuffer.clear();
+            adtsPendingPts = -1;
+            return false;
+        }
+        return ok;
+    }
+
+    size_t FindLoasSync() const
+    {
+        for (size_t i = 0; i + 1 < loasBuffer.size(); ++i) {
+            if (loasBuffer[i] == 0x56 && (loasBuffer[i + 1] & 0xE0) == 0xE0)
+                return i;
+        }
+        return (std::numeric_limits<size_t>::max)();
+    }
+
+    void TrimUnsyncedBuffer()
+    {
+        if (loasBuffer.size() <= 1)
+            return;
+        const uint8_t last = loasBuffer.back();
+        if (droppedSyncBytes < 20) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: waiting for LOAS sync, dropped %zu bytes streamIndex=%d\n",
+                   loasBuffer.size() - 1, streamIndex);
+        }
+        ++droppedSyncBytes;
+        loasBuffer.clear();
+        loasBuffer.push_back(last);
+    }
+
+    bool DecodePacket(AVCodecContext* decodeCtx, const uint8_t* packetData, size_t packetSize, REFERENCE_TIME packetPts,
+                      std::vector<PcmFrame>& outFrames)
+    {
+        if (!decodeCtx || !packetData || packetSize == 0)
+            return true;
+
+        av_packet_unref(packet);
+        packet->data = const_cast<uint8_t*>(packetData);
+        packet->size = static_cast<int>(packetSize);
+        packet->pts = packetPts;
+        packet->dts = packetPts;
+
+        if (packetPts >= 0)
+            nextPts = packetPts;
+
+        int ret = avcodec_send_packet(decodeCtx, packet);
+        packet->data = nullptr;
+        packet->size = 0;
+        av_packet_unref(packet);
+        if (ret < 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: send failed streamIndex=%d size=%zu pts=%I64d ms firstBytes=%02X %02X %02X err=%s\n",
+                   streamIndex, packetSize, packetPts / 10000,
+                   packetSize > 0 ? packetData[0] : 0,
+                   packetSize > 1 ? packetData[1] : 0,
+                   packetSize > 2 ? packetData[2] : 0,
+                   AvErrorString(ret).c_str());
+            return false;
+        }
+
+        while (true) {
+            ret = avcodec_receive_frame(decodeCtx, frame);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                break;
+            if (ret < 0) {
+                LogMsg(L"MMT/TLV LATM PCM decoder: receive failed streamIndex=%d err=%s\n",
+                       streamIndex, AvErrorString(ret).c_str());
+                return false;
+            }
+
+            PcmFrame pcm;
+            if (ConvertFrame(frame, pcm)) {
+                outFrames.push_back(std::move(pcm));
+                static volatile LONG s_outputFrames = 0;
+                const LONG outNo = InterlockedIncrement(&s_outputFrames);
+                if (outNo <= 40 || (outNo % 100) == 0) {
+                    const auto& last = outFrames.back();
+                    LogMsg(L"MMT/TLV LATM PCM decoder: output #%ld streamIndex=%d bytes=%zu pts=%I64d ms duration=%I64d ms\n",
+                           outNo, streamIndex, last.data.size(), last.pts / 10000, last.duration / 10000);
+                }
+            }
+            av_frame_unref(frame);
+        }
+        return true;
+    }
+
+    bool EnsureResampler(const AVFrame* in)
+    {
+        if (!in || in->nb_samples <= 0)
+            return false;
+
+        AVChannelLayout inLayout{};
+        if (in->ch_layout.nb_channels > 0) {
+            av_channel_layout_copy(&inLayout, &in->ch_layout);
+        } else {
+            av_channel_layout_default(&inLayout, 2);
+        }
+
+        const bool unchanged = swr &&
+            inRate == in->sample_rate &&
+            inFormat == static_cast<AVSampleFormat>(in->format) &&
+            av_channel_layout_compare(&inLayout, &lastInLayout) == 0;
+        if (unchanged) {
+            av_channel_layout_uninit(&inLayout);
+            return true;
+        }
+
+        if (swr)
+            swr_free(&swr);
+        av_channel_layout_uninit(&lastInLayout);
+        av_channel_layout_copy(&lastInLayout, &inLayout);
+        inRate = in->sample_rate;
+        inFormat = static_cast<AVSampleFormat>(in->format);
+
+        AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+        int ret = swr_alloc_set_opts2(&swr,
+                                      &outLayout,
+                                      AV_SAMPLE_FMT_S16,
+                                      kOutputSampleRate,
+                                      &inLayout,
+                                      inFormat,
+                                      inRate,
+                                      0,
+                                      nullptr);
+        av_channel_layout_uninit(&inLayout);
+        if (ret < 0 || !swr) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: swr_alloc failed streamIndex=%d err=%s\n",
+                   streamIndex, AvErrorString(ret).c_str());
+            return false;
+        }
+
+        ret = swr_init(swr);
+        if (ret < 0) {
+            LogMsg(L"MMT/TLV LATM PCM decoder: swr_init failed streamIndex=%d err=%s\n",
+                   streamIndex, AvErrorString(ret).c_str());
+            swr_free(&swr);
+            return false;
+        }
+
+        LogMsg(L"MMT/TLV LATM PCM decoder: resampler configured streamIndex=%d inputChannels=%d inputRate=%d inputFormat=%d output=stereo s16 %dHz\n",
+               streamIndex, lastInLayout.nb_channels, inRate, static_cast<int>(inFormat), kOutputSampleRate);
+        return true;
+    }
+
+    bool ConvertFrame(const AVFrame* in, PcmFrame& pcm)
+    {
+        if (!EnsureResampler(in))
+            return false;
+
+        const int outSamples = swr_get_out_samples(swr, in->nb_samples);
+        if (outSamples <= 0)
+            return false;
+
+        const int outBytes = av_samples_get_buffer_size(nullptr, kOutputChannels,
+                                                       outSamples, AV_SAMPLE_FMT_S16, 1);
+        if (outBytes <= 0)
+            return false;
+
+        pcm.data.resize(static_cast<size_t>(outBytes));
+        uint8_t* outData[1] = { pcm.data.data() };
+        const int converted = swr_convert(swr,
+                                          outData,
+                                          outSamples,
+                                          const_cast<const uint8_t**>(in->extended_data),
+                                          in->nb_samples);
+        if (converted <= 0)
+            return false;
+
+        const int actualBytes = av_samples_get_buffer_size(nullptr, kOutputChannels,
+                                                          converted, AV_SAMPLE_FMT_S16, 1);
+        if (actualBytes <= 0)
+            return false;
+        pcm.data.resize(static_cast<size_t>(actualBytes));
+        pcm.duration = static_cast<REFERENCE_TIME>(converted) * 10000000LL / kOutputSampleRate;
+        const REFERENCE_TIME framePts =
+            (in->pts != AV_NOPTS_VALUE) ? static_cast<REFERENCE_TIME>(in->pts) : nextPts;
+        pcm.pts = framePts;
+        if (nextPts >= 0)
+            nextPts = ((framePts >= 0) ? framePts : nextPts) + pcm.duration;
+        return !pcm.data.empty();
+    }
+
+    static constexpr int kOutputSampleRate = 48000;
+    static constexpr int kOutputChannels = 2;
+    enum class InputKind {
+        Unknown,
+        Latm,
+        Adts,
+    };
+
+    int streamIndex = -1;
+    AVCodecContext* latmCtx = nullptr;
+    AVCodecContext* adtsCtx = nullptr;
+    AVPacket* packet = nullptr;
+    AVFrame* frame = nullptr;
+    SwrContext* swr = nullptr;
+    AVChannelLayout lastInLayout{};
+    int inRate = 0;
+    AVSampleFormat inFormat = AV_SAMPLE_FMT_NONE;
+    std::vector<uint8_t> loasBuffer;
+    std::vector<uint8_t> adtsBuffer;
+    REFERENCE_TIME pendingPts = -1;
+    REFERENCE_TIME adtsPendingPts = -1;
+    REFERENCE_TIME nextPts = -1;
+    InputKind currentInputKind = InputKind::Unknown;
+    unsigned droppedSyncBytes = 0;
+    unsigned badHeaderCount = 0;
+    unsigned badAdtsHeaderCount = 0;
+};
+
 // ---------------------------------------------------------------------------
 // Pin management
 // ---------------------------------------------------------------------------
@@ -3180,6 +3815,8 @@ void CMmtTlvSplitter::CreatePins()
 {
     for (auto* p : m_pins) delete p;
     m_pins.clear();
+    m_latmPcmDecoders.clear();
+    m_limitAudioToSelected = false;
 
     HRESULT hr = S_OK;
     m_pins.push_back(new CMmtTlvOutputPin(true,  &hr, this, &m_pinLock, L"Video"));
@@ -3192,28 +3829,70 @@ void CMmtTlvSplitter::CreatePins()
             LogMsg(L"MMT/TLV Splitter: CreatePins skipped Audio pins because audio is unsupported\n");
         }
     } else {
+        int preferredPcmAudioStreamIndex = -1;
+        bool hasLatmPcmAudio = false;
+        for (const auto& info : audioStreams) {
+            if (ShouldDecodeLatmToPcm(info.latm, info.channels)) {
+                hasLatmPcmAudio = true;
+                preferredPcmAudioStreamIndex = info.streamIndex;
+                break;
+            }
+        }
+        const bool limitToLatmPcm = hasLatmPcmAudio && audioStreams.size() == 1;
+        m_limitAudioToSelected = limitToLatmPcm;
         for (size_t i = 0; i < audioStreams.size(); ++i) {
-            WCHAR pinName[64];
-            StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Audio %zu", i + 1);
+            const bool decodeLatmToPcm =
+                ShouldDecodeLatmToPcm(audioStreams[i].latm, audioStreams[i].channels);
+            if (limitToLatmPcm && !decodeLatmToPcm)
+                continue;
+
+            WCHAR pinName[128];
+            const std::wstring sourceLabel = AudioTimelineLabel(audioStreams[i]);
+            StringCchPrintfW(pinName, ARRAYSIZE(pinName), L"Audio %zu %s",
+                             i + 1, sourceLabel.c_str());
             auto* pin = new CMmtTlvOutputPin(false, &hr, this, &m_pinLock,
                                              pinName, audioStreams[i].streamIndex);
-            if (audioStreams[i].samplingRate > 0)
+            if (decodeLatmToPcm) {
+                pin->SetPcmAudioInfo(48000, 2, 16);
+                m_latmPcmDecoders.push_back(
+                    std::make_unique<LatmPcmDecoder>(audioStreams[i].streamIndex));
+            } else if (audioStreams[i].samplingRate > 0) {
                 pin->SetAudioInfo(static_cast<int>(audioStreams[i].samplingRate),
                                   audioStreams[i].channels,
                                   16,
                                   audioStreams[i].latm,
                                   audioStreams[i].extraData);
-            pin->SetTrackName(audioStreams[i].latm ? L"AAC LATM 22.2ch" : L"AAC ADTS");
+            }
+            WCHAR trackName[128];
+            if (decodeLatmToPcm) {
+                StringCchPrintfW(trackName, ARRAYSIZE(trackName),
+                                 L"%s -> PCM 2.0",
+                                 sourceLabel.c_str());
+            } else {
+                StringCchPrintfW(trackName, ARRAYSIZE(trackName),
+                                 L"%s",
+                                 sourceLabel.c_str());
+            }
+            pin->SetTrackName(trackName);
             m_pins.push_back(pin);
-            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, format=%s, channels=%u, extra=%zu\n",
+            LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, format=%s, channels=%u, output=%s, extra=%zu\n",
                    pinName,
                    audioStreams[i].streamIndex,
                    audioStreams[i].packetId,
                    audioStreams[i].componentTag,
                    audioStreams[i].latm ? L"LATM" : L"ADTS",
                    audioStreams[i].channels,
+                   decodeLatmToPcm ? L"PCM stereo" : L"passthrough",
                    audioStreams[i].extraData.size());
         }
+        if (preferredPcmAudioStreamIndex >= 0)
+            m_handler.selectAudioStreamByStreamIndex(preferredPcmAudioStreamIndex);
+        if (limitToLatmPcm)
+            LogMsg(L"MMT/TLV Splitter: CreatePins limited audio outputs to LATM PCM streamIndex=%d\n",
+                   preferredPcmAudioStreamIndex);
+        else if (hasLatmPcmAudio)
+            LogMsg(L"MMT/TLV Splitter: CreatePins kept non-LATM audio outputs alongside LATM PCM streamIndex=%d\n",
+                   preferredPcmAudioStreamIndex);
     }
     constexpr bool kEnableSubtitlePins = true;
     auto subtitleStreams = m_handler.getSubtitleStreams();
@@ -3296,6 +3975,8 @@ void CMmtTlvSplitter::CreatePins()
             }
             if (last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
+            if (last && normDts >= 0)
+                m_currentDts.store(normDts, std::memory_order_relaxed);
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
@@ -3306,6 +3987,11 @@ void CMmtTlvSplitter::CreatePins()
     m_handler.setAudioCallback(
         [this](int streamIndex, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
+            const int selectedStreamIndex = m_handler.getSelectedAudioStreamIndex();
+            const bool useSelectedAudioOnly = m_limitAudioToSelected;
+            if (useSelectedAudioOnly && selectedStreamIndex >= 0 && selectedStreamIndex != streamIndex)
+                return;
+
             REFERENCE_TIME normPts, normDts;
             if (IsMultiSegment()) {
                 if (!EditMapPts(pts, normPts))
@@ -3323,7 +4009,24 @@ void CMmtTlvSplitter::CreatePins()
             for (auto* pin : m_pins) {
                 if (pin->IsAudio() &&
                     (pin->AudioStreamIndex() == -1 || pin->AudioStreamIndex() == streamIndex)) {
-                    pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
+                    LatmPcmDecoder* decoder = nullptr;
+                    for (const auto& candidate : m_latmPcmDecoders) {
+                        if (candidate && candidate->StreamIndex() == streamIndex) {
+                            decoder = candidate.get();
+                            break;
+                        }
+                    }
+                    if (decoder) {
+                        std::vector<LatmPcmDecoder::PcmFrame> frames;
+                                    if (decoder->Decode(key, samplePts, first, last, d, sz, frames)) {
+                            for (const auto& frame : frames) {
+                                pin->DeliverSample(true, frame.pts, frame.pts, true, true,
+                                                   frame.data.data(), frame.data.size());
+                            }
+                        }
+                    } else {
+                        pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
+                    }
                     delivered = true;
                 }
             }
@@ -3331,6 +4034,37 @@ void CMmtTlvSplitter::CreatePins()
                 LogMsg(L"AUDIO CALLBACK: no pin for streamIndex=%d, pts=%I64d ms\n",
                        streamIndex, normPts / 10000);
             }
+        });
+
+    m_handler.setProgramStartCallback(
+        [this](long long programStartRt) {
+            const REFERENCE_TIME oldStart = m_subtitleProgramStartRt.exchange(
+                programStartRt, std::memory_order_acq_rel);
+            m_subtitleAwaitProgramStart.store(false, std::memory_order_release);
+            if (oldStart != programStartRt) {
+                LogMsg(L"SUBTITLE EIT program start updated: old=%I64d ms, new=%I64d ms\n",
+                       oldStart / 10000,
+                       programStartRt / 10000);
+            }
+            ProcessDeferredSubtitleSamples();
+        });
+
+    m_handler.setNtpCallback(
+        [this](long long ntpRt) {
+            const REFERENCE_TIME mediaRt = SubtitleTimingAnchor();
+            m_subtitleNtpRt.store(ntpRt, std::memory_order_release);
+            m_subtitleNtpMediaRt.store(mediaRt, std::memory_order_release);
+            m_subtitleAwaitNtp.store(false, std::memory_order_release);
+            static volatile LONG s_ntpLogCount = 0;
+            LONG logNo = InterlockedIncrement(&s_ntpLogCount);
+            if (logNo <= 40 || m_subtitleAwaitProgramStart.load(std::memory_order_acquire)) {
+                LogDetail(L"SUBTITLE NTP anchor #%ld: ntp=%I64d ms, media=%I64d ms, current=%I64d ms\n",
+                          logNo,
+                          ntpRt / 10000,
+                          mediaRt / 10000,
+                          m_currentPts.load(std::memory_order_acquire) / 10000);
+            }
+            ProcessDeferredSubtitleSamples();
         });
 
     m_handler.setSubtitleCallback(
@@ -3344,6 +4078,27 @@ void CMmtTlvSplitter::CreatePins()
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
             DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
+
+            const bool waitingForProgramStart =
+                m_subtitleAwaitProgramStart.load(std::memory_order_acquire) &&
+                m_subtitleProgramStartRt.load(std::memory_order_acquire) < 0;
+            if (cue.hasBegin && waitingForProgramStart) {
+                DeferredSubtitleSample sample;
+                sample.streamIndex = streamIndex;
+                sample.pts = pts;
+                sample.callbackNo = callbackNo;
+                sample.data.assign(d, d + sz);
+                m_deferredSubtitleSamples.push_back(std::move(sample));
+                if (m_deferredSubtitleSamples.size() > 32)
+                    m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
+                LogDetail(L"SUBTITLE CALLBACK deferred for EIT: callback=%ld streamIndex=%d waitEit=%d ttmlBegin=%I64d ms size=%zu\n",
+                          callbackNo,
+                          streamIndex,
+                          waitingForProgramStart ? 1 : 0,
+                          cue.begin / 10000,
+                          sz);
+                return;
+            }
 
             if (cue.missingGlyph && !cue.text.empty()) {
                 DeferredSubtitleSample sample;
@@ -3401,15 +4156,16 @@ void CMmtTlvSplitter::CreatePins()
             REFERENCE_TIME sampleStop;
             bool repeatUntilNextCue = false;
             if (cue.hasBegin) {
-                const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin);
-                sampleStart = cue.begin - subtitleTimeOffset;
+                const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
+                const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
+                sampleStart = sourceBegin - subtitleTimeOffset;
                 if (cue.hasEnd) {
-                    sampleStop = cue.end - subtitleTimeOffset;
+                    sampleStop = SubtitleSourceTime(cue.end) - subtitleTimeOffset;
                 } else {
                     REFERENCE_TIME nextBegin = -1;
                     const long long lookaheadOffset = m_demuxByteOffset.load(std::memory_order_acquire);
                     if (FindNextSubtitleBegin(streamIndex, cue.begin, lookaheadOffset, nextBegin)) {
-                        sampleStop = nextBegin - subtitleTimeOffset;
+                        sampleStop = SubtitleSourceTime(nextBegin) - subtitleTimeOffset;
                         LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d\n",
                                   streamIndex,
                                   cue.begin / 10000,
@@ -3427,11 +4183,8 @@ void CMmtTlvSplitter::CreatePins()
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
                 sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
             } else {
-                // No TTML begin: subtitles have no PTS, so anchor to the current
-                // video position rather than the (always invalid) sample PTS.
-                REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
-                if (anchor < 0)
-                    anchor = 0;
+                // No TTML begin: use the same stable anchor as timed cues.
+                REFERENCE_TIME anchor = SubtitleTimingAnchor();
                 sampleStart = ToSegmentTime(anchor, m_segmentStart);
                 sampleStop = sampleStart + kDefaultSubtitleDuration;
             }
@@ -3500,39 +4253,119 @@ REFERENCE_TIME CMmtTlvSplitter::GetSegmentTimeOffset() const
     return m_segmentTimeOffset.load(std::memory_order_acquire);
 }
 
-REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin)
+REFERENCE_TIME CMmtTlvSplitter::SubtitleTimingAnchor() const
 {
-    // Subtitle samples have no PTS, so anchor TTML times to the current video
-    // position. offset maps TTML begin -> normalized media time:
-    //   mediaStart = ttmlBegin - offset
-    REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
+    REFERENCE_TIME anchor = m_currentDts.load(std::memory_order_acquire);
+    if (anchor < 0)
+        anchor = m_currentPts.load(std::memory_order_acquire);
     if (anchor < 0)
         anchor = 0;
+    return anchor;
+}
+
+REFERENCE_TIME CMmtTlvSplitter::SubtitleSourceTime(REFERENCE_TIME ttmlTime, REFERENCE_TIME* programStartRt) const
+{
+    const REFERENCE_TIME start = m_subtitleProgramStartRt.load(std::memory_order_acquire);
+    if (programStartRt)
+        *programStartRt = start;
+    if (start >= 0)
+        return start + ttmlTime;
+    return ttmlTime;
+}
+
+REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, REFERENCE_TIME sourceBegin)
+{
+    // Subtitle samples have no MFU PTS, so synthesize a source timeline from
+    // EIT program start + TTML begin when possible. If an NTP/PCR anchor is
+    // available, calibrate like dantto4k: align the first cue of each program
+    // to the latest PCR-derived media time and keep that offset for TTML spacing.
+    // offset maps subtitle source time
+    // -> normalized media time:
+    //   mediaStart = sourceBegin - offset
+    const REFERENCE_TIME anchor = SubtitleTimingAnchor();
+    const REFERENCE_TIME programStartRt = m_subtitleProgramStartRt.load(std::memory_order_acquire);
+    const REFERENCE_TIME ntpRt = m_subtitleNtpRt.load(std::memory_order_acquire);
+    const REFERENCE_TIME ntpMediaRt = m_subtitleNtpMediaRt.load(std::memory_order_acquire);
+    const bool canUseNtp = (programStartRt >= 0 && ntpRt >= 0 && ntpMediaRt >= 0);
 
     REFERENCE_TIME offset = m_subtitleTimeOffset.load(std::memory_order_acquire);
     bool valid = m_subtitleOffsetValid.load(std::memory_order_acquire);
+    bool usesNtp = m_subtitleOffsetUsesNtp.load(std::memory_order_acquire);
 
     if (valid) {
-        // Detect a TTML timeline jump (e.g. a program boundary): with a stale
-        // offset the cue would be scheduled far in the past or far ahead of the
-        // current playback position. Re-sync so it shows at "now" instead.
-        const REFERENCE_TIME candidate = ttmlBegin - offset;
-        if (candidate < anchor - kSubtitleResyncBackTolerance ||
-            candidate > anchor + kSubtitleResyncAheadTolerance) {
-            LogMsg(L"SUBTITLE timing resync: oldOffset=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
-                   offset / 10000, candidate / 10000, anchor / 10000, ttmlBegin / 10000);
+        // Detect a TTML timeline reset (e.g. a program boundary). With the
+        // cached offset, normal cue times can be far from the current delivered
+        // video PTS, so only a clear TTML begin rollback is a resync signal.
+        const REFERENCE_TIME candidate = sourceBegin - offset;
+        const REFERENCE_TIME lastTtmlBegin = m_lastSubtitleTtmlBegin.load(std::memory_order_acquire);
+        const REFERENCE_TIME calibratedProgramStart =
+            m_subtitleOffsetProgramStartRt.load(std::memory_order_acquire);
+        if (programStartRt >= 0 && calibratedProgramStart != programStartRt) {
+            LogMsg(L"SUBTITLE timing resync: programStart changed old=%I64d ms, new=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
+                   calibratedProgramStart / 10000,
+                   programStartRt / 10000,
+                   candidate / 10000,
+                   anchor / 10000,
+                   ttmlBegin / 10000);
             valid = false;
+        }
+        if (canUseNtp && !usesNtp) {
+            LogMsg(L"SUBTITLE timing resync: switching to NTP anchor oldOffset=%I64d ms, ntp=%I64d ms, ntpMedia=%I64d ms, ttmlBegin=%I64d ms\n",
+                   offset / 10000,
+                   ntpRt / 10000,
+                   ntpMediaRt / 10000,
+                   ttmlBegin / 10000);
+            valid = false;
+        }
+        if (lastTtmlBegin >= 0 && ttmlBegin + kSubtitleResyncBackTolerance < lastTtmlBegin) {
+            LogMsg(L"SUBTITLE timing resync: oldOffset=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, current=%I64d ms, programStart=%I64d ms, lastTtmlBegin=%I64d ms, ttmlBegin=%I64d ms\n",
+                   offset / 10000,
+                   candidate / 10000,
+                   anchor / 10000,
+                   m_currentPts.load(std::memory_order_acquire) / 10000,
+                   programStartRt / 10000,
+                   lastTtmlBegin / 10000,
+                   ttmlBegin / 10000);
+            valid = false;
+        }
+        if (valid) {
+            const REFERENCE_TIME drift = candidate - anchor;
+            if (drift > kSubtitleDriftCorrectionTolerance) {
+                LogMsg(L"SUBTITLE timing drift correction: oldOffset=%I64d ms, drift=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, programStart=%I64d ms, ttmlBegin=%I64d ms\n",
+                       offset / 10000,
+                       drift / 10000,
+                       candidate / 10000,
+                       anchor / 10000,
+                       programStartRt / 10000,
+                       ttmlBegin / 10000);
+                valid = false;
+            }
         }
     }
 
     if (!valid) {
-        offset = ttmlBegin - anchor;
+        const REFERENCE_TIME baseAnchor = canUseNtp ? ntpMediaRt : anchor;
+        offset = sourceBegin - baseAnchor;
         m_subtitleTimeOffset.store(offset, std::memory_order_release);
+        m_subtitleOffsetProgramStartRt.store(programStartRt, std::memory_order_release);
+        m_subtitleOffsetUsesNtp.store(canUseNtp, std::memory_order_release);
         m_subtitleOffsetValid.store(true, std::memory_order_release);
-        LogMsg(L"SUBTITLE timing base set: ttmlOffset=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
-               offset / 10000, anchor / 10000, ttmlBegin / 10000);
+        LogMsg(L"SUBTITLE timing base set: sourceOffset=%I64d ms, anchor=%I64d ms, current=%I64d ms, currentDts=%I64d ms, segmentStart=%I64d ms, rapOffset=%I64d ms, programStart=%I64d ms, ntp=%I64d ms, ntpMedia=%I64d ms, useNtp=%d, ttmlBegin=%I64d ms, sourceBegin=%I64d ms\n",
+               offset / 10000,
+               baseAnchor / 10000,
+               m_currentPts.load(std::memory_order_acquire) / 10000,
+               m_currentDts.load(std::memory_order_acquire) / 10000,
+               m_segmentStart / 10000,
+               m_segmentTimeOffset.load(std::memory_order_acquire) / 10000,
+               programStartRt / 10000,
+               ntpRt / 10000,
+               ntpMediaRt / 10000,
+               canUseNtp ? 1 : 0,
+               ttmlBegin / 10000,
+               sourceBegin / 10000);
     }
 
+    m_lastSubtitleTtmlBegin.store(ttmlBegin, std::memory_order_release);
     return offset;
 }
 
@@ -3666,6 +4499,15 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
     for (const auto& sample : m_deferredSubtitleSamples) {
         TtmlDebugStats stats;
         TtmlTextCue cue = ExtractTtmlPlainText(sample.data.data(), sample.data.size(), stats, sample.streamIndex);
+        if (cue.hasBegin) {
+            const bool waitingForProgramStart =
+                m_subtitleAwaitProgramStart.load(std::memory_order_acquire) &&
+                m_subtitleProgramStartRt.load(std::memory_order_acquire) < 0;
+            if (waitingForProgramStart) {
+                remaining.push_back(sample);
+                continue;
+            }
+        }
         if (cue.missingGlyph) {
             remaining.push_back(sample);
             continue;
@@ -3676,16 +4518,16 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
         REFERENCE_TIME sampleStart = 0;
         REFERENCE_TIME sampleStop = 0;
         if (cue.hasBegin) {
-            const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin);
-            sampleStart = cue.begin - subtitleTimeOffset;
-            sampleStop = cue.hasEnd ? cue.end - subtitleTimeOffset : sampleStart + kDefaultSubtitleDuration;
+            const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
+            const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
+            sampleStart = sourceBegin - subtitleTimeOffset;
+            sampleStop = cue.hasEnd ? SubtitleSourceTime(cue.end) - subtitleTimeOffset
+                                    : sampleStart + kDefaultSubtitleDuration;
             sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
             sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
         } else {
-            // No TTML begin / no subtitle PTS: anchor to the current video position.
-            REFERENCE_TIME anchor = m_currentPts.load(std::memory_order_acquire);
-            if (anchor < 0)
-                anchor = 0;
+            // No TTML begin: use the same stable anchor as timed cues.
+            REFERENCE_TIME anchor = SubtitleTimingAnchor();
             sampleStart = ToSegmentTime(anchor, m_segmentStart);
             sampleStop = sampleStart + kDefaultSubtitleDuration;
         }
@@ -3883,9 +4725,21 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
 
     for (auto* pin : m_pins)
         pin->ResetForSeek();
+    for (const auto& decoder : m_latmPcmDecoders)
+        if (decoder)
+            decoder->Reset(true);
 
     m_seekTarget = pos;
     m_currentPts = pos;   // normalised position (0-based)
+    m_currentDts = -1;
+    m_subtitleProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitProgramStart.store(pos > 0, std::memory_order_release);
+    m_subtitleNtpRt.store(-1, std::memory_order_release);
+    m_subtitleNtpMediaRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitNtp.store(false, std::memory_order_release);
+    m_subtitleOffsetProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleOffsetUsesNtp.store(false, std::memory_order_release);
+    m_subtitleOffsetValid.store(false, std::memory_order_release);
     ClearPendingSubtitleCues();
 
     // Keep stream registration intact across seek so video starts faster.
@@ -3931,7 +4785,15 @@ void CMmtTlvSplitter::DemuxLoop()
     }
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
+    m_subtitleProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitProgramStart.store(sourceSeekTarget > 0, std::memory_order_release);
+    m_subtitleNtpRt.store(-1, std::memory_order_release);
+    m_subtitleNtpMediaRt.store(-1, std::memory_order_release);
+    m_subtitleAwaitNtp.store(false, std::memory_order_release);
     m_subtitleTimeOffset.store(0, std::memory_order_release);
+    m_lastSubtitleTtmlBegin.store(-1, std::memory_order_release);
+    m_subtitleOffsetProgramStartRt.store(-1, std::memory_order_release);
+    m_subtitleOffsetUsesNtp.store(false, std::memory_order_release);
     m_subtitleOffsetValid.store(false, std::memory_order_release);
     ClearPendingSubtitleCues();
     const bool waitForRap = sourceSeekTarget > 0;
@@ -4056,6 +4918,9 @@ void CMmtTlvSplitter::DemuxLoop()
                 m_demuxByteOffset.store(bufferOffset, std::memory_order_release);
                 m_demuxer.resetStreams();
                 m_handler.reset();
+                for (const auto& decoder : m_latmPcmDecoders)
+                    if (decoder)
+                        decoder->Reset();
                 m_waitingForVideoRap.store(true, std::memory_order_release);
                 for (auto* pin : m_pins)
                     if (pin->IsVideo())
@@ -4235,6 +5100,7 @@ STDMETHODIMP CMmtTlvSplitter::SetPositions(
         } else {
             m_seekTarget = pos;
             m_currentPts = pos;
+            m_currentDts = -1;
         }
         *pCurrent = pos;
     }
@@ -4317,12 +5183,13 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
     if (plcid) *plcid = 0;
     if (pdwGroup) *pdwGroup = 1;
     if (ppszName) {
-        WCHAR formatName[16];
-        StringCchCopyW(formatName, ARRAYSIZE(formatName), info.latm ? L"LATM" : L"ADTS");
-        WCHAR buf[160];
+        const bool pcmOutput = ShouldDecodeLatmToPcm(info.latm, info.channels);
+        const std::wstring sourceLabel = AudioTimelineLabel(info);
+        WCHAR buf[256];
         StringCchPrintfW(buf, ARRAYSIZE(buf),
-                         L"Audio %ld %s %uch (stream %d, component %d)",
-                         lIndex + 1, formatName, info.channels,
+                         L"Audio %ld %s%s (stream %d, component %d)",
+                         lIndex + 1, sourceLabel.c_str(),
+                         pcmOutput ? L" -> PCM 2.0" : L"",
                          info.streamIndex, info.componentTag);
         const size_t chars = wcslen(buf) + 1;
         *ppszName = static_cast<LPWSTR>(CoTaskMemAlloc(chars * sizeof(WCHAR)));

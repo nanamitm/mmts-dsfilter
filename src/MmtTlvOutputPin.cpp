@@ -3,6 +3,7 @@
 #include "MmtTlvSplitter.h"
 #include "Guids.h"
 #include <dvdmedia.h>   // VIDEOINFOHEADER2
+#include <algorithm>
 #include <atomic>
 
 struct SUBTITLEINFO {
@@ -202,22 +203,24 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
         }
     } else if (IsAudio()) {
         pmt->SetType(&MEDIATYPE_Audio);
-        pmt->SetSubtype(m_audioLatm ? &MEDIASUBTYPE_MPEG_LOAS : &MEDIASUBTYPE_RAW_AAC1);
+        pmt->SetSubtype(m_audioPcm ? &MEDIASUBTYPE_PCM :
+                        (m_audioLatm ? &MEDIASUBTYPE_MPEG_LOAS : &MEDIASUBTYPE_RAW_AAC1));
         pmt->SetFormatType(&FORMAT_WaveFormatEx);
 
-        const ULONG extraSize = static_cast<ULONG>(m_audioLatm ? m_audioExtraData.size() : 0);
+        const ULONG extraSize = static_cast<ULONG>((m_audioLatm && !m_audioPcm) ? m_audioExtraData.size() : 0);
         const ULONG fmtSize = sizeof(WAVEFORMATEX) + extraSize;
         WAVEFORMATEX* wf = reinterpret_cast<WAVEFORMATEX*>(
             pmt->AllocFormatBuffer(fmtSize));
         if (!wf) return E_OUTOFMEMORY;
         ZeroMemory(wf, fmtSize);
 
-        wf->wFormatTag      = m_audioLatm ? 0x1602 : 0x00FF;  // WAVE_FORMAT_MPEG_LOAS / WAVE_FORMAT_RAW_AAC1
+        wf->wFormatTag      = m_audioPcm ? WAVE_FORMAT_PCM :
+                              (m_audioLatm ? 0x1602 : 0x00FF);  // WAVE_FORMAT_MPEG_LOAS / WAVE_FORMAT_RAW_AAC1
         wf->nChannels       = static_cast<WORD>(m_channels);
         wf->nSamplesPerSec  = static_cast<DWORD>(m_sampleRate);
         wf->wBitsPerSample  = static_cast<WORD>(m_bitdepth);
-        wf->nBlockAlign     = 1;
-        wf->nAvgBytesPerSec = 0;
+        wf->nBlockAlign     = m_audioPcm ? static_cast<WORD>((m_channels * m_bitdepth) / 8) : 1;
+        wf->nAvgBytesPerSec = m_audioPcm ? wf->nSamplesPerSec * wf->nBlockAlign : 0;
         wf->cbSize          = static_cast<WORD>(extraSize);
 
         if (extraSize > 0) {
@@ -262,7 +265,12 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
     }
 
     pmt->SetTemporalCompression(IsVideo() ? TRUE : FALSE);
-    pmt->SetVariableSize();
+    if (IsAudio() && m_audioPcm) {
+        const LONG blockAlign = (std::max)(1, (m_channels * m_bitdepth) / 8);
+        pmt->SetSampleSize(blockAlign);
+    } else {
+        pmt->SetVariableSize();
+    }
     return S_OK;
 }
 
@@ -273,13 +281,41 @@ HRESULT CMmtTlvOutputPin::CheckMediaType(const CMediaType* pmt)
         if (*pmt->Subtype() != MEDIASUBTYPE_HEVC)  return VFW_E_TYPE_NOT_ACCEPTED;
     } else if (IsAudio()) {
         if (*pmt->Type()    != MEDIATYPE_Audio)       return VFW_E_TYPE_NOT_ACCEPTED;
-        if (*pmt->Subtype() != (m_audioLatm ? MEDIASUBTYPE_MPEG_LOAS : MEDIASUBTYPE_RAW_AAC1))
+        const GUID expectedSubtype = m_audioPcm ? MEDIASUBTYPE_PCM :
+                                     (m_audioLatm ? MEDIASUBTYPE_MPEG_LOAS : MEDIASUBTYPE_RAW_AAC1);
+        if (*pmt->Subtype() != expectedSubtype)
             return VFW_E_TYPE_NOT_ACCEPTED;
     } else {
         if (*pmt->Type()    != MEDIATYPE_Subtitle) return VFW_E_TYPE_NOT_ACCEPTED;
         if (*pmt->Subtype() != MEDIASUBTYPE_ASS)   return VFW_E_TYPE_NOT_ACCEPTED;
     }
     return S_OK;
+}
+
+HRESULT CMmtTlvOutputPin::CompleteConnect(IPin* pReceivePin)
+{
+    HRESULT hr = CBaseOutputPin::CompleteConnect(pReceivePin);
+    if (FAILED(hr))
+        return hr;
+
+    if (IsAudio() && m_Connected) {
+        CMediaType mt;
+        if (SUCCEEDED(ConnectionMediaType(&mt))) {
+            const WAVEFORMATEX* wf = reinterpret_cast<const WAVEFORMATEX*>(mt.Format());
+            LogPinMsg(L"MMT/TLV Audio CompleteConnect: streamIndex=%d output=%s subtype=%08lX channels=%u rate=%lu bits=%u block=%u avg=%lu fixed=%d sampleSize=%lu\n",
+                      m_audioStreamIndex,
+                      m_audioPcm ? L"PCM" : (m_audioLatm ? L"LATM" : L"ADTS"),
+                      mt.Subtype()->Data1,
+                      wf ? wf->nChannels : 0,
+                      wf ? wf->nSamplesPerSec : 0,
+                      wf ? wf->wBitsPerSample : 0,
+                      wf ? wf->nBlockAlign : 0,
+                      wf ? wf->nAvgBytesPerSec : 0,
+                      mt.IsFixedSize() ? 1 : 0,
+                      mt.GetSampleSize());
+        }
+    }
+    return hr;
 }
 
 HRESULT CMmtTlvOutputPin::DecideBufferSize(IMemAllocator* pAlloc, ALLOCATOR_PROPERTIES* pprop)
@@ -289,7 +325,7 @@ HRESULT CMmtTlvOutputPin::DecideBufferSize(IMemAllocator* pAlloc, ALLOCATOR_PROP
     const bool isSubtitle = IsSubtitle();
     pprop->cbBuffer = isVideo
         ? 16 * 1024 * 1024
-        : (isSubtitle ? 256 * 1024 : 64 * 1024);
+        : (isSubtitle ? 256 * 1024 : (m_audioPcm ? 256 * 1024 : 64 * 1024));
     pprop->cBuffers  = isVideo ? 32 : 64;
     pprop->cbAlign   = 1;
     pprop->cbPrefix  = 0;
@@ -530,6 +566,13 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         REFERENCE_TIME rtEnd;
         if (m_isVideo) {
             rtEnd = rtStart + 166667; // 60fps duration in 100ns units
+        } else if (m_audioPcm) {
+            const int blockAlign = (std::max)(1, (m_channels * m_bitdepth) / 8);
+            const size_t samples = m_accum.size() / static_cast<size_t>(blockAlign);
+            const REFERENCE_TIME rtDuration = (m_sampleRate > 0)
+                ? static_cast<REFERENCE_TIME>(samples * 10000000LL / m_sampleRate)
+                : 0;
+            rtEnd = rtStart + rtDuration;
         } else {
             // Calculate correct audio frame duration (1024 samples at m_sampleRate) to avoid gaps
             REFERENCE_TIME rtDuration = (m_sampleRate > 0)
@@ -642,7 +685,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
                       sampleNo,
                       hr,
                       m_audioStreamIndex,
-                      m_audioLatm ? L"LATM" : L"ADTS",
+                      m_audioPcm ? L"PCM" : (m_audioLatm ? L"LATM" : L"ADTS"),
                       m_channels,
                       m_accum.size(),
                       m_accumPts / 10000,

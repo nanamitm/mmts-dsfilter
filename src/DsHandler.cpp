@@ -2,12 +2,17 @@
 #include "DebugLog.h"
 #include "mmtStream.h"
 #include "mpt.h"
+#include "mhEit.h"
+#include "ntp.h"
 #include "mmtDescriptors.h"
 #include "mhStreamIdentificationDescriptor.h"
 #include "mhAudioComponentDescriptor.h"
 #include "mpuProcessorBase.h"  // NOPTS_VALUE
+#include "timeUtil.h"
 #include <windows.h>
+#include <strsafe.h>
 #include <algorithm>
+#include <ctime>
 
 #define LogMsg MmtTlvLogInfo
 #define LogDetail MmtTlvLogDebug
@@ -15,6 +20,42 @@
 static bool IsCaptionComponentTag(int componentTag)
 {
     return componentTag >= 0x30 && componentTag <= 0x37;
+}
+
+static uint16_t AudioModeToChannels(uint8_t audioMode)
+{
+    switch (audioMode) {
+    case 0b00001: return 1;   // single mono
+    case 0b00010: return 2;   // dual mono
+    case 0b00011: return 2;   // stereo
+    case 0b00100: return 3;   // 2/1
+    case 0b00101: return 3;   // 3ch
+    case 0b00110: return 4;   // 2/2
+    case 0b00111: return 4;   // 4ch
+    case 0b01000: return 5;   // 5ch
+    case 0b01001: return 6;   // 5.1ch
+    case 0b01010: return 7;   // 3/3.1
+    case 0b01011: return 7;   // 6.1ch
+    case 0b01100:
+    case 0b01101:
+    case 0b01110:
+    case 0b01111: return 8;   // 7.1ch variants
+    case 0b10000: return 12;  // 10.2ch
+    case 0b10001: return 24;  // 22.2ch
+    default: return 2;
+    }
+}
+
+static long long Pcr27ToRefTime(int64_t pcr27)
+{
+    if (pcr27 < 0)
+        return -1;
+    return static_cast<long long>((static_cast<double>(pcr27) * 10000000.0) / 27000000.0);
+}
+
+static uint16_t AudioDescriptorChannels(const MmtTlv::MhAudioComponentDescriptor& audio)
+{
+    return AudioModeToChannels(audio.getAudioMode());
 }
 
 long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream& stream)
@@ -65,7 +106,10 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
     info.packetId = stream.getPacketId();
     info.componentTag = stream.getComponentTag();
     info.samplingRate = stream.getSamplingRate();
-    info.channels = stream.is22_2chAudio() ? 24 : 2;
+    if (auto desc = stream.getMhAudioComponentDescriptor())
+        info.channels = AudioDescriptorChannels(desc->get());
+    else
+        info.channels = stream.is22_2chAudio() ? 24 : 2;
     info.latm = stream.is22_2chAudio();
     m_audioStreams.push_back(info);
     LogDetail(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u\n",
@@ -233,7 +277,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                     const auto* audio = static_cast<const MmtTlv::MhAudioComponentDescriptor*>(descriptor.get());
                     info.componentTag = audio->componentTag;
                     info.samplingRate = audio->getConvertedSamplingRate();
-                    info.channels = audio->is22_2chAudio() ? 24 : 2;
+                    info.channels = AudioDescriptorChannels(*audio);
                     info.latm = audio->is22_2chAudio();
                     break;
                 }
@@ -494,6 +538,21 @@ bool CFilterDemuxerHandler::selectAudioStreamByListIndex(size_t listIndex)
     return true;
 }
 
+bool CFilterDemuxerHandler::selectAudioStreamByStreamIndex(int streamIndex)
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [streamIndex](const AudioStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (it == m_audioStreams.end())
+        return false;
+
+    m_primaryAudioStreamIndex = streamIndex;
+    LogMsg(L"MMT/TLV Audio selected by streamIndex=%d\n", m_primaryAudioStreamIndex);
+    return true;
+}
+
 void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
     if (!m_videoCallback || mfu.data.empty())
@@ -601,7 +660,12 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
             cursor += used;
             remaining -= used;
         }
-        LogMsg(L"MMT/TLV Subtitle MFU #%ld: streamIndex=%u packetId=0x%04X componentTag=%d type=%u subsample=%u/%u pts=%I64d ms size=%zu first=%s\n",
+        WCHAR ptsText[32] = {};
+        if (pts >= 0)
+            StringCchPrintfW(ptsText, ARRAYSIZE(ptsText), L"%I64d ms", pts / 10000);
+        else
+            StringCchCopyW(ptsText, ARRAYSIZE(ptsText), L"none");
+        LogMsg(L"MMT/TLV Subtitle MFU #%ld: streamIndex=%u packetId=0x%04X componentTag=%d type=%u subsample=%u/%u pts=%s size=%zu first=%s\n",
                logNo,
                stream.getStreamIndex(),
                stream.getPacketId(),
@@ -609,7 +673,7 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
                mfu.subtitleDataType,
                mfu.subtitleSubsampleNumber,
                mfu.subtitleLastSubsampleNumber,
-               pts / 10000,
+               ptsText,
                mfu.data.size(),
                hex);
     }
@@ -632,4 +696,49 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
     m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
                        true, pts, dts, true, true,
                        mfu.data.data(), mfu.data.size());
+}
+
+void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
+{
+    if (!mhEit.isPf() || mhEit.sectionNumber != 0)
+        return;
+
+    for (const auto& mhEvent : mhEit.events) {
+        if (!mhEvent)
+            continue;
+
+        std::tm startTime = EITConvertStartTime(mhEvent->startTime);
+        if (!isValidEITStartTime(startTime))
+            continue;
+
+        const std::time_t startSec = std::mktime(&startTime);
+        if (startSec < 0)
+            continue;
+
+        const long long programStartSec = static_cast<long long>(startSec);
+        if (programStartSec == m_programStartTimeSec)
+            return;
+
+        m_programStartTimeSec = programStartSec;
+        const long long programStartRt = programStartSec * 10000000LL;
+        LogMsg(L"MMT/TLV EIT program start: unix=%I64d, rt=%I64d ms, eventId=%u\n",
+               programStartSec,
+               programStartRt / 10000,
+               mhEvent->eventId);
+        if (m_programStartCallback)
+            m_programStartCallback(programStartRt);
+        return;
+    }
+}
+
+void CFilterDemuxerHandler::onNtp(const MmtTlv::NTPv4& ntp)
+{
+    if (!m_ntpCallback)
+        return;
+
+    const long long ntpRt = Pcr27ToRefTime(ntp.transmit_timestamp.toPcrValue());
+    if (ntpRt < 0)
+        return;
+
+    m_ntpCallback(ntpRt);
 }
