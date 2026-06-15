@@ -58,6 +58,16 @@ static uint16_t AudioDescriptorChannels(const MmtTlv::MhAudioComponentDescriptor
     return AudioModeToChannels(audio.getAudioMode());
 }
 
+static bool SameAudioIdentity(const CFilterDemuxerHandler::AudioStreamInfo& a,
+                              const CFilterDemuxerHandler::AudioStreamInfo& b)
+{
+    if (a.packetId != b.packetId)
+        return false;
+    if (a.componentTag >= 0 && b.componentTag >= 0)
+        return a.componentTag == b.componentTag;
+    return true;
+}
+
 long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream& stream)
 {
     if (pts == static_cast<int64_t>(MmtTlv::NOPTS_VALUE)) {
@@ -91,16 +101,6 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
         return;
     }
 
-    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
-        [streamIndex](const AudioStreamInfo& info) {
-            return info.streamIndex == streamIndex;
-        });
-    if (it != m_audioStreams.end()) {
-        if (it->latm && it->extraData.empty())
-            LogDetail(L"MMT/TLV Audio LATM stream known without extra data: streamIndex=%d\n", streamIndex);
-        return;
-    }
-
     AudioStreamInfo info;
     info.streamIndex = streamIndex;
     info.packetId = stream.getPacketId();
@@ -111,6 +111,21 @@ void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
     else
         info.channels = stream.is22_2chAudio() ? 24 : 2;
     info.latm = stream.is22_2chAudio();
+
+    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [&info](const AudioStreamInfo& known) {
+            return SameAudioIdentity(known, info);
+        });
+    if (it != m_audioStreams.end()) {
+        it->streamIndex = info.streamIndex;
+        it->samplingRate = info.samplingRate;
+        it->channels = info.channels;
+        it->latm = info.latm;
+        if (it->latm && it->extraData.empty())
+            LogDetail(L"MMT/TLV Audio LATM stream known without extra data: streamIndex=%d\n", streamIndex);
+        return;
+    }
+
     m_audioStreams.push_back(info);
     LogDetail(L"MMT/TLV Audio discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u\n",
            info.streamIndex, info.packetId, info.componentTag, info.samplingRate,
@@ -160,7 +175,7 @@ bool CFilterDemuxerHandler::shouldProcessAudioStream(int streamIndex) const
 
     // Each DirectShow audio output pin represents one stream.  MPC-BE may switch
     // between those pins without calling IAMStreamSelect::Enable, so demux-time
-    // filtering by m_primaryAudioStreamIndex can starve the selected pin.
+    // filtering by the selected stream identity can starve the selected pin.
     auto known = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
         [streamIndex](const AudioStreamInfo& info) {
             return info.streamIndex == streamIndex;
@@ -309,10 +324,13 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
         for (auto& info : discovered) {
             auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
                 [&info](const AudioStreamInfo& known) {
-                    return known.streamIndex == info.streamIndex;
+                    return SameAudioIdentity(known, info);
                 });
-            if (it != m_audioStreams.end() && !it->extraData.empty())
-                info.extraData = it->extraData;
+            if (it != m_audioStreams.end()) {
+                info.streamIndex = it->streamIndex;
+                if (!it->extraData.empty())
+                    info.extraData = it->extraData;
+            }
         }
 
         if (m_requireAdtsConvertibleAudio) {
@@ -334,7 +352,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             for (const auto& info : discovered) {
                 auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
                     [&info](const AudioStreamInfo& known) {
-                        return known.streamIndex == info.streamIndex;
+                        return SameAudioIdentity(known, info);
                     });
                 if (it == m_audioStreams.end()) {
                     missing = true;
@@ -365,14 +383,17 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 
         if (changed) {
             m_audioStreams = discovered;
-            if (m_primaryAudioStreamIndex == -1 && !m_audioStreams.empty()) {
-                m_primaryAudioStreamIndex = m_audioStreams.front().streamIndex;
+            if (!m_hasSelectedAudioStream && !m_audioStreams.empty()) {
+                m_selectedAudioPacketId = m_audioStreams.front().packetId;
+                m_selectedAudioComponentTag = m_audioStreams.front().componentTag;
+                m_hasSelectedAudioStream = true;
             }
 
-            LogMsg(L"MMT/TLV Audio MPT updated: assets=%u, audioStreams=%zu, defaultStreamIndex=%d\n",
+            LogMsg(L"MMT/TLV Audio MPT updated: assets=%u, audioStreams=%zu, selectedPacketId=0x%04X, selectedComponentTag=%d\n",
                    static_cast<unsigned>(mpt.assets.size()),
                    m_audioStreams.size(),
-                   m_primaryAudioStreamIndex);
+                   m_hasSelectedAudioStream ? m_selectedAudioPacketId : 0,
+                   m_hasSelectedAudioStream ? m_selectedAudioComponentTag : -1);
             for (size_t i = 0; i < m_audioStreams.size(); ++i) {
                 const auto& info = m_audioStreams[i];
                 LogDetail(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u, extra=%zu\n",
@@ -434,7 +455,9 @@ std::vector<CFilterDemuxerHandler::SubtitleStreamInfo> CFilterDemuxerHandler::ge
 void CFilterDemuxerHandler::resetAudioSelection()
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
-    m_primaryAudioStreamIndex = -1;
+    m_hasSelectedAudioStream = false;
+    m_selectedAudioPacketId = 0;
+    m_selectedAudioComponentTag = -1;
     m_audioStreams.clear();
     m_adtsConvertibleAudioStreams.clear();
     m_requireAdtsConvertibleAudio = false;
@@ -449,9 +472,14 @@ void CFilterDemuxerHandler::setKnownAudioStreams(const std::vector<AudioStreamIn
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
     m_audioStreams = streams;
-    if (m_primaryAudioStreamIndex == -1 && !m_audioStreams.empty()) {
-        m_primaryAudioStreamIndex = m_audioStreams.front().streamIndex;
-        LogMsg(L"MMT/TLV Audio default streamIndex=%d\n", m_primaryAudioStreamIndex);
+    if (!m_hasSelectedAudioStream && !m_audioStreams.empty()) {
+        m_selectedAudioPacketId = m_audioStreams.front().packetId;
+        m_selectedAudioComponentTag = m_audioStreams.front().componentTag;
+        m_hasSelectedAudioStream = true;
+        LogMsg(L"MMT/TLV Audio default packetId=0x%04X componentTag=%d streamIndex=%d\n",
+               m_selectedAudioPacketId,
+               m_selectedAudioComponentTag,
+               m_audioStreams.front().streamIndex);
     }
 }
 
@@ -523,7 +551,29 @@ void CFilterDemuxerHandler::setKnownSubtitleStreams(const std::vector<SubtitleSt
 int CFilterDemuxerHandler::getSelectedAudioStreamIndex() const
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
-    return m_primaryAudioStreamIndex;
+    if (!m_hasSelectedAudioStream)
+        return -1;
+    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [this](const AudioStreamInfo& info) {
+            return info.packetId == m_selectedAudioPacketId &&
+                   (m_selectedAudioComponentTag < 0 ||
+                    info.componentTag < 0 ||
+                    info.componentTag == m_selectedAudioComponentTag);
+        });
+    return it != m_audioStreams.end() ? it->streamIndex : -1;
+}
+
+bool CFilterDemuxerHandler::isSelectedAudioStream(size_t listIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    if (!m_hasSelectedAudioStream || listIndex >= m_audioStreams.size())
+        return false;
+
+    const auto& info = m_audioStreams[listIndex];
+    return info.packetId == m_selectedAudioPacketId &&
+           (m_selectedAudioComponentTag < 0 ||
+            info.componentTag < 0 ||
+            info.componentTag == m_selectedAudioComponentTag);
 }
 
 bool CFilterDemuxerHandler::selectAudioStreamByListIndex(size_t listIndex)
@@ -532,9 +582,12 @@ bool CFilterDemuxerHandler::selectAudioStreamByListIndex(size_t listIndex)
     if (listIndex >= m_audioStreams.size())
         return false;
 
-    m_primaryAudioStreamIndex = m_audioStreams[listIndex].streamIndex;
-    LogMsg(L"MMT/TLV Audio selected by IAMStreamSelect: list=%zu, streamIndex=%d\n",
-           listIndex, m_primaryAudioStreamIndex);
+    const auto& info = m_audioStreams[listIndex];
+    m_selectedAudioPacketId = info.packetId;
+    m_selectedAudioComponentTag = info.componentTag;
+    m_hasSelectedAudioStream = true;
+    LogMsg(L"MMT/TLV Audio selected by IAMStreamSelect: list=%zu, packetId=0x%04X, componentTag=%d, streamIndex=%d\n",
+           listIndex, m_selectedAudioPacketId, m_selectedAudioComponentTag, info.streamIndex);
     return true;
 }
 
@@ -548,8 +601,11 @@ bool CFilterDemuxerHandler::selectAudioStreamByStreamIndex(int streamIndex)
     if (it == m_audioStreams.end())
         return false;
 
-    m_primaryAudioStreamIndex = streamIndex;
-    LogMsg(L"MMT/TLV Audio selected by streamIndex=%d\n", m_primaryAudioStreamIndex);
+    m_selectedAudioPacketId = it->packetId;
+    m_selectedAudioComponentTag = it->componentTag;
+    m_hasSelectedAudioStream = true;
+    LogMsg(L"MMT/TLV Audio selected by streamIndex=%d packetId=0x%04X componentTag=%d\n",
+           streamIndex, m_selectedAudioPacketId, m_selectedAudioComponentTag);
     return true;
 }
 
@@ -576,9 +632,12 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
 
     {
         std::lock_guard<std::mutex> lock(m_audioMutex);
-        if (m_primaryAudioStreamIndex == -1) {
-            m_primaryAudioStreamIndex = streamIndex;
-            LogMsg(L"MMT/TLV Audio selected streamIndex=%d\n", m_primaryAudioStreamIndex);
+        if (!m_hasSelectedAudioStream) {
+            m_selectedAudioPacketId = stream.getPacketId();
+            m_selectedAudioComponentTag = stream.getComponentTag();
+            m_hasSelectedAudioStream = true;
+            LogMsg(L"MMT/TLV Audio selected packetId=0x%04X componentTag=%d streamIndex=%d\n",
+                   m_selectedAudioPacketId, m_selectedAudioComponentTag, streamIndex);
         }
     }
 

@@ -5177,7 +5177,7 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
     if (ppmt) *ppmt = nullptr;
     if (pdwFlags) {
         *pdwFlags = AMSTREAMSELECTINFO_EXCLUSIVE;
-        if (info.streamIndex == m_handler.getSelectedAudioStreamIndex())
+        if (m_handler.isSelectedAudioStream(static_cast<size_t>(lIndex)))
             *pdwFlags |= AMSTREAMSELECTINFO_ENABLED;
     }
     if (plcid) *plcid = 0;

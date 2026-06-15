@@ -77,6 +77,7 @@ public:
     void setRequireAdtsConvertibleAudio(bool require);
     void setAudioStreamListLocked(bool locked);
     int getSelectedAudioStreamIndex() const;
+    bool isSelectedAudioStream(size_t listIndex) const;
     bool selectAudioStreamByListIndex(size_t listIndex);
     bool selectAudioStreamByStreamIndex(int streamIndex);
 
@@ -97,7 +98,9 @@ private:
     ADTSConverter  m_adtsConverter;
     long long m_basePts{-1};  // first valid PTS seen, in 100ns units
     long long m_programStartTimeSec{-1};
-    int m_primaryAudioStreamIndex{-1};
+    bool m_hasSelectedAudioStream{false};
+    uint16_t m_selectedAudioPacketId{0};
+    int m_selectedAudioComponentTag{-1};
     mutable std::mutex m_audioMutex;
     std::vector<AudioStreamInfo> m_audioStreams;
     std::vector<int> m_adtsConvertibleAudioStreams;
