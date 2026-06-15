@@ -25,6 +25,12 @@ jobs:
           repository: ${{ github.repository_owner }}/dantto4k
           path: dantto4k
 
+      - name: Install vcpkg dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & C:\vcpkg\vcpkg.exe install ffmpeg:x64-windows
+
       - name: Build Release
         shell: pwsh
         working-directory: mmts-dsfilter
