@@ -145,8 +145,8 @@ avcodec-62.dll
 avutil-60.dll
 swresample-6.dll
 mmts-dsfilter.ini
-register-filter.ps1
-unregister-filter.ps1
+Install_mmts-dsfilter_64.cmd
+Uninstall_mmts-dsfilter_64.cmd
 README.md
 ```
 
@@ -168,12 +168,15 @@ repository.
 > **Administrator privileges are required.**
 
 From a release package, right-click each script and choose
-**Run with PowerShell as administrator**:
+**Run as administrator**:
 
-- `register-filter.ps1` — registers the filter
-- `unregister-filter.ps1` — unregisters the filter
+- `Install_mmts-dsfilter_64.cmd` — registers the filter
+- `Uninstall_mmts-dsfilter_64.cmd` — unregisters the filter
 
-`regsvr32` will show a dialog confirming success or failure.
+The scripts call `regsvr32` silently and then show a success/failure message.
+Do not delete `mmts-dsfilter.ax`, the bundled FFmpeg DLLs, or
+`mmts-dsfilter.ini` after installation. The installer does not copy files
+anywhere; the filter runs from the release-package folder.
 
 For a development build, use an elevated command prompt:
 

@@ -71,8 +71,8 @@ jobs:
           Copy-Item -LiteralPath "msvc\x64\Release\avcodec-62.dll" -Destination $packageRoot
           Copy-Item -LiteralPath "msvc\x64\Release\avutil-60.dll" -Destination $packageRoot
           Copy-Item -LiteralPath "msvc\x64\Release\swresample-6.dll" -Destination $packageRoot
-          Copy-Item -LiteralPath "scripts\register-filter.ps1" -Destination $packageRoot
-          Copy-Item -LiteralPath "scripts\unregister-filter.ps1" -Destination $packageRoot
+          Copy-Item -LiteralPath "scripts\Install_mmts-dsfilter_64.cmd" -Destination $packageRoot
+          Copy-Item -LiteralPath "scripts\Uninstall_mmts-dsfilter_64.cmd" -Destination $packageRoot
           Copy-Item -LiteralPath "settings\mmts-dsfilter.ini" -Destination $packageRoot
           Copy-Item -LiteralPath "README.md" -Destination $packageRoot
 
