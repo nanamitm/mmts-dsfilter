@@ -38,7 +38,6 @@ static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 // where that timeline is first observed, then preserve TTML spacing until a
 // clear TTML begin rollback indicates a program boundary.
 static constexpr REFERENCE_TIME kSubtitleResyncBackTolerance = 5 * 10000000LL;   // 5 s in the past
-static constexpr REFERENCE_TIME kSubtitleDriftCorrectionTolerance = 400 * 10000LL; // 400 ms
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
@@ -4328,19 +4327,13 @@ REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, 
                    ttmlBegin / 10000);
             valid = false;
         }
-        if (valid) {
-            const REFERENCE_TIME drift = candidate - anchor;
-            if (drift > kSubtitleDriftCorrectionTolerance) {
-                LogMsg(L"SUBTITLE timing drift correction: oldOffset=%I64d ms, drift=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, programStart=%I64d ms, ttmlBegin=%I64d ms\n",
-                       offset / 10000,
-                       drift / 10000,
-                       candidate / 10000,
-                       anchor / 10000,
-                       programStartRt / 10000,
-                       ttmlBegin / 10000);
-                valid = false;
-            }
-        }
+        // Note: a large *forward* gap between candidate and anchor is not by
+        // itself a resync signal. Broadcast TTML cues are routinely delivered
+        // well ahead of their display time (and a cut/edit point can widen
+        // that gap further), so candidate >> anchor is expected and must not
+        // be "corrected" -- doing so previously caused the offset to latch
+        // onto a too-early cue, after which every later (correctly paced) cue
+        // computed a start time in the past and was silently dropped.
     }
 
     if (!valid) {
