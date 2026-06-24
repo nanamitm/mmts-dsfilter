@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mmtTlvDemuxer.h"
@@ -50,6 +52,11 @@ public:
     int64_t stopAtMs = -1; // when >=0, stop printing details after this anchor time
     int64_t lastEitStartSec = -1;
     int subtitleCount = 0;
+    std::string findText; // when non-empty, stop once a subtitle cue contains this substring
+    bool found = false;
+    bool quiet = false; // suppress per-cue printing; only print anomalies/progress
+    std::map<int, std::pair<int64_t, int64_t>> lastByStream; // streamIndex -> (anchorMs, ttmlBeginMs)
+    int anomalyCount = 0;
 
     void onVideoData(const MmtStream& stream, const MfuData& mfu) override
     {
@@ -131,22 +138,56 @@ public:
             }
         }
 
-        std::printf("[SUB #%d] anchor=%lld ms  streamIndex=%d  ttmlBegin=%s%llu ms  ttmlEnd=%s%llu ms  text=\"%s\"\n",
-                    subtitleCount, (long long)Anchor(), mfu.streamIndex,
-                    hasBegin ? "" : "none/", (unsigned long long)begin,
-                    hasEnd ? "" : "none/", (unsigned long long)end,
-                    text.c_str());
+        const int64_t anchorMs = Anchor();
+        if (!quiet) {
+            std::printf("[SUB #%d] anchor=%lld ms  streamIndex=%d  ttmlBegin=%s%llu ms  ttmlEnd=%s%llu ms  text=\"%s\"\n",
+                        subtitleCount, (long long)anchorMs, mfu.streamIndex,
+                        hasBegin ? "" : "none/", (unsigned long long)begin,
+                        hasEnd ? "" : "none/", (unsigned long long)end,
+                        text.c_str());
+        }
+
+        if (!findText.empty() && text.find(findText) != std::string::npos)
+            found = true;
+
+        // Anomaly: content time (ttmlBegin) jumps far ahead of how much real
+        // delivery time (anchor) actually advanced since the previous cue on
+        // the same stream -- i.e. a cue that claims to be much further in the
+        // future than its arrival pace would suggest.
+        if (hasBegin) {
+            auto it = lastByStream.find(mfu.streamIndex);
+            if (it != lastByStream.end()) {
+                const int64_t prevAnchor = it->second.first;
+                const int64_t prevBegin = it->second.second;
+                const int64_t anchorDelta = anchorMs - prevAnchor;
+                const int64_t beginDelta = static_cast<int64_t>(begin) - prevBegin;
+                if (beginDelta - anchorDelta > 2000) {
+                    ++anomalyCount;
+                    std::printf("[ANOMALY #%d] streamIndex=%d  anchor %lld -> %lld ms (d=%lld)  ttmlBegin %lld -> %lld ms (d=%lld)  text=\"%s\"\n",
+                                anomalyCount, mfu.streamIndex,
+                                (long long)prevAnchor, (long long)anchorMs, (long long)anchorDelta,
+                                (long long)prevBegin, (long long)begin, (long long)beginDelta,
+                                text.c_str());
+                }
+            }
+            lastByStream[mfu.streamIndex] = { anchorMs, static_cast<int64_t>(begin) };
+        }
     }
 };
 
 int main(int argc, char* argv[])
 {
     if (argc < 2) {
-        std::printf("Usage: subtitle_timeline_probe <input.mmts> [stopAtAnchorMs]\n");
+        std::printf("Usage: subtitle_timeline_probe <input.mmts> [stopAtAnchorMs] [--quiet]\n");
         return 1;
     }
     const char* filename = argv[1];
-    int64_t stopAtMs = argc >= 3 ? _atoi64(argv[2]) : -1;
+    int64_t stopAtMs = -1;
+    bool quiet = false;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) == "--quiet") quiet = true;
+        else stopAtMs = _atoi64(argv[i]);
+    }
 
     std::ifstream ifs(filename, std::ios::binary);
     if (!ifs.is_open()) {
@@ -156,6 +197,7 @@ int main(int argc, char* argv[])
 
     TimelineProbeHandler handler;
     handler.stopAtMs = stopAtMs;
+    handler.quiet = quiet;
     MmtTlvDemuxer demuxer;
     demuxer.setDemuxerHandler(handler);
 
@@ -186,9 +228,19 @@ int main(int argc, char* argv[])
                         (long long)handler.Anchor(), (unsigned long long)totalRead);
             break;
         }
+        if (handler.found) {
+            std::printf("[stop] found text match at byte offset %llu\n",
+                        (unsigned long long)totalRead);
+            break;
+        }
+        if (totalRead % (1024ULL * 1024 * 1024) < kChunk) {
+            std::printf("[progress] %.1f GB scanned, anchor=%lld ms\n",
+                        totalRead / 1073741824.0, (long long)handler.Anchor());
+        }
     }
 
-    std::printf("Done. totalRead=%llu bytes, lastAnchor=%lld ms, subtitleSamples=%d\n",
-                (unsigned long long)totalRead, (long long)handler.Anchor(), handler.subtitleCount);
+    std::printf("Done. totalRead=%llu bytes, lastAnchor=%lld ms, subtitleSamples=%d, anomalies=%d\n",
+                (unsigned long long)totalRead, (long long)handler.Anchor(), handler.subtitleCount,
+                handler.anomalyCount);
     return 0;
 }
