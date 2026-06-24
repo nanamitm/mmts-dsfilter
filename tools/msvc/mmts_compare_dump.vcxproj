@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B2C3D4E5-F6A7-8901-BCDE-F12345678901}</ProjectGuid>
+    <RootNamespace>mmts_compare_dump</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <PropertyGroup>
+    <!-- thirdparty/tsduck root, relative to this project file -->
+    <TSDuckRootDir>$(MSBuildThisFileDirectory)..\..\..\dantto4k\thirdparty\tsduck\</TSDuckRootDir>
+    <TSDuckStaticLibDir Condition="'$(Configuration)'=='Release'">$(TSDuckRootDir)bin\Release-x64\</TSDuckStaticLibDir>
+    <TSDuckStaticLibDir Condition="'$(Configuration)'=='Debug'">$(TSDuckRootDir)bin\Debug-x64\</TSDuckStaticLibDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Same recursive header enumeration dantto4k's own tsduck-static.props uses -->
+    <_TSCorePublicHeaders Include="$(TSDuckRootDir)src\libtscore\**\*.h"
+                          Exclude="$(TSDuckRootDir)src\libtscore\**\unix\**;
+                                   $(TSDuckRootDir)src\libtscore\**\linux\**;
+                                   $(TSDuckRootDir)src\libtscore\**\mac\**;
+                                   $(TSDuckRootDir)src\libtscore\**\bsd\**;
+                                   $(TSDuckRootDir)src\libtscore\**\private\**;
+                                   $(TSDuckRootDir)src\libtscore\**\__pycache__\**" />
+    <_TSDuckPublicHeaders Include="$(TSDuckRootDir)src\libtsduck\**\*.h"
+                          Exclude="$(TSDuckRootDir)src\libtsduck\**\unix\**;
+                                   $(TSDuckRootDir)src\libtsduck\**\linux\**;
+                                   $(TSDuckRootDir)src\libtsduck\**\mac\**;
+                                   $(TSDuckRootDir)src\libtsduck\**\bsd\**;
+                                   $(TSDuckRootDir)src\libtsduck\**\private\**;
+                                   $(TSDuckRootDir)src\libtsduck\**\__pycache__\**" />
+    <_TSCorePublicDirs Include="@(_TSCorePublicHeaders->'%(RootDir)%(Directory)'->Distinct())" />
+    <_TSDuckPublicDirs Include="@(_TSDuckPublicHeaders->'%(RootDir)%(Directory)'->Distinct())" />
+  </ItemGroup>
+  <PropertyGroup>
+    <TSCoreIncludeDirs>@(_TSCorePublicDirs)</TSCoreIncludeDirs>
+    <TSDuckIncludeDirs>@(_TSDuckPublicDirs)</TSDuckIncludeDirs>
+  </PropertyGroup>
+
+  <!-- ==================== Common settings ==================== -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>
+        ..;
+        ..\..\src;
+        ..\..\..\dantto4k\src;
+        $(TSCoreIncludeDirs);
+        $(TSDuckIncludeDirs);
+        $(TSDuckRootDir)bin\include;
+        %(AdditionalIncludeDirectories)
+      </AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>
+        WIN32;_CONSOLE;TSDUCK_STATIC_LIBRARY;TSCORE_STATIC_LIBRARY;
+        %(PreprocessorDefinitions)
+      </PreprocessorDefinitions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <AdditionalOptions>/utf-8 /permissive /wd4819 /Wv:17 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Console</SubSystem>
+      <AdditionalLibraryDirectories>
+        $(TSDuckStaticLibDir);
+        %(AdditionalLibraryDirectories)
+      </AdditionalLibraryDirectories>
+      <AdditionalDependencies>
+        ws2_32.lib;
+        tsducklib.lib;tscorelib.lib;
+        %(AdditionalDependencies)
+      </AdditionalDependencies>
+      <AdditionalOptions>/wholearchive:tsducklib.lib /wholearchive:tscorelib.lib %(AdditionalOptions)</AdditionalOptions>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- ==================== Debug ==================== -->
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <PreprocessorDefinitions>DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- ==================== Release ==================== -->
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!-- ==================== Tool source ==================== -->
+  <ItemGroup>
+    <ClCompile Include="..\mmts_compare_dump.cpp" />
+    <ClCompile Include="..\..\src\DsHandler.cpp" />
+    <ClCompile Include="..\..\src\SubtitleTimingResolver.cpp" />
+  </ItemGroup>
+
+  <!-- ==================== dantto4k core + RemuxerHandler (needs TSDuck) ==================== -->
+  <ItemGroup>
+    <ClCompile Include="..\..\..\dantto4k\src\accessControlDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\adtsConverter.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\aes.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\aribEncoder.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\aribUtil.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\b24Color.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\b24SubtitleConvertor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\caMessage.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\compressedIPPacket.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\config.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\contentCopyControlDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\damt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\dataTransmissionMessage.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\dataUnit.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\dcct.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ddmt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ecm.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\emt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\eventPackageDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\extensionHeaderScrambling.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\fragmentAssembler.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\indexItem.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ipv6.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\m2SectionMessage.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\m2ShortSectionMessage.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhAit.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhApplicationBoundaryAndPermissionDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhApplicationDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhAudioComponentDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhAutostartPriorityDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhBit.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhBroadcasterNameDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhCacheControlInfoDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhCaContractInformation.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhCdt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhContentDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhDataComponentDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhEit.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhEventGroupDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhExtendedEventDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhExternalApplicationControlDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhLinkageDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhLogoTransmissionDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhParentalRatingDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhRandomizedLatencyDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhSdt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhSeriesDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhServiceDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhServiceListDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhShortEventDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhSimpleApplicationLocationDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhSiParameterDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhStreamIdentificationDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhTot.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mhTransportProtocolDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtDescriptorFactory.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtDescriptors.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtGeneralLocationInfo.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtp.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtStream.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtTableFactory.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mmtTlvDemuxer.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpu.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuApplicationProcessor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuAudioProcessor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuExtendedTimestampDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuProcessorFactory.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuSubtitleProcessor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuTimestampDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\mpuVideoProcessor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\multimediaServiceInformationDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\networkNameDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\nit.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ntp.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\paMessage.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\pesPacket.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\plt.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\pugixml.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\relatedBroadcasterDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\remoteControlKeyDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\remuxerHandler.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\serviceListDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\signalingMessage.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\stream.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\systemManagementDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\timebase.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\timeUtil.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\tlv.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\tlvDescriptorFactory.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\tlvDescriptors.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\tlvTableFactory.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\transmissionControlSignal.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\videoComponentDescriptor.cpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
