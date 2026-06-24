@@ -7,6 +7,7 @@
 #include "mmtTlvDemuxer.h"
 #include "DsHandler.h"
 #include "MmtTlvOutputPin.h"
+#include "SubtitleTimingResolver.h"
 
 class CMmtTlvSplitter : public CBaseFilter
                       , public IFileSourceFilter
@@ -114,7 +115,9 @@ private:
     // Maps subtitle source time to the media (normalized, pre-segment) timeline.
     // When EIT is available, source time is programStart + TTML begin, similar
     // to dantto4k's synthetic subtitle PTS. Otherwise TTML begin is used alone.
-    REFERENCE_TIME SubtitleSourceTime(REFERENCE_TIME ttmlTime, REFERENCE_TIME* programStartRt = nullptr) const;
+    // Thin wrappers around m_subtitleResolver (see SubtitleTimingResolver.h),
+    // kept as methods so every existing call site is unchanged.
+    REFERENCE_TIME SubtitleSourceTime(REFERENCE_TIME ttmlTime) const;
     REFERENCE_TIME ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, REFERENCE_TIME sourceBegin);
     REFERENCE_TIME SubtitleTimingAnchor() const;
 
@@ -168,19 +171,8 @@ private:
     REFERENCE_TIME m_segmentStart{0};  // media-time start of the active segment
     std::atomic<bool> m_waitingForVideoRap{false};
     std::atomic<REFERENCE_TIME> m_segmentTimeOffset{0};
-    std::atomic<REFERENCE_TIME> m_subtitleProgramStartRt{-1};
-    std::atomic<bool> m_subtitleAwaitProgramStart{false};
-    std::atomic<REFERENCE_TIME> m_subtitleNtpRt{-1};
-    std::atomic<REFERENCE_TIME> m_subtitleNtpMediaRt{-1};
-    std::atomic<bool> m_subtitleAwaitNtp{false};
-    std::atomic<REFERENCE_TIME> m_subtitleTimeOffset{0};
-    std::atomic<REFERENCE_TIME> m_lastSubtitleTtmlBegin{-1};
-    std::atomic<REFERENCE_TIME> m_subtitleOffsetProgramStartRt{-1};
-    std::atomic<bool> m_subtitleOffsetUsesNtp{false};
-    // Whether m_subtitleTimeOffset holds a calibrated value. A separate flag is
-    // required because a legitimate offset can be negative (TTML begin < media PTS),
-    // so the previous "< 0 means unset" sentinel mis-fired on every cue.
-    std::atomic<bool> m_subtitleOffsetValid{false};
+    // TTML timeline -> media-clock anchoring/calibration; see SubtitleTimingResolver.h.
+    SubtitleTimingResolver m_subtitleResolver;
     std::atomic<long long> m_demuxByteOffset{0};
 
     struct PendingSubtitleCue {
