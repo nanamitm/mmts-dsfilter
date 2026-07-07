@@ -119,6 +119,7 @@ copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-6.dll "$(OutDir)"</C
     <ClCompile Include="..\src\DsHandler.cpp" />
     <ClCompile Include="..\src\MmtTlvOutputPin.cpp" />
     <ClCompile Include="..\src\MmtTlvSplitter.cpp" />
+    <ClCompile Include="..\src\SubtitleDebugLogShim.cpp" />
     <ClCompile Include="..\src\SubtitleTimingResolver.cpp" />
     <ClCompile Include="..\src\FilterFactory.cpp" />
   </ItemGroup>
