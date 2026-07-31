@@ -218,9 +218,18 @@ static bool ReadIniValue(const WCHAR* iniPath, const WCHAR* section, const WCHAR
     return GetPrivateProfileStringW(section, key, L"", buf, size, iniPath) > 0;
 }
 
-static std::wstring SidecarEditPathFor(const std::wstring& mediaPath)
+static bool IsMmtsEditPath(const std::wstring& path)
 {
-    return mediaPath + L"edit";
+    static constexpr WCHAR kExtension[] = L".mmtsedit";
+    if (path.size() < ARRAYSIZE(kExtension) - 1)
+        return false;
+    return _wcsicmp(path.c_str() + path.size() - (ARRAYSIZE(kExtension) - 1), kExtension) == 0;
+}
+
+static std::wstring MediaPathForEditPath(const std::wstring& editPath)
+{
+    // A .mmtsedit file is named by appending "edit" to its source .mmts path.
+    return editPath.substr(0, editPath.size() - 4);
 }
 
 static std::wstring SidecarMapPathFor(const std::wstring& mediaPath)
@@ -2066,7 +2075,9 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     if (!pszFileName) return E_POINTER;
     CAutoLock lock(&m_pinLock);
     ConfigureMmtsDebugLoggingFromIni();
-    m_filename = pszFileName;
+    const std::wstring requestedPath = pszFileName;
+    const bool loadEdit = IsMmtsEditPath(requestedPath);
+    m_filename = loadEdit ? MediaPathForEditPath(requestedPath) : requestedPath;
     m_handler.reset();
     m_handler.resetAudioSelection();
     m_videoWidth = 3840;
@@ -2097,7 +2108,8 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     }
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
-    LoadSidecarEdit();
+    if (loadEdit)
+        LoadSidecarEdit(requestedPath);
     LoadSidecarMap();
     PreScanFile();   // sets m_hevcExtradata, m_firstPts, m_duration
     ApplySidecarMap();
@@ -2106,14 +2118,13 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     return S_OK;
 }
 
-void CMmtTlvSplitter::LoadSidecarEdit()
+void CMmtTlvSplitter::LoadSidecarEdit(const std::wstring& editPath)
 {
     m_virtualStart = 0;
     m_virtualEnd = 0;
     m_hasSidecarIndex = false;
     m_editSegments.clear();
 
-    const std::wstring editPath = SidecarEditPathFor(m_filename);
     std::ifstream ifs(editPath, std::ios::binary | std::ios::ate);
     if (!ifs.is_open())
         return;

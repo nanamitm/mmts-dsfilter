@@ -1,6 +1,7 @@
 # mmts-dsfilter
 
-DirectShow source/splitter filter for MMT/TLV `.mmts` files.
+DirectShow source/splitter filter for MMT/TLV `.mmts` files and `.mmtsedit`
+edit decision lists.
 
 This filter was built for playback/debugging with MPC-BE and MPC-HC. It uses
 the `dantto4k` demuxer sources for MMT/TLV parsing and exposes HEVC video, AAC
@@ -8,8 +9,8 @@ audio, and ARIB B24 subtitle streams as DirectShow output pins.
 
 ## Features
 
-- Loads `.mmts` files through `IFileSourceFilter`.
-- Registers `.mmts` as a DirectShow source filter extension.
+- Loads `.mmts` and `.mmtsedit` files through `IFileSourceFilter`.
+- Registers `.mmts` and `.mmtsedit` as DirectShow source filter extensions.
 - Exposes HEVC video output.
 - Exposes each MPT `mp4a` audio stream as a separate audio output pin.
 - Outputs ordinary AAC streams as ADTS/`MEDIASUBTYPE_RAW_AAC1`.
@@ -90,8 +91,8 @@ tools\mmts_audio_split.exe <input.mmts> [--split] [--max-mb N] [--progress-mb N]
 
 ## Non-destructive edits (`.mmtsedit`)
 
-The filter supports a non-destructive edit decision list via a `.mmtsedit`
-sidecar (JSON) placed next to the media (`recording.mmts` -> `recording.mmtsedit`).
+The filter supports a non-destructive edit decision list in a `.mmtsedit` JSON
+file placed next to the media (`recording.mmts` -> `recording.mmtsedit`).
 The edited program is the concatenation of the listed source segments, played
 without rewriting the media file:
 
@@ -108,12 +109,13 @@ without rewriting the media file:
 }
 ```
 
-When the filter loads `recording.mmts` it reads `recording.mmtsedit`, verifies
-the recorded source size, and exposes a virtual timeline whose duration is the
-sum of the segment durations. A single segment behaves as a simple in/out trim;
-multiple segments are concatenated, with the demuxer jumping across the cut
-gaps (each segment starts at the nearest RAP). Create and edit these files with
-the `mmts-edit-gui` tool.
+Opening `recording.mmts` plays the original file and does not look for an edit
+file. To apply edits, open `recording.mmtsedit` directly. The filter then opens
+the same-named `recording.mmts`, verifies the recorded source size, and exposes
+a virtual timeline whose duration is the sum of the segment durations. A single
+segment behaves as a simple in/out trim; multiple segments are concatenated,
+with the demuxer jumping across the cut gaps (each segment starts at the nearest
+RAP). Create and edit these files with the `mmts-edit-gui` tool.
 
 > The earlier start-only `.mmtsidx` format has been removed; use `.mmtsedit`
 > (a single segment is equivalent to the old start offset plus an end).

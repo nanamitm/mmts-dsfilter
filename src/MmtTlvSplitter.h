@@ -78,7 +78,7 @@ private:
     void StopThread();
     void SeekTo(REFERENCE_TIME pos);
     void PreScanFile();
-    void LoadSidecarEdit();
+    void LoadSidecarEdit(const std::wstring& editPath);
     void LoadSidecarMap();
     void ApplySidecarIndex();
     void ApplySidecarMap();

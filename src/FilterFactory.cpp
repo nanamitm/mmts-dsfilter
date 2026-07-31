@@ -1,5 +1,6 @@
 // Filter factory registration - uses DirectShow BaseClasses mechanism.
 #include <streams.h>
+#include <string>
 #include "Guids.h"
 #include "MmtTlvSplitter.h"
 
@@ -58,18 +59,19 @@ CFactoryTemplate g_Templates[] = {
 int g_cTemplates = ARRAYSIZE(g_Templates);
 
 // ---------------------------------------------------------------------------
-// Register/unregister ".mmts" extension so DirectShow picks up this filter
-// HKEY_CLASSES_ROOT\Media Type\Extensions\.mmts  "Source Filter" = CLSID
+// Register/unregister the supported source extensions so DirectShow picks up
+// this filter.  .mmtsedit is an edit decision list for the same-named .mmts.
 // ---------------------------------------------------------------------------
-static const WCHAR kExtKeyPath[] = L"Media Type\\Extensions\\.mmts";
+static const WCHAR* const kExtensions[] = { L".mmts", L".mmtsedit" };
 static const WCHAR kSourceFilterValue[] = L"Source Filter";
 // {8b7d1a60-3c4e-4f2a-9b8e-1234567890ab}
 static const WCHAR kClsidStr[] = L"{8B7D1A60-3C4E-4F2A-9B8E-1234567890AB}";
 
-static HRESULT RegisterExtension()
+static HRESULT RegisterExtension(const WCHAR* extension)
 {
+    const std::wstring keyPath = std::wstring(L"Media Type\\Extensions\\") + extension;
     HKEY hKey = nullptr;
-    LONG r = RegCreateKeyExW(HKEY_CLASSES_ROOT, kExtKeyPath, 0, nullptr,
+    LONG r = RegCreateKeyExW(HKEY_CLASSES_ROOT, keyPath.c_str(), 0, nullptr,
                              REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &hKey, nullptr);
     if (r != ERROR_SUCCESS) return HRESULT_FROM_WIN32(r);
     r = RegSetValueExW(hKey, kSourceFilterValue, 0, REG_SZ,
@@ -79,10 +81,10 @@ static HRESULT RegisterExtension()
     return HRESULT_FROM_WIN32(r);
 }
 
-static HRESULT UnregisterExtension()
+static void UnregisterExtension(const WCHAR* extension)
 {
-    RegDeleteKeyW(HKEY_CLASSES_ROOT, kExtKeyPath);
-    return S_OK;
+    const std::wstring keyPath = std::wstring(L"Media Type\\Extensions\\") + extension;
+    RegDeleteKeyW(HKEY_CLASSES_ROOT, keyPath.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -91,13 +93,17 @@ static HRESULT UnregisterExtension()
 STDAPI DllRegisterServer()
 {
     HRESULT hr = AMovieDllRegisterServer2(TRUE);
-    if (SUCCEEDED(hr)) hr = RegisterExtension();
+    for (const WCHAR* extension : kExtensions) {
+        if (FAILED(hr)) break;
+        hr = RegisterExtension(extension);
+    }
     return hr;
 }
 
 STDAPI DllUnregisterServer()
 {
-    UnregisterExtension();
+    for (const WCHAR* extension : kExtensions)
+        UnregisterExtension(extension);
     return AMovieDllRegisterServer2(FALSE);
 }
 
