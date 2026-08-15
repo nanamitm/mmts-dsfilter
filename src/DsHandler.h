@@ -84,6 +84,7 @@ public:
     bool selectVideoStreamByStreamIndex(int streamIndex);
     std::vector<AudioStreamInfo> getAudioStreams() const;
     std::vector<SubtitleStreamInfo> getSubtitleStreams() const;
+    void setKnownVideoStreams(const std::vector<VideoStreamInfo>& streams);
     void setKnownAudioStreams(const std::vector<AudioStreamInfo>& streams);
     void setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams);
     std::vector<AudioStreamInfo> getAdtsConvertibleAudioStreams() const;

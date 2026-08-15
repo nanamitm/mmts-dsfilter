@@ -799,6 +799,14 @@ std::vector<CFilterDemuxerHandler::AudioStreamInfo> CFilterDemuxerHandler::getPl
     return streams;
 }
 
+void CFilterDemuxerHandler::setKnownVideoStreams(const std::vector<VideoStreamInfo>& streams)
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    m_videoStreams = streams;
+    if (!m_hasSelectedVideoStream)
+        selectDefaultVideoStreamLocked();
+}
+
 void CFilterDemuxerHandler::setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams)
 {
     std::lock_guard<std::mutex> lock(m_subtitleMutex);

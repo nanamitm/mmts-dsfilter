@@ -3011,13 +3011,21 @@ void CMmtTlvSplitter::PreScanFile()
     // ---- Phase 1: beginning of file ----------------------------------------
     bool phase1Done = false;
     std::vector<uint8_t> accumVideo;
+    int  accumStreamIndex = -1;
     long long minPts = -1;
 
     handler.setVideoCallback(
-        [&](int, bool, long long pts, long long, bool isFirst, bool isLast,
+        [&](int streamIndex, bool, long long pts, long long, bool isFirst, bool isLast,
             const uint8_t* data, size_t size)
         {
             if (phase1Done) return;
+            // The handler forwards one video asset only, but the very first
+            // fragments can arrive before the asset list settles. Never mix two
+            // assets into the buffer the parameter sets are parsed from.
+            if (streamIndex != accumStreamIndex) {
+                accumVideo.clear();
+                accumStreamIndex = streamIndex;
+            }
             if (isFirst) {
                 accumVideo.clear();
             }
@@ -3099,6 +3107,7 @@ void CMmtTlvSplitter::PreScanFile()
         }
         m_handler.setAudioStreamListLocked(true);
     }
+    m_handler.setKnownVideoStreams(handler.getVideoStreams());
     m_handler.setKnownSubtitleStreams(handler.getSubtitleStreams());
     {
         auto streams = m_handler.getAudioStreams();
@@ -3122,6 +3131,34 @@ void CMmtTlvSplitter::PreScanFile()
 
     LogMsg(L"MMT/TLV Splitter: Phase 1 finished. minPts=%I64d, phase1Done=%d, totalRead=%d\n",
            m_firstPts, phase1Done, totalRead);
+
+    {
+        const auto videoStreams = handler.getVideoStreams();
+        const int selected = handler.getSelectedVideoStreamIndex();
+        LogMsg(L"MMT/TLV Splitter: PreScanFile found %zu video asset(s), selected streamIndex=%d\n",
+               videoStreams.size(), selected);
+        for (const auto& info : videoStreams) {
+            LogMsg(L"MMT/TLV Splitter: video asset streamIndex=%d packetId=0x%04X componentTag=%d %dx%d%s\n",
+                   info.streamIndex, info.packetId, info.componentTag, info.width, info.height,
+                   info.streamIndex == selected ? L" (selected)" : L"");
+        }
+
+        // The extradata parse is the authority on the coded size, but if it did
+        // not produce one, the selected asset's video component descriptor beats
+        // the hard-coded 4K default - a 1080p asset would otherwise be announced
+        // as 3840x2160.
+        if (m_hevcExtradata.empty()) {
+            for (const auto& info : videoStreams) {
+                if (info.streamIndex == selected && info.width > 0 && info.height > 0) {
+                    m_videoWidth = info.width;
+                    m_videoHeight = info.height;
+                    LogMsg(L"MMT/TLV Splitter: PreScanFile using descriptor video size %dx%d\n",
+                           m_videoWidth, m_videoHeight);
+                    break;
+                }
+            }
+        }
+    }
 
     if (m_firstPts < 0 || m_fileSize <= 0) {
         LogMsg(L"MMT/TLV Splitter: PreScanFile early abort due to negative firstPts or 0 fileSize!\n");
