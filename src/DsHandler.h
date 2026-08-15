@@ -22,6 +22,15 @@ public:
         std::vector<uint8_t> extraData;
     };
 
+    struct VideoStreamInfo {
+        int streamIndex{-1};
+        uint16_t packetId{0};
+        int componentTag{-1};
+        int width{0};
+        int height{0};
+        bool hasData{false};
+    };
+
     struct SubtitleStreamInfo {
         int streamIndex{-1};
         uint16_t packetId{0};
@@ -68,6 +77,11 @@ public:
 
     void reset() { m_basePts = -1; m_programStartTimeSec = -1; }
     void resetAudioSelection();
+    std::vector<VideoStreamInfo> getVideoStreams() const;
+    int getSelectedVideoStreamIndex() const;
+    bool isSelectedVideoStream(size_t listIndex) const;
+    bool selectVideoStreamByListIndex(size_t listIndex);
+    bool selectVideoStreamByStreamIndex(int streamIndex);
     std::vector<AudioStreamInfo> getAudioStreams() const;
     std::vector<SubtitleStreamInfo> getSubtitleStreams() const;
     void setKnownAudioStreams(const std::vector<AudioStreamInfo>& streams);
@@ -83,6 +97,10 @@ public:
 
 private:
     long long toRefTime(int64_t pts, const MmtTlv::MmtStream& stream);
+    void rememberVideoStream(const MmtTlv::MmtStream& stream);
+    bool shouldProcessVideoStream(int streamIndex) const;
+    // Callers must hold m_videoMutex.
+    void selectDefaultVideoStreamLocked();
     void rememberAudioStream(const MmtTlv::MmtStream& stream);
     void rememberLatmConfig(int streamIndex, const uint8_t* data, size_t size);
     void rememberAdtsConvertibleAudioStream(int streamIndex);
@@ -98,6 +116,15 @@ private:
     ADTSConverter  m_adtsConverter;
     long long m_basePts{-1};  // first valid PTS seen, in 100ns units
     long long m_programStartTimeSec{-1};
+    // A BS4K package can carry more than one hev1 asset (e.g. a 4K main video
+    // plus a 1080p simulcast). They share one DirectShow video pin, so exactly
+    // one of them may be delivered - mixing their MFU fragments produces
+    // spliced, undecodable access units.
+    mutable std::mutex m_videoMutex;
+    std::vector<VideoStreamInfo> m_videoStreams;
+    bool m_hasSelectedVideoStream{false};
+    uint16_t m_selectedVideoPacketId{0};
+    int m_selectedVideoComponentTag{-1};
     bool m_hasSelectedAudioStream{false};
     uint16_t m_selectedAudioPacketId{0};
     int m_selectedAudioComponentTag{-1};

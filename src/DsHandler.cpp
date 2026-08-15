@@ -7,6 +7,7 @@
 #include "mmtDescriptors.h"
 #include "mhStreamIdentificationDescriptor.h"
 #include "mhAudioComponentDescriptor.h"
+#include "videoComponentDescriptor.h"
 #include "mpuProcessorBase.h"  // NOPTS_VALUE
 #include "timeUtil.h"
 #include <windows.h>
@@ -44,6 +45,40 @@ static uint16_t AudioModeToChannels(uint8_t audioMode)
     case 0b10001: return 24;  // 22.2ch
     default: return 2;
     }
+}
+
+// ARIB STD-B10 video_resolution / video_aspect_ratio, as carried by the MMT
+// video component descriptor.
+static void VideoResolutionSize(uint8_t videoResolution, uint8_t videoAspectRatio,
+                                int* width, int* height)
+{
+    int h = 0;
+    switch (videoResolution) {
+    case 1: h = 180; break;
+    case 2: h = 240; break;
+    case 3: h = 480; break;
+    case 4: h = 720; break;
+    case 5: h = 1080; break;
+    case 6: h = 2160; break;
+    case 7: h = 4320; break;
+    default: h = 0; break;
+    }
+
+    const bool wide = (videoAspectRatio == 2 || videoAspectRatio == 3);
+    if (width)
+        *width = static_cast<int>(h * (wide ? 16.0 / 9.0 : 4.0 / 3.0));
+    if (height)
+        *height = h;
+}
+
+static bool SameVideoIdentity(const CFilterDemuxerHandler::VideoStreamInfo& a,
+                              const CFilterDemuxerHandler::VideoStreamInfo& b)
+{
+    if (a.packetId != b.packetId)
+        return false;
+    if (a.componentTag >= 0 && b.componentTag >= 0)
+        return a.componentTag == b.componentTag;
+    return true;
 }
 
 static long long Pcr27ToRefTime(int64_t pcr27)
@@ -84,6 +119,155 @@ long long CFilterDemuxerHandler::toRefTime(int64_t pts, const MmtTlv::MmtStream&
     // Use double math to prevent 64-bit integer overflow when pts is a very large NTP timestamp
     double val = (static_cast<double>(pts) * 10000000.0 * tb.num) / tb.den;
     return static_cast<long long>(val);
+}
+
+void CFilterDemuxerHandler::selectDefaultVideoStreamLocked()
+{
+    if (m_videoStreams.empty())
+        return;
+
+    // ARIB assigns component_tag 0 to the main video; a simulcast or secondary
+    // view gets a higher tag. Prefer the lowest tag, falling back to MPT order
+    // when no tag is known.
+    auto best = m_videoStreams.begin();
+    for (auto it = m_videoStreams.begin(); it != m_videoStreams.end(); ++it) {
+        const int bestTag = best->componentTag < 0 ? 0x7FFFFFFF : best->componentTag;
+        const int tag = it->componentTag < 0 ? 0x7FFFFFFF : it->componentTag;
+        if (tag < bestTag)
+            best = it;
+    }
+
+    if (m_hasSelectedVideoStream &&
+        m_selectedVideoPacketId == best->packetId &&
+        m_selectedVideoComponentTag == best->componentTag) {
+        return;
+    }
+
+    m_selectedVideoPacketId = best->packetId;
+    m_selectedVideoComponentTag = best->componentTag;
+    m_hasSelectedVideoStream = true;
+    LogMsg(L"MMT/TLV Video selected packetId=0x%04X componentTag=%d streamIndex=%d %dx%d\n",
+           best->packetId, best->componentTag, best->streamIndex, best->width, best->height);
+}
+
+void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+
+    VideoStreamInfo info;
+    info.streamIndex = static_cast<int>(stream.getStreamIndex());
+    info.packetId = stream.getPacketId();
+    info.componentTag = stream.getComponentTag();
+    info.hasData = true;
+    if (auto desc = stream.getVideoComponentDescriptor()) {
+        VideoResolutionSize(desc->get().videoResolution, desc->get().videoAspectRatio,
+                            &info.width, &info.height);
+    }
+
+    auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
+        [&info](const VideoStreamInfo& known) {
+            return SameVideoIdentity(known, info);
+        });
+    if (it != m_videoStreams.end()) {
+        it->streamIndex = info.streamIndex;
+        it->hasData = true;
+        if (info.height > 0) {
+            it->width = info.width;
+            it->height = info.height;
+        }
+        return;
+    }
+
+    m_videoStreams.push_back(info);
+    LogDetail(L"MMT/TLV Video discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, %dx%d\n",
+              info.streamIndex, info.packetId, info.componentTag, info.width, info.height);
+    if (!m_hasSelectedVideoStream)
+        selectDefaultVideoStreamLocked();
+}
+
+bool CFilterDemuxerHandler::shouldProcessVideoStream(int streamIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    if (!m_hasSelectedVideoStream)
+        return true;
+
+    auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
+        [streamIndex](const VideoStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (it == m_videoStreams.end())
+        return true;
+
+    if (it->packetId != m_selectedVideoPacketId)
+        return false;
+    if (it->componentTag >= 0 && m_selectedVideoComponentTag >= 0)
+        return it->componentTag == m_selectedVideoComponentTag;
+    return true;
+}
+
+std::vector<CFilterDemuxerHandler::VideoStreamInfo> CFilterDemuxerHandler::getVideoStreams() const
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    return m_videoStreams;
+}
+
+int CFilterDemuxerHandler::getSelectedVideoStreamIndex() const
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    if (!m_hasSelectedVideoStream)
+        return -1;
+    for (const auto& info : m_videoStreams) {
+        if (info.packetId == m_selectedVideoPacketId &&
+            (info.componentTag < 0 || m_selectedVideoComponentTag < 0 ||
+             info.componentTag == m_selectedVideoComponentTag)) {
+            return info.streamIndex;
+        }
+    }
+    return -1;
+}
+
+bool CFilterDemuxerHandler::isSelectedVideoStream(size_t listIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    if (!m_hasSelectedVideoStream || listIndex >= m_videoStreams.size())
+        return false;
+    const auto& info = m_videoStreams[listIndex];
+    if (info.packetId != m_selectedVideoPacketId)
+        return false;
+    if (info.componentTag >= 0 && m_selectedVideoComponentTag >= 0)
+        return info.componentTag == m_selectedVideoComponentTag;
+    return true;
+}
+
+bool CFilterDemuxerHandler::selectVideoStreamByListIndex(size_t listIndex)
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    if (listIndex >= m_videoStreams.size())
+        return false;
+
+    const auto& info = m_videoStreams[listIndex];
+    m_selectedVideoPacketId = info.packetId;
+    m_selectedVideoComponentTag = info.componentTag;
+    m_hasSelectedVideoStream = true;
+    LogMsg(L"MMT/TLV Video selection changed: listIndex=%zu packetId=0x%04X componentTag=%d streamIndex=%d\n",
+           listIndex, info.packetId, info.componentTag, info.streamIndex);
+    return true;
+}
+
+bool CFilterDemuxerHandler::selectVideoStreamByStreamIndex(int streamIndex)
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
+        [streamIndex](const VideoStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    if (it == m_videoStreams.end())
+        return false;
+
+    m_selectedVideoPacketId = it->packetId;
+    m_selectedVideoComponentTag = it->componentTag;
+    m_hasSelectedVideoStream = true;
+    return true;
 }
 
 void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
@@ -248,6 +432,7 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
 
 void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 {
+    std::vector<VideoStreamInfo> discoveredVideos;
     std::vector<AudioStreamInfo> discovered;
     std::vector<SubtitleStreamInfo> discoveredSubtitles;
     int streamIndex = 0;
@@ -274,7 +459,32 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
         if (!isSupportedStream)
             continue;
 
-        if (asset.assetType == MmtTlv::AssetType::mp4a) {
+        if (asset.assetType == MmtTlv::AssetType::hev1) {
+            VideoStreamInfo info;
+            info.streamIndex = streamIndex;
+            info.packetId = packetId;
+
+            for (const auto& descriptor : asset.descriptors.list) {
+                switch (descriptor->getDescriptorTag()) {
+                case MmtTlv::MhStreamIdentificationDescriptor::kDescriptorTag:
+                {
+                    const auto* streamId = static_cast<const MmtTlv::MhStreamIdentificationDescriptor*>(descriptor.get());
+                    info.componentTag = streamId->componentTag;
+                    break;
+                }
+                case MmtTlv::VideoComponentDescriptor::kDescriptorTag:
+                {
+                    const auto* video = static_cast<const MmtTlv::VideoComponentDescriptor*>(descriptor.get());
+                    info.componentTag = video->componentTag;
+                    VideoResolutionSize(video->videoResolution, video->videoAspectRatio,
+                                        &info.width, &info.height);
+                    break;
+                }
+                }
+            }
+
+            discoveredVideos.push_back(info);
+        } else if (asset.assetType == MmtTlv::AssetType::mp4a) {
             AudioStreamInfo info;
             info.streamIndex = streamIndex;
             info.packetId = packetId;
@@ -317,6 +527,53 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
         }
 
         ++streamIndex;
+    }
+
+    if (!discoveredVideos.empty()) {
+        std::lock_guard<std::mutex> lock(m_videoMutex);
+        for (auto& info : discoveredVideos) {
+            auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
+                [&info](const VideoStreamInfo& known) {
+                    return SameVideoIdentity(known, info);
+                });
+            if (it != m_videoStreams.end()) {
+                // The demuxer counts a stream index per packet location while
+                // this walk counts one per asset, so once data has been seen the
+                // index observed there is the authoritative one.
+                info.streamIndex = it->streamIndex;
+                info.hasData = it->hasData;
+            }
+        }
+
+        bool changed = discoveredVideos.size() != m_videoStreams.size();
+        if (!changed) {
+            for (size_t i = 0; i < discoveredVideos.size(); ++i) {
+                if (discoveredVideos[i].streamIndex != m_videoStreams[i].streamIndex ||
+                    discoveredVideos[i].packetId != m_videoStreams[i].packetId ||
+                    discoveredVideos[i].componentTag != m_videoStreams[i].componentTag ||
+                    discoveredVideos[i].width != m_videoStreams[i].width ||
+                    discoveredVideos[i].height != m_videoStreams[i].height) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        if (changed) {
+            m_videoStreams = discoveredVideos;
+            LogMsg(L"MMT/TLV Video MPT updated: assets=%u, videoStreams=%zu\n",
+                   static_cast<unsigned>(mpt.assets.size()), m_videoStreams.size());
+            for (size_t i = 0; i < m_videoStreams.size(); ++i) {
+                const auto& info = m_videoStreams[i];
+                LogDetail(L"MMT/TLV Video MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, %dx%d, data=%d\n",
+                          i, info.streamIndex, info.packetId, info.componentTag,
+                          info.width, info.height, info.hasData ? 1 : 0);
+            }
+        }
+
+        // Only pick a default; an explicit selection must survive MPT updates.
+        if (!m_hasSelectedVideoStream)
+            selectDefaultVideoStreamLocked();
     }
 
     if (!discovered.empty()) {
@@ -612,6 +869,14 @@ bool CFilterDemuxerHandler::selectAudioStreamByStreamIndex(int streamIndex)
 void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
     if (!m_videoCallback || mfu.data.empty())
+        return;
+
+    rememberVideoStream(stream);
+
+    // The video pin assembles one access unit at a time, so fragments from a
+    // second hev1 asset would clear the accumulator mid-AU and splice their NAL
+    // units into the primary stream. Deliver the selected stream only.
+    if (!shouldProcessVideoStream(static_cast<int>(stream.getStreamIndex())))
         return;
 
     long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);
