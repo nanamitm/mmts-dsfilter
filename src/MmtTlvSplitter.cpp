@@ -5085,13 +5085,25 @@ STDMETHODIMP CMmtTlvSplitter::GetPreroll(LONGLONG* pllPreroll)
 // ---------------------------------------------------------------------------
 // IAMStreamSelect
 // ---------------------------------------------------------------------------
+// The enumeration is video assets first (group 0), then audio assets (group 1).
+// Only one video pin exists - a second one would make the graph builder attach
+// a second renderer - so switching video means re-pointing that pin at another
+// hev1 asset, which is how a player switches video streams anyway.
 STDMETHODIMP CMmtTlvSplitter::Count(DWORD* pcStreams)
 {
     if (!pcStreams) return E_POINTER;
+    auto videoStreams = m_handler.getVideoStreams();
     auto streams = m_handler.getAudioStreams();
-    *pcStreams = static_cast<DWORD>(streams.size());
-    LogMsg(L"MMT/TLV StreamSelect: Count=%lu, selectedStreamIndex=%d\n",
-           *pcStreams, m_handler.getSelectedAudioStreamIndex());
+    *pcStreams = static_cast<DWORD>(videoStreams.size() + streams.size());
+    LogMsg(L"MMT/TLV StreamSelect: Count=%lu (video=%zu, audio=%zu), selectedVideoStreamIndex=%d, selectedStreamIndex=%d\n",
+           *pcStreams, videoStreams.size(), streams.size(),
+           m_handler.getSelectedVideoStreamIndex(),
+           m_handler.getSelectedAudioStreamIndex());
+    for (size_t i = 0; i < videoStreams.size(); ++i) {
+        const auto& info = videoStreams[i];
+        LogDetail(L"MMT/TLV StreamSelect: Count video[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, %dx%d\n",
+               i, info.streamIndex, info.packetId, info.componentTag, info.width, info.height);
+    }
     for (size_t i = 0; i < streams.size(); ++i) {
         const auto& info = streams[i];
         LogDetail(L"MMT/TLV StreamSelect: Count stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u\n",
@@ -5104,9 +5116,48 @@ STDMETHODIMP CMmtTlvSplitter::Count(DWORD* pcStreams)
 STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdwFlags,
     LCID* plcid, DWORD* pdwGroup, LPWSTR* ppszName, IUnknown** ppObject, IUnknown** ppUnk)
 {
+    auto videoStreams = m_handler.getVideoStreams();
+    if (lIndex >= 0 && static_cast<size_t>(lIndex) < videoStreams.size()) {
+        const size_t listIndex = static_cast<size_t>(lIndex);
+        const auto& video = videoStreams[listIndex];
+        if (ppmt) *ppmt = nullptr;
+        if (pdwFlags) {
+            *pdwFlags = AMSTREAMSELECTINFO_EXCLUSIVE;
+            if (m_handler.isSelectedVideoStream(listIndex))
+                *pdwFlags |= AMSTREAMSELECTINFO_ENABLED;
+        }
+        if (plcid) *plcid = 0;
+        if (pdwGroup) *pdwGroup = 0;
+        if (ppszName) {
+            WCHAR buf[256];
+            if (video.width > 0 && video.height > 0) {
+                StringCchPrintfW(buf, ARRAYSIZE(buf),
+                                 L"Video %ld %dx%d (stream %d, component %d)",
+                                 lIndex + 1, video.width, video.height,
+                                 video.streamIndex, video.componentTag);
+            } else {
+                StringCchPrintfW(buf, ARRAYSIZE(buf),
+                                 L"Video %ld (stream %d, component %d)",
+                                 lIndex + 1, video.streamIndex, video.componentTag);
+            }
+            const size_t chars = wcslen(buf) + 1;
+            *ppszName = static_cast<LPWSTR>(CoTaskMemAlloc(chars * sizeof(WCHAR)));
+            if (!*ppszName)
+                return E_OUTOFMEMORY;
+            StringCchCopyW(*ppszName, chars, buf);
+        }
+        if (ppObject) *ppObject = nullptr;
+        if (ppUnk) *ppUnk = nullptr;
+        LogMsg(L"MMT/TLV StreamSelect: Info index=%ld, video streamIndex=%d, flags=0x%08X, group=0\n",
+               lIndex, video.streamIndex, pdwFlags ? *pdwFlags : 0);
+        return S_OK;
+    }
+
     auto streams = m_handler.getAudioStreams();
-    if (lIndex < 0 || static_cast<size_t>(lIndex) >= streams.size())
+    const long audioIndex = lIndex - static_cast<long>(videoStreams.size());
+    if (audioIndex < 0 || static_cast<size_t>(audioIndex) >= streams.size())
         return E_INVALIDARG;
+    lIndex = audioIndex;
 
     const auto& info = streams[static_cast<size_t>(lIndex)];
     if (ppmt) *ppmt = nullptr;
@@ -5147,7 +5198,44 @@ STDMETHODIMP CMmtTlvSplitter::Enable(long lIndex, DWORD dwFlags)
     if ((dwFlags & AMSTREAMSELECTENABLE_ENABLE) == 0)
         return S_OK;
 
+    auto videoStreams = m_handler.getVideoStreams();
+    if (lIndex >= 0 && static_cast<size_t>(lIndex) < videoStreams.size()) {
+        for (auto* pin : m_pins)
+            if (pin->IsVideo() && pin->IsConnected())
+                pin->DeliverBeginFlush();
+
+        const bool ok = m_handler.selectVideoStreamByListIndex(static_cast<size_t>(lIndex));
+
+        const auto& selected = videoStreams[static_cast<size_t>(lIndex)];
+        if (ok && selected.width > 0 && selected.height > 0) {
+            m_videoWidth = selected.width;
+            m_videoHeight = selected.height;
+        }
+
+        for (auto* pin : m_pins) {
+            if (pin->IsVideo()) {
+                // The connected media type cannot change on the fly; the decoder
+                // picks the new geometry up from the parameter sets the broadcast
+                // stream repeats at every IRAP. Keep the pin's own idea of the
+                // size current for any later reconnect.
+                if (ok && selected.width > 0 && selected.height > 0)
+                    pin->SetVideoInfo(selected.width, selected.height);
+                // ResetForSeek() re-arms the RAP wait, so the newly selected
+                // asset starts at an IRAP with its own parameter sets rather
+                // than mid-GOP.
+                pin->ResetForSeek();
+                if (pin->IsConnected())
+                    pin->DeliverEndFlush();
+            }
+        }
+
+        LogMsg(L"MMT/TLV StreamSelect: Enable video index=%ld flags=0x%08X ok=%d\n",
+               lIndex, dwFlags, ok ? 1 : 0);
+        return ok ? S_OK : E_INVALIDARG;
+    }
+
     auto streams = m_handler.getAudioStreams();
+    lIndex -= static_cast<long>(videoStreams.size());
     if (lIndex < 0 || static_cast<size_t>(lIndex) >= streams.size())
         return E_INVALIDARG;
 
