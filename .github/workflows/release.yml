@@ -68,9 +68,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
           Copy-Item -LiteralPath "msvc\x64\Release\mmts-dsfilter.ax" -Destination $packageRoot
-          Copy-Item -LiteralPath "msvc\x64\Release\avcodec-62.dll" -Destination $packageRoot
-          Copy-Item -LiteralPath "msvc\x64\Release\avutil-60.dll" -Destination $packageRoot
-          Copy-Item -LiteralPath "msvc\x64\Release\swresample-6.dll" -Destination $packageRoot
+
+          # The ffmpeg SONAMEs follow whatever vcpkg installs, so match them by
+          # wildcard and fail loudly if one of the three is missing rather than
+          # shipping a package that cannot load.
+          foreach ($library in @('avcodec', 'avutil', 'swresample')) {
+            $dll = Get-ChildItem -Path "msvc\x64\Release\$library-*.dll" -File
+            if ($dll.Count -ne 1) {
+              throw "Expected exactly one $library-*.dll in the output directory, found $($dll.Count)."
+            }
+            Copy-Item -LiteralPath $dll[0].FullName -Destination $packageRoot
+          }
           Copy-Item -LiteralPath "scripts\Install_mmts-dsfilter_64.cmd" -Destination $packageRoot
           Copy-Item -LiteralPath "scripts\Uninstall_mmts-dsfilter_64.cmd" -Destination $packageRoot
           Copy-Item -LiteralPath "settings\mmts-dsfilter.ini" -Destination $packageRoot

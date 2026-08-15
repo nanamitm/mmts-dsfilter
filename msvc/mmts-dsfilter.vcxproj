@@ -84,9 +84,12 @@
       </AdditionalDependencies>
     </Link>
     <PostBuildEvent>
-      <Command>copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avcodec-62.dll "$(OutDir)"
-copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avutil-60.dll "$(OutDir)"
-copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-6.dll "$(OutDir)"</Command>
+      <!-- Match the SONAME by wildcard: vcpkg bumps ffmpeg (and with it
+           avcodec-NN / avutil-NN / swresample-N) without notice, and a
+           hard-coded number turns that into a post-build failure. -->
+      <Command>copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avcodec-*.dll "$(OutDir)"
+copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avutil-*.dll "$(OutDir)"
+copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-*.dll "$(OutDir)"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
 

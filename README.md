@@ -143,14 +143,19 @@ and creates a ZIP package containing:
 
 ```text
 mmts-dsfilter.ax
-avcodec-62.dll
-avutil-60.dll
-swresample-6.dll
+avcodec-<soname>.dll
+avutil-<soname>.dll
+swresample-<soname>.dll
 mmts-dsfilter.ini
 Install_mmts-dsfilter_64.cmd
 Uninstall_mmts-dsfilter_64.cmd
 README.md
 ```
+
+The ffmpeg DLL names carry the SONAME of whatever version vcpkg installed, so
+they change when ffmpeg is bumped (ffmpeg 8 ships `avutil-60.dll`, ffmpeg 9
+ships `avutil-61.dll`). Both the post-build copy and the packaging step match
+them by wildcard.
 
 The workflow can be run manually from GitHub Actions to create an artifact. It
 also publishes the ZIP as a GitHub Release asset when a `v*` tag is pushed, for
