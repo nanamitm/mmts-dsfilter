@@ -124,6 +124,7 @@ copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-*.dll "$(OutDir)"</C
     <ClCompile Include="..\src\MmtTlvSplitter.cpp" />
     <ClCompile Include="..\src\SubtitleDebugLogShim.cpp" />
     <ClCompile Include="..\src\SubtitleTimingResolver.cpp" />
+    <ClCompile Include="..\src\TtmlAdapter.cpp" />
     <ClCompile Include="..\src\FilterFactory.cpp" />
   </ItemGroup>
 

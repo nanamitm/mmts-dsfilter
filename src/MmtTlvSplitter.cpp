@@ -2,7 +2,7 @@
 #include "DebugLog.h"
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
-#include "ttml.h"
+#include "TtmlModel.h"
 #include "pugixml.hpp"
 #include <fstream>
 #include <strmif.h>
@@ -130,7 +130,7 @@ static std::string ExtractTtmlPlainText(const uint8_t* data, size_t size)
         return {};
 
     std::string xml(reinterpret_cast<const char*>(data), size);
-    TTML ttml = TTMLPaser::parse(xml);
+    const DsTtml::Document ttml = DsTtml::Parse(xml);
     std::ostringstream text;
 
     for (const auto& div : ttml.divTags) {
@@ -791,24 +791,16 @@ static void TryLoadDumpedSubtitleGlyphResources(int streamIndex)
 
 static std::string EscapeAssText(const std::string& text);
 
-static bool TryGetLength(const TTMLCssValue& value, float& length)
+// DsTtml::Parse() already dropped every non-<length> value, so only the unit
+// still has to be checked here - matching the old TryGetLength() behaviour.
+static bool TryGetLengthPair(const std::optional<DsTtml::LengthPair>& pair, float& first, float& second)
 {
-    try {
-        TTMLCssValueLength v = value.getValue<TTMLCssValueLength>();
-        if (v.unit == "px") {
-            length = v.value;
-            return true;
-        }
-    } catch (const std::bad_variant_access&) {
-    }
-    return false;
-}
-
-static bool TryGetLengthPair(const std::optional<TTMLCssValuePair>& pair, float& first, float& second)
-{
-    if (!pair.has_value())
+    if (!pair.has_value() || pair->first.unit != "px" || pair->second.unit != "px")
         return false;
-    return TryGetLength(pair->first, first) && TryGetLength(pair->second, second);
+
+    first = pair->first.value;
+    second = pair->second.value;
+    return true;
 }
 
 static std::string FormatAssTag(const char* format, int value)
@@ -818,7 +810,7 @@ static std::string FormatAssTag(const char* format, int value)
     return std::string(buf);
 }
 
-static std::string FormatAssColorTag(const TTMLCssValueColor& color)
+static std::string FormatAssColorTag(const DsTtml::Color& color)
 {
     char buf[64];
     std::snprintf(buf, sizeof(buf), "\\c&H%02X%02X%02X&",
@@ -832,7 +824,7 @@ static std::string FormatAssColorTag(const TTMLCssValueColor& color)
     return tag;
 }
 
-static int BaseAssFontSizeFromSpan(const TTMLSpanTag* span)
+static int BaseAssFontSizeFromSpan(const DsTtml::Span* span)
 {
     if (!span)
         return 64;
@@ -845,7 +837,7 @@ static int BaseAssFontSizeFromSpan(const TTMLSpanTag* span)
     return 64;
 }
 
-static int ParagraphMaxBaseFontSize(const TTMLPTag& p)
+static int ParagraphMaxBaseFontSize(const DsTtml::Paragraph& p)
 {
     int maxSize = 0;
     for (const auto& span : p.spanTags) {
@@ -855,7 +847,7 @@ static int ParagraphMaxBaseFontSize(const TTMLPTag& p)
     return maxSize;
 }
 
-static int DivMaxBaseFontSize(const TTMLDivTag& div)
+static int DivMaxBaseFontSize(const DsTtml::Division& div)
 {
     int maxSize = 0;
     for (const auto& p : div.pTags)
@@ -863,7 +855,7 @@ static int DivMaxBaseFontSize(const TTMLDivTag& div)
     return maxSize;
 }
 
-static double RubyLikeYOffsetAss(const TTMLPTag& p, int divMaxFontSize)
+static double RubyLikeYOffsetAss(const DsTtml::Paragraph& p, int divMaxFontSize)
 {
     const int pFontSize = ParagraphMaxBaseFontSize(p);
     if (divMaxFontSize <= 0 || pFontSize <= 0 || pFontSize * 10 > divMaxFontSize * 6)
@@ -872,12 +864,12 @@ static double RubyLikeYOffsetAss(const TTMLPTag& p, int divMaxFontSize)
     return divMaxFontSize - pFontSize;
 }
 
-static bool IsRubyLikeParagraph(const TTMLPTag& p, int divMaxFontSize)
+static bool IsRubyLikeParagraph(const DsTtml::Paragraph& p, int divMaxFontSize)
 {
     return RubyLikeYOffsetAss(p, divMaxFontSize) > 0;
 }
 
-static bool HasRubyLikeParagraph(const TTMLDivTag& div, int divMaxFontSize)
+static bool HasRubyLikeParagraph(const DsTtml::Division& div, int divMaxFontSize)
 {
     for (const auto& p : div.pTags) {
         if (IsRubyLikeParagraph(p, divMaxFontSize))
@@ -886,7 +878,7 @@ static bool HasRubyLikeParagraph(const TTMLDivTag& div, int divMaxFontSize)
     return false;
 }
 
-static double B24FontHeightFromSpan(const TTMLSpanTag* span)
+static double B24FontHeightFromSpan(const DsTtml::Span* span)
 {
     if (!span)
         return 0;
@@ -899,22 +891,18 @@ static double B24FontHeightFromSpan(const TTMLSpanTag* span)
     return fontHeight;
 }
 
-static double B24LineOffsetYFromParagraph(const TTMLPTag& p)
+static double B24LineOffsetYFromParagraph(const DsTtml::Paragraph& p)
 {
     if (p.spanTags.empty() || !p.region.extent.has_value())
         return 0;
 
-    const TTMLSpanTag* firstSpan = &(*p.spanTags.begin());
+    const DsTtml::Span* firstSpan = &(*p.spanTags.begin());
     if (!firstSpan->style.lineHeight.has_value() || !firstSpan->style.fontSize.has_value())
         return 0;
 
-    try {
-        const double lineHeight = firstSpan->style.lineHeight->getValue<TTMLCssValueLength>().value;
-        const double fontHeight = B24FontHeightFromSpan(firstSpan);
-        return (lineHeight - fontHeight) / 2.0;
-    } catch (const std::bad_variant_access&) {
-        return 0;
-    }
+    const double lineHeight = firstSpan->style.lineHeight->value;
+    const double fontHeight = B24FontHeightFromSpan(firstSpan);
+    return (lineHeight - fontHeight) / 2.0;
 }
 
 static int CountAssTextLines(const std::string& text)
@@ -930,7 +918,7 @@ static int CountAssTextLines(const std::string& text)
     return lines;
 }
 
-static int CountAssParagraphLines(const TTMLPTag& p)
+static int CountAssParagraphLines(const DsTtml::Paragraph& p)
 {
     int lines = 1;
     for (const auto& span : p.spanTags)
@@ -938,17 +926,13 @@ static int CountAssParagraphLines(const TTMLPTag& p)
     return lines;
 }
 
-static double AssBackgroundCellHeightFromSpan(const TTMLPTag& p, const TTMLSpanTag* span,
+static double AssBackgroundCellHeightFromSpan(const DsTtml::Paragraph& p, const DsTtml::Span* span,
                                               double fontScale)
 {
     if (span && span->style.lineHeight.has_value()) {
-        try {
-            const TTMLCssValueLength lineHeight =
-                span->style.lineHeight->getValue<TTMLCssValueLength>();
-            if (lineHeight.unit == "px" && lineHeight.value > 0)
-                return lineHeight.value * 1080.0 / 2160.0;
-        } catch (const std::bad_variant_access&) {
-        }
+        const DsTtml::Length& lineHeight = *span->style.lineHeight;
+        if (lineHeight.unit == "px" && lineHeight.value > 0)
+            return lineHeight.value * 1080.0 / 2160.0;
     }
 
     float extentX = 0;
@@ -991,12 +975,12 @@ static double FitAssFontScale(int baseFontSize, int lineCount, double anchorYAss
     return scale;
 }
 
-static int AssFontSizeFromSpan(const TTMLSpanTag* span, double fontScale)
+static int AssFontSizeFromSpan(const DsTtml::Span* span, double fontScale)
 {
     return (std::max)(1, static_cast<int>(std::lround(BaseAssFontSizeFromSpan(span) * fontScale)));
 }
 
-static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
+static int AssFontScaleXPercentFromSpan(const DsTtml::Span* span)
 {
     if (!span)
         return 100;
@@ -1009,7 +993,7 @@ static int AssFontScaleXPercentFromSpan(const TTMLSpanTag* span)
     return (std::max)(1, static_cast<int>(std::lround(fontWidth * 100.0 / fontHeight)));
 }
 
-static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale,
+static std::string BuildAssStyleTags(const DsTtml::Span* span, double fontScale,
                                      const MmtsCaptionSettings& settings)
 {
     std::string tags;
@@ -1033,12 +1017,8 @@ static std::string BuildAssStyleTags(const TTMLSpanTag* span, double fontScale,
     tags += FormatAssTag("\\bord%d", settings.outlineWidth);
     tags += "\\shad0";
 
-    if (span->style.color.has_value()) {
-        try {
-            tags += FormatAssColorTag(span->style.color->getValue<TTMLCssValueColor>());
-        } catch (const std::bad_variant_access&) {
-        }
-    }
+    if (span->style.color.has_value())
+        tags += FormatAssColorTag(*span->style.color);
 
     return tags;
 }
@@ -1056,7 +1036,7 @@ static std::wstring Utf8ToWide(const std::string& text)
     return wide;
 }
 
-static int CountAssTextChars(const TTMLPTag& p)
+static int CountAssTextChars(const DsTtml::Paragraph& p)
 {
     int total = 0;
     for (const auto& span : p.spanTags) {
@@ -1069,7 +1049,7 @@ static int CountAssTextChars(const TTMLPTag& p)
     return total;
 }
 
-static double AssCellWidthFromSpan(const TTMLSpanTag* span)
+static double AssCellWidthFromSpan(const DsTtml::Span* span)
 {
     if (!span)
         return 64.0;
@@ -1082,9 +1062,9 @@ static double AssCellWidthFromSpan(const TTMLSpanTag* span)
     return BaseAssFontSizeFromSpan(span);
 }
 
-static double ParagraphCellWidthAss(const TTMLPTag& p)
+static double ParagraphCellWidthAss(const DsTtml::Paragraph& p)
 {
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     return AssCellWidthFromSpan(firstSpan);
 }
 
@@ -1096,7 +1076,7 @@ static std::string BuildAssPositionTagsFromAss(double xPos, double yPos)
            FormatAssTag("\\pos(%d", x) + FormatAssTag(",%d)", y);
 }
 
-static bool ParagraphBasePositionAss(const TTMLPTag& p, double extraYAss,
+static bool ParagraphBasePositionAss(const DsTtml::Paragraph& p, double extraYAss,
                                      bool hasXOverride, double xOverrideAss,
                                      double& xAss, double& yAss)
 {
@@ -1110,7 +1090,7 @@ static bool ParagraphBasePositionAss(const TTMLPTag& p, double extraYAss,
     return true;
 }
 
-static bool ParagraphBackgroundPositionAss(const TTMLPTag& p, double extraYAss,
+static bool ParagraphBackgroundPositionAss(const DsTtml::Paragraph& p, double extraYAss,
                                            bool hasXOverride, double xOverrideAss,
                                            double& xAss, double& yAss)
 {
@@ -1399,7 +1379,7 @@ static bool GetSubtitleGlyphResource(int streamIndex, uint32_t codepoint, Subtit
     return false;
 }
 
-static std::string BuildAssDrawingStyleTags(const TTMLSpanTag* span,
+static std::string BuildAssDrawingStyleTags(const DsTtml::Span* span,
                                             const MmtsCaptionSettings& settings)
 {
     std::string tags = "\\bord0\\shad0";
@@ -1409,16 +1389,13 @@ static std::string BuildAssDrawingStyleTags(const TTMLSpanTag* span,
                       static_cast<unsigned>(settings.captionAlpha));
         tags += alphaBuf;
     }
-    if (span && span->style.color.has_value()) {
-        try {
-            tags += FormatAssColorTag(span->style.color->getValue<TTMLCssValueColor>());
-        } catch (const std::bad_variant_access&) {
-        }
-    }
+    if (span && span->style.color.has_value())
+        tags += FormatAssColorTag(*span->style.color);
+
     return tags;
 }
 
-static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
+static bool GetAssBackgroundColor(const DsTtml::Span& span, const MmtsCaptionSettings& settings,
                                   uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& assAlpha)
 {
     r = kDefaultBackgroundRgb;
@@ -1427,19 +1404,16 @@ static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSett
     bool hasColor = false;
 
     if (span.style.backgroundColor.has_value()) {
-        try {
-            const TTMLCssValueColor color = span.style.backgroundColor->getValue<TTMLCssValueColor>();
-            r = color.r;
-            g = color.g;
-            b = color.b;
-            if (settings.backgroundAlpha < 0) {
-                if (color.a == 0)
-                    return false;
-                assAlpha = 255 - color.a;
-            }
-            hasColor = true;
-        } catch (const std::bad_variant_access&) {
+        const DsTtml::Color& color = *span.style.backgroundColor;
+        r = color.r;
+        g = color.g;
+        b = color.b;
+        if (settings.backgroundAlpha < 0) {
+            if (color.a == 0)
+                return false;
+            assAlpha = 255 - color.a;
         }
+        hasColor = true;
     }
 
     if (settings.backgroundAlpha >= 0) {
@@ -1453,7 +1427,7 @@ static bool GetAssBackgroundColor(const TTMLSpanTag& span, const MmtsCaptionSett
 }
 
 static void AppendAssBackgroundEvent(double xPos, double yPos, double width, double height,
-                                     const TTMLSpanTag& span, const MmtsCaptionSettings& settings,
+                                     const DsTtml::Span& span, const MmtsCaptionSettings& settings,
                                      std::vector<std::string>& events)
 {
     if (!settings.showBackground || width <= 0 || height <= 0)
@@ -1481,7 +1455,7 @@ static void AppendAssBackgroundEvent(double xPos, double yPos, double width, dou
     events.emplace_back(buf);
 }
 
-static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, double extraYAss,
+static void AppendAssCellBackgroundEvents(const DsTtml::Paragraph& p, double fontScale, double extraYAss,
                                           bool hasXOverride, double xOverrideAss,
                                           const MmtsCaptionSettings& settings,
                                           std::vector<std::string>& events)
@@ -1494,7 +1468,7 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
     if (!ParagraphBackgroundPositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
         return;
 
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const double lineGap = AssBackgroundCellHeightFromSpan(p, firstSpan, fontScale);
     const double fallbackCellWidth = ParagraphCellWidthAss(p);
     double x = baseX;
@@ -1577,7 +1551,7 @@ static void AppendAssCellBackgroundEvents(const TTMLPTag& p, double fontScale, d
     flushRun();
 }
 
-static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double fontScale, double extraYAss,
+static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& p, double fontScale, double extraYAss,
                                       bool hasXOverride, double xOverrideAss,
                                       const MmtsCaptionSettings& settings,
                                       std::vector<std::string>& events,
@@ -1589,7 +1563,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double
     if (!ParagraphBasePositionAss(p, extraYAss, hasXOverride, xOverrideAss, baseX, baseY))
         return false;
 
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
     const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
     const double fallbackCellWidth = ParagraphCellWidthAss(p);
@@ -1667,7 +1641,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const TTMLPTag& p, double
     return wroteEvent;
 }
 
-static double BaseAssYFromParagraph(const TTMLPTag& p)
+static double BaseAssYFromParagraph(const DsTtml::Paragraph& p)
 {
     float originX = 0;
     float originY = 0;
@@ -1676,13 +1650,13 @@ static double BaseAssYFromParagraph(const TTMLPTag& p)
     return (originY + B24LineOffsetYFromParagraph(p)) * 1080.0 / 2160.0;
 }
 
-static double AssLineGapForParagraphs(const TTMLPTag& a, const TTMLPTag& b)
+static double AssLineGapForParagraphs(const DsTtml::Paragraph& a, const DsTtml::Paragraph& b)
 {
     const int fontSize = (std::max)(ParagraphMaxBaseFontSize(a), ParagraphMaxBaseFontSize(b));
     return fontSize > 0 ? fontSize * 1.18 : 85.0;
 }
 
-static double AssLineGapForRubyCluster(const TTMLPTag& a, const TTMLPTag& b, int rubyFontSize)
+static double AssLineGapForRubyCluster(const DsTtml::Paragraph& a, const DsTtml::Paragraph& b, int rubyFontSize)
 {
     const int mainFontSize = (std::max)(ParagraphMaxBaseFontSize(a), ParagraphMaxBaseFontSize(b));
     if (mainFontSize <= 0 || rubyFontSize <= 0)
@@ -1692,7 +1666,7 @@ static double AssLineGapForRubyCluster(const TTMLPTag& a, const TTMLPTag& b, int
     return mainFontSize + rubyFontSize + rubyGap * 2.0;
 }
 
-static void LogAssParagraphLayout(const TTMLPTag& p, size_t eventIndex, double fontScale, double extraYAss)
+static void LogAssParagraphLayout(const DsTtml::Paragraph& p, size_t eventIndex, double fontScale, double extraYAss)
 {
     float originX = 0;
     float originY = 0;
@@ -1700,7 +1674,7 @@ static void LogAssParagraphLayout(const TTMLPTag& p, size_t eventIndex, double f
     float extentY = 0;
     const bool hasOrigin = TryGetLengthPair(p.region.origin, originX, originY);
     const bool hasExtent = TryGetLengthPair(p.region.extent, extentX, extentY);
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const int baseFontSize = BaseAssFontSizeFromSpan(firstSpan);
     const int assFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
     const int lineCount = CountAssParagraphLines(p);
@@ -1723,9 +1697,9 @@ static void LogAssParagraphLayout(const TTMLPTag& p, size_t eventIndex, double f
     }
 }
 
-static double AssFontScaleForParagraph(const TTMLPTag& p)
+static double AssFontScaleForParagraph(const DsTtml::Paragraph& p)
 {
-    const TTMLSpanTag* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
+    const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const int baseFontSize = BaseAssFontSizeFromSpan(firstSpan);
     float originX = 0;
     float originY = 0;
@@ -1748,7 +1722,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
         return cue;
 
     std::string xml(reinterpret_cast<const char*>(data), size);
-    TTML ttml = TTMLPaser::parse(xml);
+    const DsTtml::Document ttml = DsTtml::Parse(xml);
     const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
     std::ostringstream text;
 
@@ -1767,7 +1741,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
             cue.hasEnd = true;
         }
         if (!splitParagraphs) {
-            std::vector<const TTMLPTag*> paragraphs;
+            std::vector<const DsTtml::Paragraph*> paragraphs;
             paragraphs.reserve(div.pTags.size());
             for (const auto& p : div.pTags)
                 paragraphs.push_back(&p);
@@ -1835,7 +1809,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 }
             }
         } else {
-            std::vector<const TTMLPTag*> paragraphs;
+            std::vector<const DsTtml::Paragraph*> paragraphs;
             paragraphs.reserve(div.pTags.size());
             for (const auto& p : div.pTags)
                 paragraphs.push_back(&p);

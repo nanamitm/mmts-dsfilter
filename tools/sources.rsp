@@ -85,4 +85,5 @@
 "..\..\dantto4k\src\tlvDescriptors.cpp"
 "..\..\dantto4k\src\tlvTableFactory.cpp"
 "..\..\dantto4k\src\ttml.cpp"
+"..\src\TtmlAdapter.cpp"
 "..\..\dantto4k\src\videoComponentDescriptor.cpp"

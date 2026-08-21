@@ -44,7 +44,7 @@
 #include "config.h"
 #include "mpuProcessorBase.h" // NOPTS_VALUE, MfuData
 #include "remuxerHandler.h"
-#include "ttml.h"
+#include "TtmlModel.h"
 #include "DsHandler.h"
 #include "SubtitleTimingResolver.h"
 
@@ -66,9 +66,9 @@ std::string ExtractPlainTextAndTiming(const uint8_t* data, size_t size,
         return {};
 
     std::string xml(reinterpret_cast<const char*>(data), size);
-    TTML ttml;
+    DsTtml::Document ttml;
     try {
-        ttml = TTMLPaser::parse(xml);
+        ttml = DsTtml::Parse(xml);
     } catch (...) {
         return {};
     }

@@ -18,7 +18,7 @@
 #include "mpuProcessorBase.h"  // NOPTS_VALUE, MfuData
 #include "stream.h"
 #include "timebase.h"
-#include "ttml.h"
+#include "TtmlModel.h"
 
 using namespace MmtTlv;
 
@@ -49,17 +49,16 @@ public:
     std::map<int, StreamInfo> streams;
     int subtitleSamples = 0;
 
-    static bool getLengthPair(const std::optional<TTMLCssValuePair>& pair, double& x, double& y)
+    // DsTtml::Parse() resolved the CSS variants, so a present pair is always a
+    // pair of lengths. As before, the unit is not inspected here.
+    static bool getLengthPair(const std::optional<DsTtml::LengthPair>& pair, double& x, double& y)
     {
         if (!pair.has_value())
             return false;
-        try {
-            x = pair->first.getValue<TTMLCssValueLength>().value;
-            y = pair->second.getValue<TTMLCssValueLength>().value;
-            return true;
-        } catch (...) {
-            return false;
-        }
+
+        x = pair->first.value;
+        y = pair->second.value;
+        return true;
     }
 
     void onVideoData(const MmtStream& stream, const MfuData& mfu) override {
@@ -119,7 +118,7 @@ public:
         ++subtitleSamples;
 
         std::string xml(mfu.data.begin(), mfu.data.end());
-        TTML ttml = TTMLPaser::parse(xml);
+        const DsTtml::Document ttml = DsTtml::Parse(xml);
 
         double maxOriginX = 0, maxOriginY = 0, maxExtentX = 0, maxExtentY = 0;
         double maxFontX = 0, maxFontY = 0;

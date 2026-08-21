@@ -124,6 +124,7 @@
     <ClCompile Include="..\mmts_compare_dump.cpp" />
     <ClCompile Include="..\..\src\DsHandler.cpp" />
     <ClCompile Include="..\..\src\SubtitleTimingResolver.cpp" />
+    <ClCompile Include="..\..\src\TtmlAdapter.cpp" />
   </ItemGroup>
 
   <!-- ==================== dantto4k core + RemuxerHandler (needs TSDuck) ==================== -->

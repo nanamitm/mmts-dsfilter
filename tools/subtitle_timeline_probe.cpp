@@ -24,7 +24,7 @@
 #include "timeUtil.h"
 #include "mhEit.h"
 #include "ntp.h"
-#include "ttml.h"
+#include "TtmlModel.h"
 
 using namespace MmtTlv;
 
@@ -108,9 +108,9 @@ public:
         ++subtitleCount;
 
         std::string xml(mfu.data.begin(), mfu.data.end());
-        TTML ttml;
+        DsTtml::Document ttml;
         try {
-            ttml = TTMLPaser::parse(xml);
+            ttml = DsTtml::Parse(xml);
         } catch (...) {
             std::printf("[SUB #%d] anchor=%lld ms  streamIndex=%d  <parse failed> bytes=%zu\n",
                         subtitleCount, (long long)Anchor(), mfu.streamIndex, mfu.data.size());
