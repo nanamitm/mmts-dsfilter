@@ -1039,12 +1039,11 @@ void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
         if (!mhEvent)
             continue;
 
-        std::tm startTime = EITConvertStartTime(mhEvent->startTime);
-        if (!isValidEITStartTime(startTime))
-            continue;
-
-        const std::time_t startSec = std::mktime(&startTime);
-        if (startSec < 0)
+        // EIT start_time carries JST wall-clock. std::mktime() would read it
+        // in the host's local timezone, so use dantto4k's fixed +09:00
+        // conversion instead - it also rejects unknown/out-of-range fields.
+        uint64_t startSec{};
+        if (!EITConvertStartTimeToUnixTime(mhEvent->startTime, &startSec))
             continue;
 
         const long long programStartSec = static_cast<long long>(startSec);

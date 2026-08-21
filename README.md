@@ -168,7 +168,11 @@ git push origin v0.1.0
 
 The workflow checks out `dantto4k` from the same GitHub owner as this
 repository, so forks should also provide a sibling `<owner>/dantto4k`
-repository.
+repository. The checkout is pinned to a dantto4k tag (`ref:` in
+`.github/workflows/release.yml`) because this project compiles dantto4k
+sources directly; bump it deliberately after verifying the build against the
+newer dantto4k release. Local builds are not pinned -- they use whatever is
+checked out in the sibling `dantto4k` directory.
 
 ## Register
 
