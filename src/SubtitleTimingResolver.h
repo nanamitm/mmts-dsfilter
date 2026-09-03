@@ -31,10 +31,15 @@ public:
     int64_t SourceTime(int64_t ttmlTime) const;
 
     // Resolves (and, at most once per program/resync, recalibrates) the
-    // offset mapping subtitle source time -> normalized media time, mirroring
-    // dantto4k's one-shot-per-program PCR calibration. `anchor` is the
-    // current media-time anchor (video DTS/PTS elapsed). The *ForLog params
-    // only feed the diagnostic log line and have no effect on the result.
+    // offset mapping subtitle source time -> normalized media time. This was
+    // modelled on dantto4k's one-shot-per-program PCR calibration, which
+    // dantto4k no longer has: its TTML/B24 rewrite dropped the EIT-derived
+    // calibration, and it now anchors each TTML document on the
+    // reference_start_time carried in the subtitle descriptor. The two timing
+    // models have diverged - this one is ours to reason about on its own.
+    // `anchor` is the current media-time anchor (video DTS/PTS elapsed). The
+    // *ForLog params only feed the diagnostic log line and have no effect on
+    // the result.
     int64_t ResolveOffset(int64_t ttmlBegin, int64_t sourceBegin, int64_t anchor,
                           int64_t currentPtsForLog, int64_t currentDtsForLog,
                           int64_t segmentStartForLog, int64_t segmentTimeOffsetForLog);

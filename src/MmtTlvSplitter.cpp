@@ -4280,8 +4280,10 @@ REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, 
 {
     // Subtitle samples have no MFU PTS, so synthesize a source timeline from
     // EIT program start + TTML begin when possible. If an NTP/PCR anchor is
-    // available, calibrate like dantto4k: align the first cue of each program
-    // to the latest PCR-derived media time and keep that offset for TTML spacing.
+    // available, align the first cue of each program to the latest PCR-derived
+    // media time and keep that offset for TTML spacing. dantto4k calibrated the
+    // same way when this was written; it has since moved to per-document
+    // anchoring - see SubtitleTimingResolver.h.
     // offset maps subtitle source time
     // -> normalized media time:
     //   mediaStart = sourceBegin - offset

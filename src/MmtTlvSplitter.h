@@ -113,8 +113,10 @@ private:
                             const std::string& assText);
     void ProcessDeferredSubtitleSamples();
     // Maps subtitle source time to the media (normalized, pre-segment) timeline.
-    // When EIT is available, source time is programStart + TTML begin, similar
-    // to dantto4k's synthetic subtitle PTS. Otherwise TTML begin is used alone.
+    // When EIT is available, source time is programStart + TTML begin; otherwise
+    // TTML begin is used alone. dantto4k synthesized its subtitle PTS the same
+    // way when this was written, but no longer does - see
+    // SubtitleTimingResolver.h.
     // Thin wrappers around m_subtitleResolver (see SubtitleTimingResolver.h),
     // kept as methods so every existing call site is unchanged.
     REFERENCE_TIME SubtitleSourceTime(REFERENCE_TIME ttmlTime) const;
