@@ -640,18 +640,29 @@ static void RegisterSubtitleGlyphResource(int streamIndex, const uint8_t* data, 
         return;
 
     const std::string payload(reinterpret_cast<const char*>(data), size);
-    const auto glyphs = arib::ttml::parse_svg_glyph_resource(payload);
-    int registered = 0;
-    for (const auto& [codepoint, glyph] : glyphs) {
+    bool xmlParsed = false;
+    const auto glyphs = arib::ttml::parse_svg_glyph_resource(payload, &xmlParsed);
+
+    {
         std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
-        g_subtitleGlyphs[{streamIndex, codepoint}] = glyph;
-        ++registered;
+        for (const auto& [codepoint, glyph] : glyphs)
+            g_subtitleGlyphs[{streamIndex, codepoint}] = glyph;
+    }
+
+    for (const auto& [codepoint, glyph] : glyphs) {
         LogDetail(L"MMT/TLV Subtitle glyph registered: streamIndex=%d U+%04X units=%d ascent=%d descent=%d\n",
                   streamIndex, codepoint, glyph.unitsPerEm, glyph.ascent, glyph.descent);
     }
 
-    if (registered == 0) {
-        LogDetail(L"MMT/TLV Subtitle glyph resource parsed but no glyph registered: streamIndex=%d\n", streamIndex);
+    if (glyphs.empty()) {
+        // A resource that is not XML and one that is a font with nothing usable
+        // in it call for different digging, so keep them apart in the log.
+        if (!xmlParsed) {
+            LogDetail(L"MMT/TLV Subtitle glyph resource is not XML: streamIndex=%d bytes=%zu\n",
+                      streamIndex, size);
+        } else {
+            LogDetail(L"MMT/TLV Subtitle glyph resource parsed but no glyph registered: streamIndex=%d\n", streamIndex);
+        }
     }
 }
 
@@ -1135,7 +1146,10 @@ static bool BuildAssGlyphDrawingPath(const arib::ttml::DrcsGlyph& glyph,
     if (glyph.path.empty() || width <= 0 || height <= 0)
         return false;
 
-    const double units = glyph.unitsPerEm > 0 ? glyph.unitsPerEm : 360.0;
+    // Only a resource that declares a nonsense units-per-em gets here, and the
+    // fallback has to be the one DrcsGlyph uses when the resource declares
+    // none - the two renderers would otherwise scale the same glyph differently.
+    const double units = glyph.unitsPerEm > 0 ? glyph.unitsPerEm : arib::ttml::DrcsGlyph{}.unitsPerEm;
     const double glyphHeight = glyph.ascent > glyph.descent ? glyph.ascent - glyph.descent : units;
     const double scaleX = width / units;
     const double scaleY = height / glyphHeight;
@@ -1144,12 +1158,15 @@ static bool BuildAssGlyphDrawingPath(const arib::ttml::DrcsGlyph& glyph,
 
     const arib::ttml::SvgPath path = arib::ttml::parse_svg_path(glyph.path);
     if (!path.complete()) {
-        LogDetail(L"MMT/TLV Subtitle glyph path unsupported: command=%C\n",
-                  static_cast<wchar_t>(path.unsupportedCommand));
+        LogDetail(L"MMT/TLV Subtitle glyph path unsupported: U+%04X command=%c\n",
+                  glyph.codepoint, static_cast<wchar_t>(path.unsupportedCommand));
         return false;
     }
 
     std::ostringstream ass;
+    // A moveto on its own draws nothing, so it deliberately does not set this:
+    // a path holding only movetos has to fall back to the text rather than
+    // claim a glyph and render an empty drawing over it.
     bool wrote = false;
     for (const auto& command : path.commands) {
         switch (command.type) {
