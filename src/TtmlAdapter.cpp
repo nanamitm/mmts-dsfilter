@@ -31,6 +31,14 @@ std::optional<DsTtml::LengthPair> ToLengthPair(const std::optional<LengthPair>& 
     };
 }
 
+std::optional<DsTtml::Length> ToLength(const std::optional<double>& value)
+{
+    if (!value.has_value())
+        return std::nullopt;
+
+    return DsTtml::Length{static_cast<float>(*value), kPx};
+}
+
 std::optional<DsTtml::Length> ToLineHeight(const std::optional<StyleLineHeightValue>& value)
 {
     if (!value.has_value())
@@ -57,6 +65,7 @@ DsTtml::Style ToStyle(const StyleProperties& style)
     DsTtml::Style out;
     out.fontSize = ToLengthPair(style.font_size);
     out.lineHeight = ToLineHeight(style.line_height);
+    out.letterSpacing = ToLength(style.letter_spacing);
     out.color = ToColor(style.color);
     out.backgroundColor = ToColor(style.background_color);
     return out;

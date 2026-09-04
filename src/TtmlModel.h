@@ -37,6 +37,9 @@ struct Style {
     // reads as absent, which is how the previous getValue<>() + catch did it.
     std::optional<LengthPair> fontSize;
     std::optional<Length> lineHeight;
+    // arib-tt:letter-spacing. B24 advances the pen by fontSize + letterSpacing
+    // per cell, so this is part of the layout, not a typographic nicety.
+    std::optional<Length> letterSpacing;
     std::optional<Color> color;
     std::optional<Color> backgroundColor;
 };

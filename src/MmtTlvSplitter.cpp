@@ -1062,10 +1062,35 @@ static double AssCellWidthFromSpan(const DsTtml::Span* span)
     return BaseAssFontSizeFromSpan(span);
 }
 
-static double ParagraphCellWidthAss(const DsTtml::Paragraph& p)
+static double AssLetterSpacingFromSpan(const DsTtml::Span* span)
+{
+    if (!span || !span->style.letterSpacing.has_value())
+        return 0.0;
+
+    const DsTtml::Length& spacing = *span->style.letterSpacing;
+    if (spacing.unit != "px" || spacing.value <= 0)
+        return 0.0;
+
+    return spacing.value * 1920.0 / 3840.0;
+}
+
+// B24 lays text out on a grid of cells that are one font width plus one
+// letter-spacing wide - a region's extent is exactly the cell count times this.
+// The glyph itself only fills the font width, so this is the pen advance and
+// the width of the cell background, not the size the character is drawn at.
+static double AssCellAdvanceFromSpan(const DsTtml::Span* span)
+{
+    const double cellWidth = AssCellWidthFromSpan(span);
+    if (cellWidth <= 0)
+        return cellWidth;
+
+    return cellWidth + AssLetterSpacingFromSpan(span);
+}
+
+static double ParagraphCellAdvanceAss(const DsTtml::Paragraph& p)
 {
     const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
-    return AssCellWidthFromSpan(firstSpan);
+    return AssCellAdvanceFromSpan(firstSpan);
 }
 
 static std::string BuildAssPositionTagsFromAss(double xPos, double yPos)
@@ -1470,7 +1495,7 @@ static void AppendAssCellBackgroundEvents(const DsTtml::Paragraph& p, double fon
 
     const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const double lineGap = AssBackgroundCellHeightFromSpan(p, firstSpan, fontScale);
-    const double fallbackCellWidth = ParagraphCellWidthAss(p);
+    const double fallbackCellAdvance = ParagraphCellAdvanceAss(p);
     double x = baseX;
     double y = baseY;
 
@@ -1507,9 +1532,9 @@ static void AppendAssCellBackgroundEvents(const DsTtml::Paragraph& p, double fon
         if (span.text.empty())
             continue;
 
-        double cellWidth = AssCellWidthFromSpan(&span);
-        if (cellWidth <= 0)
-            cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
+        double cellAdvance = AssCellAdvanceFromSpan(&span);
+        if (cellAdvance <= 0)
+            cellAdvance = fallbackCellAdvance > 0 ? fallbackCellAdvance : 64.0;
 
         const double spanBackgroundHeight = AssBackgroundCellHeightFromSpan(p, &span, fontScale);
         const std::wstring wide = Utf8ToWide(span.text);
@@ -1530,22 +1555,22 @@ static void AppendAssCellBackgroundEvents(const DsTtml::Paragraph& p, double fon
             if (!hasColor) {
                 // No background for this cell: flush any active run and skip
                 flushRun();
-                x += cellWidth;
+                x += cellAdvance;
                 continue;
             }
 
             // Extend the active run if color matches; otherwise start a new one
             if (inRun && spanR == runR && spanG == runG && spanB == runB && spanA == runA) {
-                runWidth += cellWidth;
+                runWidth += cellAdvance;
             } else {
                 flushRun();
                 inRun    = true;
                 runX     = x;
-                runWidth = cellWidth;
+                runWidth = cellAdvance;
                 runHeight = spanBackgroundHeight;
                 runR = spanR; runG = spanG; runB = spanB; runA = spanA;
             }
-            x += cellWidth;
+            x += cellAdvance;
         }
     }
     flushRun();
@@ -1566,7 +1591,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
     const DsTtml::Span* firstSpan = p.spanTags.empty() ? nullptr : &(*p.spanTags.begin());
     const int lineFontSize = AssFontSizeFromSpan(firstSpan, fontScale);
     const double lineGap = lineFontSize > 0 ? lineFontSize * kAssLineHeightRatio : 85.0;
-    const double fallbackCellWidth = ParagraphCellWidthAss(p);
+    const double fallbackCellAdvance = ParagraphCellAdvanceAss(p);
     double x = baseX;
     double y = baseY;
     bool wroteEvent = false;
@@ -1578,9 +1603,12 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
         if (span.text.empty())
             continue;
 
-        double cellWidth = AssCellWidthFromSpan(&span);
-        if (cellWidth <= 0)
-            cellWidth = fallbackCellWidth > 0 ? fallbackCellWidth : 64.0;
+        double cellAdvance = AssCellAdvanceFromSpan(&span);
+        if (cellAdvance <= 0)
+            cellAdvance = fallbackCellAdvance > 0 ? fallbackCellAdvance : 64.0;
+        double glyphWidth = AssCellWidthFromSpan(&span);
+        if (glyphWidth <= 0)
+            glyphWidth = cellAdvance;
 
         const std::string spanTags = BuildAssStyleTags(&span, fontScale, settings);
         const std::wstring wide = Utf8ToWide(span.text);
@@ -1615,14 +1643,14 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
             std::string glyphPath;
             const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
             if (GetSubtitleGlyphResource(streamIndex, codepoint, glyph) &&
-                BuildAssGlyphDrawingPath(glyph, x, y, cellWidth, spanFontSize, glyphPath)) {
+                BuildAssGlyphDrawingPath(glyph, x, y, glyphWidth, spanFontSize, glyphPath)) {
                 std::ostringstream ass;
                 ass << events.size() << ",1,Default,,0,0,0,,{\\an7\\pos(0,0)"
                     << BuildAssDrawingStyleTags(&span, settings)
                     << "\\p1}" << glyphPath << "{\\p0}";
                 events.push_back(ass.str());
                 wroteEvent = true;
-                x += cellWidth;
+                x += cellAdvance;
                 continue;
             }
             if (missingGlyph && codepoint >= 0xE000 && codepoint <= 0xF8FF)
@@ -1634,7 +1662,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
                 << spanTags << "}" << EscapeAssText(utf8);
             events.push_back(ass.str());
             wroteEvent = true;
-            x += cellWidth;
+            x += cellAdvance;
         }
     }
 
