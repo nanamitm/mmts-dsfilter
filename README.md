@@ -89,6 +89,21 @@ tools\mmts_audio_split.exe <input.mmts> [--split] [--max-mb N] [--progress-mb N]
   combined with `--max-mb`, because a partial scan may miss later layout
   changes.
 
+`tools/subtitle_ttml_dump.exe` writes every subtitle TTML sample out as XML
+and prints the B24 cell grid each paragraph asks for:
+
+```powershell
+tools\subtitle_ttml_dump.exe <input.mmts> [outdir] [--verbose]
+```
+
+- `outdir` receives `sub_NNN.xml` per sample. Omit it to only print.
+- `--verbose` also prints the X position of every character.
+- A cell is one font width plus one `arib-tt:letter-spacing`, and a region's
+  extent is exactly the cell count times that, so the printed `laidOut` and
+  `extent` columns must agree. They are what the splitter positions text
+  from, so a `MISMATCH` (also the exit code) is a caption it will lay out
+  wrong - ruby drifting off the character it annotates, for instance.
+
 ## Non-destructive edits (`.mmtsedit`)
 
 The filter supports a non-destructive edit decision list in a `.mmtsedit` JSON
