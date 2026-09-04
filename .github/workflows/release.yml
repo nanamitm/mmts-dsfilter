@@ -27,7 +27,7 @@ jobs:
           # unpinned default branch can break this build without warning
           # (e.g. a renamed source file invalidates the vcxproj file list).
           # Bump deliberately after verifying against a dantto4k release.
-          ref: v20260827b
+          ref: v20260903
           path: dantto4k
 
       - name: Install vcpkg dependencies
