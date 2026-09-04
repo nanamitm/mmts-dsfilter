@@ -3,7 +3,7 @@
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
 #include "TtmlModel.h"
-#include "pugixml.hpp"
+#include "ttml/drcs.h"
 #include <fstream>
 #include <strmif.h>
 #include <cwchar>
@@ -171,15 +171,8 @@ struct TtmlTextCue {
     REFERENCE_TIME end = 0;
 };
 
-struct SubtitleGlyphResource {
-    int unitsPerEm = 360;
-    int ascent = 360;
-    int descent = 0;
-    std::string pathData;
-};
-
 static std::mutex g_subtitleGlyphMutex;
-static std::map<std::pair<int, uint32_t>, SubtitleGlyphResource> g_subtitleGlyphs;
+static std::map<std::pair<int, uint32_t>, arib::ttml::DrcsGlyph> g_subtitleGlyphs;
 static std::mutex g_subtitleGlyphLoadMutex;
 static std::vector<std::wstring> g_loadedSubtitleGlyphFiles;
 
@@ -641,110 +634,20 @@ static void DumpSubtitleResourceIfEnabled(int streamIndex, LONG callbackNo, REFE
     }
 }
 
-static bool ParseSvgUnicodeValue(const char* value, uint32_t& codepoint)
-{
-    if (!value || !*value)
-        return false;
-
-    std::string text(value);
-    const std::string hexEntity = "&#x";
-    size_t pos = text.find(hexEntity);
-    if (pos != std::string::npos) {
-        pos += hexEntity.size();
-        size_t end = text.find(';', pos);
-        if (end == std::string::npos)
-            end = text.size();
-        codepoint = static_cast<uint32_t>(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16));
-        return codepoint != 0;
-    }
-
-    if (text.rfind("U+", 0) == 0 || text.rfind("u+", 0) == 0) {
-        codepoint = static_cast<uint32_t>(std::strtoul(text.c_str() + 2, nullptr, 16));
-        return codepoint != 0;
-    }
-
-    int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-    if (needed <= 0)
-        return false;
-    std::wstring wide(static_cast<size_t>(needed), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), wide.data(), needed);
-    codepoint = static_cast<uint32_t>(wide[0]);
-    return codepoint != 0;
-}
-
-static bool ParseUnicodeRangeValue(const char* value, uint32_t& codepoint)
-{
-    if (!value || !*value)
-        return false;
-    std::string text(value);
-    size_t pos = text.find("U+");
-    if (pos == std::string::npos)
-        pos = text.find("u+");
-    if (pos == std::string::npos)
-        return false;
-    pos += 2;
-    size_t end = pos;
-    while (end < text.size() && std::isxdigit(static_cast<unsigned char>(text[end])))
-        ++end;
-    if (end == pos)
-        return false;
-    codepoint = static_cast<uint32_t>(std::strtoul(text.substr(pos, end - pos).c_str(), nullptr, 16));
-    return codepoint != 0;
-}
-
 static void RegisterSubtitleGlyphResource(int streamIndex, const uint8_t* data, size_t size)
 {
     if (!data || size == 0)
         return;
 
-    pugi::xml_document doc;
-    pugi::xml_parse_result result = doc.load_buffer(data, size);
-    if (result.status != pugi::status_ok) {
-        LogDetail(L"MMT/TLV Subtitle glyph resource parse failed: streamIndex=%d status=%d\n",
-                  streamIndex, static_cast<int>(result.status));
-        return;
-    }
-
-    pugi::xml_node svg = doc.child("svg");
-    if (!svg) {
-        LogDetail(L"MMT/TLV Subtitle glyph resource ignored: streamIndex=%d no svg root\n", streamIndex);
-        return;
-    }
-
+    const std::string payload(reinterpret_cast<const char*>(data), size);
+    const auto glyphs = arib::ttml::parse_svg_glyph_resource(payload);
     int registered = 0;
-    for (pugi::xml_node defs : svg.children("defs")) {
-        for (pugi::xml_node font : defs.children("font")) {
-            SubtitleGlyphResource base;
-            if (font.attribute("horiz-adv-x"))
-                base.unitsPerEm = font.attribute("horiz-adv-x").as_int(base.unitsPerEm);
-
-            pugi::xml_node face = font.child("font-face");
-            if (face) {
-                base.unitsPerEm = face.attribute("units-per-em").as_int(base.unitsPerEm);
-                base.ascent = face.attribute("ascent").as_int(base.ascent);
-                base.descent = face.attribute("descent").as_int(base.descent);
-            }
-
-            uint32_t faceCodepoint = 0;
-            ParseUnicodeRangeValue(face.attribute("unicode-range").value(), faceCodepoint);
-
-            for (pugi::xml_node glyph : font.children("glyph")) {
-                uint32_t codepoint = 0;
-                if (!ParseSvgUnicodeValue(glyph.attribute("unicode").value(), codepoint))
-                    codepoint = faceCodepoint;
-                const char* path = glyph.attribute("d").value();
-                if (codepoint == 0 || !path || !*path)
-                    continue;
-
-                SubtitleGlyphResource resource = base;
-                resource.pathData = path;
-                std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
-                g_subtitleGlyphs[{streamIndex, codepoint}] = std::move(resource);
-                ++registered;
-                LogDetail(L"MMT/TLV Subtitle glyph registered: streamIndex=%d U+%04X units=%d ascent=%d descent=%d\n",
-                          streamIndex, codepoint, resource.unitsPerEm, resource.ascent, resource.descent);
-            }
-        }
+    for (const auto& [codepoint, glyph] : glyphs) {
+        std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
+        g_subtitleGlyphs[{streamIndex, codepoint}] = glyph;
+        ++registered;
+        LogDetail(L"MMT/TLV Subtitle glyph registered: streamIndex=%d U+%04X units=%d ascent=%d descent=%d\n",
+                  streamIndex, codepoint, glyph.unitsPerEm, glyph.ascent, glyph.descent);
     }
 
     if (registered == 0) {
@@ -1219,72 +1122,17 @@ static std::string WideCharSliceToUtf8(const std::wstring& text, size_t pos, siz
     return utf8;
 }
 
-class SvgPathParser {
-public:
-    explicit SvgPathParser(const std::string& path) : m_path(path) {}
-
-    bool eof()
-    {
-        skipSeparators();
-        return m_pos >= m_path.size();
-    }
-
-    bool readCommand(char& command)
-    {
-        skipSeparators();
-        if (m_pos >= m_path.size())
-            return false;
-        char c = m_path[m_pos];
-        if (std::isalpha(static_cast<unsigned char>(c))) {
-            command = c;
-            ++m_pos;
-            return true;
-        }
-        return false;
-    }
-
-    bool readNumber(double& value)
-    {
-        skipSeparators();
-        if (m_pos >= m_path.size())
-            return false;
-        const char* begin = m_path.c_str() + m_pos;
-        char* end = nullptr;
-        value = std::strtod(begin, &end);
-        if (end == begin)
-            return false;
-        m_pos = static_cast<size_t>(end - m_path.c_str());
-        return true;
-    }
-
-private:
-    void skipSeparators()
-    {
-        while (m_pos < m_path.size()) {
-            const unsigned char c = static_cast<unsigned char>(m_path[m_pos]);
-            if (std::isspace(c) || c == ',') {
-                ++m_pos;
-                continue;
-            }
-            break;
-        }
-    }
-
-    const std::string& m_path;
-    size_t m_pos = 0;
-};
-
 static void AppendAssDrawingPoint(std::ostringstream& ass, double value)
 {
     ass << static_cast<int>(std::lround(value));
 }
 
-static bool BuildAssGlyphDrawingPath(const SubtitleGlyphResource& glyph,
+static bool BuildAssGlyphDrawingPath(const arib::ttml::DrcsGlyph& glyph,
                                      double xPos, double yPos,
                                      double width, double height,
                                      std::string& out)
 {
-    if (glyph.pathData.empty() || width <= 0 || height <= 0)
+    if (glyph.path.empty() || width <= 0 || height <= 0)
         return false;
 
     const double units = glyph.unitsPerEm > 0 ? glyph.unitsPerEm : 360.0;
@@ -1294,149 +1142,49 @@ static bool BuildAssGlyphDrawingPath(const SubtitleGlyphResource& glyph,
     auto tx = [&](double v) { return xPos + v * scaleX; };
     auto ty = [&](double v) { return yPos + (glyph.ascent - v) * scaleY; };
 
-    SvgPathParser parser(glyph.pathData);
+    const arib::ttml::SvgPath path = arib::ttml::parse_svg_path(glyph.path);
+    if (!path.complete()) {
+        LogDetail(L"MMT/TLV Subtitle glyph path unsupported: command=%C\n",
+                  static_cast<wchar_t>(path.unsupportedCommand));
+        return false;
+    }
+
     std::ostringstream ass;
-    char command = 0;
-    double cx = 0;
-    double cy = 0;
-    double sx = 0;
-    double sy = 0;
-
-    auto appendMove = [&](double x, double y) {
-        ass << "m ";
-        AppendAssDrawingPoint(ass, tx(x));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, ty(y));
-        ass << ' ';
-        cx = sx = x;
-        cy = sy = y;
-    };
-    auto appendLine = [&](double x, double y) {
-        ass << "l ";
-        AppendAssDrawingPoint(ass, tx(x));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, ty(y));
-        ass << ' ';
-        cx = x;
-        cy = y;
-    };
-    auto appendCubic = [&](double x1, double y1, double x2, double y2, double x, double y) {
-        ass << "b ";
-        AppendAssDrawingPoint(ass, tx(x1));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, ty(y1));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, tx(x2));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, ty(y2));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, tx(x));
-        ass << ' ';
-        AppendAssDrawingPoint(ass, ty(y));
-        ass << ' ';
-        cx = x;
-        cy = y;
-    };
-
     bool wrote = false;
-    while (!parser.eof()) {
-        char nextCommand = 0;
-        if (parser.readCommand(nextCommand))
-            command = nextCommand;
-        if (command == 0)
+    for (const auto& command : path.commands) {
+        switch (command.type) {
+        case arib::ttml::SvgPathCommandType::MoveTo:
+            ass << "m ";
+            AppendAssDrawingPoint(ass, tx(command.point.x));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, ty(command.point.y));
+            ass << ' ';
             break;
-
-        const bool relative = command >= 'a' && command <= 'z';
-        switch (command) {
-        case 'M':
-        case 'm':
-        {
-            double x = 0;
-            double y = 0;
-            if (!parser.readNumber(x) || !parser.readNumber(y))
-                return wrote;
-            if (relative) {
-                x += cx;
-                y += cy;
-            }
-            appendMove(x, y);
-            wrote = true;
-            command = relative ? 'l' : 'L';
-            break;
-        }
-        case 'L':
-        case 'l':
-        {
-            double x = 0;
-            double y = 0;
-            if (!parser.readNumber(x) || !parser.readNumber(y))
-                break;
-            if (relative) {
-                x += cx;
-                y += cy;
-            }
-            appendLine(x, y);
+        case arib::ttml::SvgPathCommandType::LineTo:
+        case arib::ttml::SvgPathCommandType::ClosePath:
+            ass << "l ";
+            AppendAssDrawingPoint(ass, tx(command.point.x));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, ty(command.point.y));
+            ass << ' ';
             wrote = true;
             break;
-        }
-        case 'H':
-        case 'h':
-        {
-            double x = 0;
-            if (!parser.readNumber(x))
-                break;
-            if (relative)
-                x += cx;
-            appendLine(x, cy);
+        case arib::ttml::SvgPathCommandType::CubicTo:
+            ass << "b ";
+            AppendAssDrawingPoint(ass, tx(command.control1.x));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, ty(command.control1.y));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, tx(command.control2.x));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, ty(command.control2.y));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, tx(command.point.x));
+            ass << ' ';
+            AppendAssDrawingPoint(ass, ty(command.point.y));
+            ass << ' ';
             wrote = true;
             break;
-        }
-        case 'V':
-        case 'v':
-        {
-            double y = 0;
-            if (!parser.readNumber(y))
-                break;
-            if (relative)
-                y += cy;
-            appendLine(cx, y);
-            wrote = true;
-            break;
-        }
-        case 'C':
-        case 'c':
-        {
-            double x1 = 0;
-            double y1 = 0;
-            double x2 = 0;
-            double y2 = 0;
-            double x = 0;
-            double y = 0;
-            if (!parser.readNumber(x1) || !parser.readNumber(y1) ||
-                !parser.readNumber(x2) || !parser.readNumber(y2) ||
-                !parser.readNumber(x) || !parser.readNumber(y)) {
-                break;
-            }
-            if (relative) {
-                x1 += cx;
-                y1 += cy;
-                x2 += cx;
-                y2 += cy;
-                x += cx;
-                y += cy;
-            }
-            appendCubic(x1, y1, x2, y2, x, y);
-            wrote = true;
-            break;
-        }
-        case 'Z':
-        case 'z':
-            appendLine(sx, sy);
-            wrote = true;
-            command = 0;
-            break;
-        default:
-            return wrote;
         }
     }
 
@@ -1444,7 +1192,7 @@ static bool BuildAssGlyphDrawingPath(const SubtitleGlyphResource& glyph,
     return wrote && !out.empty();
 }
 
-static bool GetSubtitleGlyphResource(int streamIndex, uint32_t codepoint, SubtitleGlyphResource& glyph)
+static bool GetSubtitleGlyphResource(int streamIndex, uint32_t codepoint, arib::ttml::DrcsGlyph& glyph)
 {
     {
         std::lock_guard<std::mutex> lock(g_subtitleGlyphMutex);
@@ -1705,11 +1453,11 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
                 codepoint = 0x10000 + ((hi << 10) | lo);
             }
 
-            SubtitleGlyphResource glyph;
+            arib::ttml::DrcsGlyph glyph;
             std::string glyphPath;
             const int spanFontSize = AssFontSizeFromSpan(&span, fontScale);
-            if (GetSubtitleGlyphResource(streamIndex, codepoint, glyph) &&
-                BuildAssGlyphDrawingPath(glyph, x, y, glyphWidth, spanFontSize, glyphPath)) {
+            const bool hasGlyph = GetSubtitleGlyphResource(streamIndex, codepoint, glyph);
+            if (hasGlyph && BuildAssGlyphDrawingPath(glyph, x, y, glyphWidth, spanFontSize, glyphPath)) {
                 std::ostringstream ass;
                 ass << events.size() << ",1,Default,,0,0,0,,{\\an7\\pos(0,0)"
                     << BuildAssDrawingStyleTags(&span, settings)
@@ -1719,7 +1467,7 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
                 x += cellAdvance;
                 continue;
             }
-            if (missingGlyph && codepoint >= 0xE000 && codepoint <= 0xF8FF)
+            if (missingGlyph && !hasGlyph && codepoint >= 0xE000 && codepoint <= 0xF8FF)
                 *missingGlyph = true;
 
             std::ostringstream ass;

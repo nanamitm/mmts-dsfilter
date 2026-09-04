@@ -1,5 +1,6 @@
-// The only translation unit that sees dantto4k's TTML layer. Keep it that way:
-// if dantto4k's TTML layer is redesigned, this file is the whole port surface.
+// The only translation unit that sees dantto4k's TTML document AST. Shared
+// DRCS glyph/path types are also consumed by MmtTlvSplitter.cpp; if the parser
+// or resolver AST is redesigned, this file remains the whole port surface.
 #include "TtmlModel.h"
 
 #include "ttml/parser.h"
