@@ -864,15 +864,49 @@ static double RubyLikeYOffsetAss(const DsTtml::Paragraph& p, int divMaxFontSize)
     return divMaxFontSize - pFontSize;
 }
 
-static bool IsRubyLikeParagraph(const DsTtml::Paragraph& p, int divMaxFontSize)
+// arib-tt:ruby states the role of a span outright, which beats inferring it
+// from a font size. It is optional though, and the captures on hand never carry
+// it, so it is only trusted for a division that actually names a role we know:
+// anything else keeps the heuristic above. Values other than "base" and "text"
+// are not interpreted.
+static bool SpanRubyRoleIs(const DsTtml::Span& span, const char* role)
 {
+    return span.style.ruby.has_value() && *span.style.ruby == role;
+}
+
+static bool ParagraphIsDeclaredRubyText(const DsTtml::Paragraph& p)
+{
+    for (const auto& span : p.spanTags) {
+        if (SpanRubyRoleIs(span, "text"))
+            return true;
+    }
+    return false;
+}
+
+static bool DivisionDeclaresRubyRoles(const DsTtml::Division& div)
+{
+    for (const auto& p : div.pTags) {
+        for (const auto& span : p.spanTags) {
+            if (SpanRubyRoleIs(span, "text") || SpanRubyRoleIs(span, "base"))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool IsRubyLikeParagraph(const DsTtml::Paragraph& p, int divMaxFontSize, bool divDeclaresRubyRoles)
+{
+    if (divDeclaresRubyRoles)
+        return ParagraphIsDeclaredRubyText(p);
+
     return RubyLikeYOffsetAss(p, divMaxFontSize) > 0;
 }
 
 static bool HasRubyLikeParagraph(const DsTtml::Division& div, int divMaxFontSize)
 {
+    const bool divDeclaresRubyRoles = DivisionDeclaresRubyRoles(div);
     for (const auto& p : div.pTags) {
-        if (IsRubyLikeParagraph(p, divMaxFontSize))
+        if (IsRubyLikeParagraph(p, divMaxFontSize, divDeclaresRubyRoles))
             return true;
     }
     return false;
@@ -1756,6 +1790,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
 
     for (const auto& div : ttml.divTags) {
         const int divMaxFontSize = DivMaxBaseFontSize(div);
+        const bool divDeclaresRubyRoles = DivisionDeclaresRubyRoles(div);
         const bool splitParagraphs = HasRubyLikeParagraph(div, divMaxFontSize);
         ++stats.divs;
         if (div.begin.has_value()) {
@@ -1865,7 +1900,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                                               false,
                                               0,
                                               settings, cue.assEvents,
-                                              IsRubyLikeParagraph(p, divMaxFontSize)
+                                              IsRubyLikeParagraph(p, divMaxFontSize, divDeclaresRubyRoles)
                                                   ? settings.showRubyBackground
                                                   : true,
                                               &cue.missingGlyph);

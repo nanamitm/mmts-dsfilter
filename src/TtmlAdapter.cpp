@@ -66,6 +66,7 @@ DsTtml::Style ToStyle(const StyleProperties& style)
     out.fontSize = ToLengthPair(style.font_size);
     out.lineHeight = ToLineHeight(style.line_height);
     out.letterSpacing = ToLength(style.letter_spacing);
+    out.ruby = style.ruby;
     out.color = ToColor(style.color);
     out.backgroundColor = ToColor(style.background_color);
     return out;

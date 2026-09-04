@@ -40,6 +40,10 @@ struct Style {
     // arib-tt:letter-spacing. B24 advances the pen by fontSize + letterSpacing
     // per cell, so this is part of the layout, not a typographic nicety.
     std::optional<Length> letterSpacing;
+    // arib-tt:ruby. Carried as written: only "base" and "text" are
+    // interpreted, and a division that names neither is laid out by the
+    // font-size heuristic instead.
+    std::optional<std::string> ruby;
     std::optional<Color> color;
     std::optional<Color> backgroundColor;
 };
