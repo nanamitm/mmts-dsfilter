@@ -1127,6 +1127,38 @@ static double ParagraphCellAdvanceAss(const DsTtml::Paragraph& p)
     return AssCellAdvanceFromSpan(firstSpan);
 }
 
+// The cell grid makes a paragraph's laid-out width exactly its region extent:
+// extent = cells * (fontSize + letter-spacing). This recomputes the left side
+// of that identity from the spans, so the layout log can check it.
+static double ParagraphLaidOutWidthAss(const DsTtml::Paragraph& p)
+{
+    const double fallbackAdvance = ParagraphCellAdvanceAss(p);
+    double widest = 0;
+    double lineWidth = 0;
+
+    for (const auto& span : p.spanTags) {
+        double advance = AssCellAdvanceFromSpan(&span);
+        if (advance <= 0)
+            advance = fallbackAdvance > 0 ? fallbackAdvance : 64.0;
+
+        for (wchar_t ch : Utf8ToWide(span.text)) {
+            if (ch == L'\r')
+                continue;
+            if (ch == L'\n') {
+                widest = (std::max)(widest, lineWidth);
+                lineWidth = 0;
+                continue;
+            }
+            // A surrogate pair is one cell, as it is when the text is laid out.
+            if (ch >= 0xDC00 && ch <= 0xDFFF)
+                continue;
+            lineWidth += advance;
+        }
+    }
+
+    return (std::max)(widest, lineWidth);
+}
+
 static std::string BuildAssPositionTagsFromAss(double xPos, double yPos)
 {
     const int x = static_cast<int>(std::floor(xPos));
@@ -1753,6 +1785,25 @@ static void LogAssParagraphLayout(const DsTtml::Paragraph& p, size_t eventIndex,
                eventIndex, p.id.c_str(), originX, originY, hasExtent ? L"yes" : L"no",
                extentX, extentY, anchorX, anchorY, assX, assY, b24AssX, b24AssY, b24OffsetY,
                extraYAss, baseFontSize, assFontSize, fontScale, lineCount);
+
+        // The region's extent is the broadcast's own statement of how wide the
+        // paragraph is, so a laid-out width that disagrees means the pen advance
+        // no longer matches the cell grid - which on screen is ruby sitting off
+        // the character it annotates. Report it whether or not verbose logging
+        // is on, since it is a defect rather than a detail.
+        if (hasExtent && extentX > 0) {
+            const double laidOutWidth = ParagraphLaidOutWidthAss(p);
+            const double extentWidthAss = extentX * 1920.0 / 3840.0;
+            const double delta = laidOutWidth - extentWidthAss;
+            if (std::abs(delta) >= 1.0) {
+                LogMsg(L"MMT/TLV Subtitle layout extent mismatch #%zu: pId=%S laidOut=%.1f extent=%.1f delta=%+.1f cells=%d\r\n",
+                       eventIndex, p.id.c_str(), laidOutWidth, extentWidthAss, delta,
+                       CountAssTextChars(p));
+            } else {
+                LogDetail(L"MMT/TLV Subtitle layout extent check #%zu: pId=%S laidOut=%.1f extent=%.1f cells=%d\r\n",
+                       eventIndex, p.id.c_str(), laidOutWidth, extentWidthAss, CountAssTextChars(p));
+            }
+        }
     } else {
         LogDetail(L"MMT/TLV Subtitle layout #%zu: pId=%S origin=none extraY=%.1f baseFs=%d assFs=%d scale=%.3f lines=%d\r\n",
                eventIndex, p.id.c_str(), extraYAss, baseFontSize, assFontSize, fontScale, lineCount);
