@@ -249,6 +249,7 @@ copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-*.dll "$(OutDir)"</C
     <ClCompile Include="..\..\dantto4k\src\ntpTimestamp.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ttml\b24_converter.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ttml\drcs.cpp" />
+    <ClCompile Include="..\..\dantto4k\src\ttml\drcs_font.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ttml\parser.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ttml\resolver.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ttml\style.cpp" />
