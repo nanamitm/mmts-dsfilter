@@ -2498,6 +2498,12 @@ void CMmtTlvSplitter::LoadSidecarMap()
                mapPath.c_str(), m_sidecarMapTracks.size(), m_sidecarMapMptChanges.size(), m_mapDuration / 10000,
                m_sidecarMapRapPoints.size(), m_sidecarMapSeekPoints.size(),
                m_mapFirstVideoPts / 10000);
+        for (size_t i = 0; i < m_sidecarMapMptChanges.size(); ++i) {
+            LogMsg(L"MMT/TLV Splitter: mmtsmap mpt[%zu]: time=%I64d ms offset=%I64d tracks=%zu%s\n",
+                   i, m_sidecarMapMptChanges[i].time / 10000, m_sidecarMapMptChanges[i].offset,
+                   m_sidecarMapMptChanges[i].tracks.size(),
+                   i == 0 ? L" (initial)" : L" (channel boundary)");
+        }
     }
 }
 
@@ -4302,16 +4308,24 @@ void CMmtTlvSplitter::ClearPendingSubtitleCues()
 
 // Media time of the first MPT change after `afterMediaTime`, or -1 when there is
 // none (or no sidecar map to read it from). Entry 0 of the map is the MPT the
-// file starts with, not a change, so it is skipped. The times are converted the
-// same way video sample times are, so the result lines up with the picture.
+// file starts with, not a change, so it is skipped.
 REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime) const
 {
     if (m_firstPts < 0)
         return -1;
 
+    // LoadSidecarMap already rebased the map's times onto the map's own first
+    // video PTS when it knew it; otherwise they are still absolute. Either way
+    // put them on the timeline the samples use, which is pts - m_firstPts. The
+    // two first-PTS values differ by a few hundred ms because they are measured
+    // by different passes over the file.
+    const REFERENCE_TIME base = (m_mapFirstVideoPts >= 0)
+        ? m_mapFirstVideoPts - m_firstPts
+        : -m_firstPts;
+
     REFERENCE_TIME best = -1;
     for (size_t i = 1; i < m_sidecarMapMptChanges.size(); ++i) {
-        const REFERENCE_TIME mediaTime = m_sidecarMapMptChanges[i].time - m_firstPts;
+        const REFERENCE_TIME mediaTime = m_sidecarMapMptChanges[i].time + base;
         if (mediaTime > afterMediaTime && (best < 0 || mediaTime < best))
             best = mediaTime;
     }
