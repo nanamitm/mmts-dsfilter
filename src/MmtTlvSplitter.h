@@ -102,7 +102,7 @@ private:
                                  int& width, int& height);
     static DWORD WINAPI ThreadProc(LPVOID pv);
     void DemuxLoop();
-    bool FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME currentBegin,
+    bool FindNextSubtitleBegin(int streamIndex, int componentTag, REFERENCE_TIME currentBegin,
                                long long startOffset, REFERENCE_TIME& nextBegin) const;
     void ClearPendingSubtitleCues();
     bool SubtitleTrackStillCurrent(int streamIndex, int componentTag) const;

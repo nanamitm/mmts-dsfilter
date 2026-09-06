@@ -4058,7 +4058,7 @@ void CMmtTlvSplitter::CreatePins()
                 } else {
                     REFERENCE_TIME nextBegin = -1;
                     const long long lookaheadOffset = m_demuxByteOffset.load(std::memory_order_acquire);
-                    if (FindNextSubtitleBegin(streamIndex, cue.begin, lookaheadOffset, nextBegin)) {
+                    if (FindNextSubtitleBegin(streamIndex, componentTag, cue.begin, lookaheadOffset, nextBegin)) {
                         sampleStop = SubtitleSourceTime(nextBegin) - subtitleTimeOffset;
                         LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d\n",
                                   streamIndex,
@@ -4183,7 +4183,8 @@ REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, 
                                             m_segmentTimeOffset.load(std::memory_order_acquire));
 }
 
-bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME currentBegin,
+bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, int componentTag,
+                                            REFERENCE_TIME currentBegin,
                                             long long startOffset, REFERENCE_TIME& nextBegin) const
 {
     constexpr size_t kChunk = 1024 * 1024;
@@ -4205,10 +4206,30 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
         return false;
 
     bool found = false;
+    bool trackEnded = false;
     CFilterDemuxerHandler handler;
     handler.setSubtitleCallback(
         [&](int si, bool, long long, long long, bool, bool, const uint8_t* d, size_t sz) {
-            if (found || si != streamIndex)
+            if (found || trackEnded)
+                return;
+
+            // Stop at a channel change. Once the MPT no longer places this track
+            // where it was, the caption belongs to a package that has ended: it
+            // must not be stretched to the next cue, which is already part of
+            // the following channel.
+            if (componentTag >= 0 && handler.getSubtitleStreamCount() > 0 &&
+                handler.getSubtitleComponentTag(streamIndex) != componentTag) {
+                trackEnded = true;
+                return;
+            }
+
+            // Match the track by component tag; the stream index is assigned per
+            // asset position and is not stable across an MPT change.
+            const int tag = handler.getSubtitleComponentTag(si);
+            const bool sameTrack = (componentTag >= 0 && tag >= 0)
+                ? tag == componentTag
+                : si == streamIndex;
+            if (!sameTrack)
                 return;
 
             TtmlDebugStats stats;
@@ -4226,7 +4247,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
     buf.reserve(kChunk * 2);
     long long readBytes = 0;
 
-    while (!found && readBytes < kMaxLookaheadBytes) {
+    while (!found && !trackEnded && readBytes < kMaxLookaheadBytes) {
         if (buf.size() < 2 * 1024 * 1024) {
             size_t oldSz = buf.size();
             buf.resize(oldSz + kChunk);
@@ -4239,7 +4260,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, REFERENCE_TIME curr
         }
 
         MmtTlv::Common::ReadStream stream(buf);
-        while (!found && !stream.isEof()) {
+        while (!found && !trackEnded && !stream.isEof()) {
             auto status = demuxer.demux(stream);
             if (status == MmtTlv::DemuxStatus::NotEnoughBuffer)
                 break;
