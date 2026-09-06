@@ -150,6 +150,54 @@ void CFilterDemuxerHandler::selectDefaultVideoStreamLocked()
            best->packetId, best->componentTag, best->streamIndex, best->width, best->height);
 }
 
+void CFilterDemuxerHandler::ensureVideoSelectionLocked()
+{
+    if (m_videoStreams.empty())
+        return;
+
+    if (!m_hasSelectedVideoStream) {
+        selectDefaultVideoStreamLocked();
+        return;
+    }
+
+    // A packetId identifies one asset, so the selection is still valid as long
+    // as an asset with that packetId is present.
+    auto selected = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
+        [this](const VideoStreamInfo& info) {
+            return info.packetId == m_selectedVideoPacketId;
+        });
+    if (selected != m_videoStreams.end())
+        return;
+
+    // The selected asset is gone from the MPT. A recording that spans a channel
+    // change does exactly this: every asset of the new channel gets a new
+    // packetId. Holding on to the old one would drop the video for the rest of
+    // the file while the audio pins keep playing, since audio is not filtered
+    // by packetId.
+    // Prefer an asset carrying the same component tag so an explicit pick is
+    // honoured across the change, and fall back to the default choice.
+    const unsigned previousPacketId = m_selectedVideoPacketId;
+    const int previousTag = m_selectedVideoComponentTag;
+    if (previousTag >= 0) {
+        auto sameTag = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
+            [previousTag](const VideoStreamInfo& info) {
+                return info.componentTag == previousTag;
+            });
+        if (sameTag != m_videoStreams.end()) {
+            m_selectedVideoPacketId = sameTag->packetId;
+            m_selectedVideoComponentTag = sameTag->componentTag;
+            LogMsg(L"MMT/TLV Video selection followed the MPT: packetId=0x%04X -> 0x%04X componentTag=%d streamIndex=%d\n",
+                   previousPacketId, sameTag->packetId, sameTag->componentTag, sameTag->streamIndex);
+            return;
+        }
+    }
+
+    m_hasSelectedVideoStream = false;
+    selectDefaultVideoStreamLocked();
+    LogMsg(L"MMT/TLV Video selection reset after the MPT dropped packetId=0x%04X\n",
+           previousPacketId);
+}
+
 void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
 {
     std::lock_guard<std::mutex> lock(m_videoMutex);
@@ -181,28 +229,20 @@ void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
     m_videoStreams.push_back(info);
     LogDetail(L"MMT/TLV Video discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, %dx%d\n",
               info.streamIndex, info.packetId, info.componentTag, info.width, info.height);
-    if (!m_hasSelectedVideoStream)
-        selectDefaultVideoStreamLocked();
+    ensureVideoSelectionLocked();
 }
 
-bool CFilterDemuxerHandler::shouldProcessVideoStream(int streamIndex) const
+bool CFilterDemuxerHandler::shouldProcessVideoStream(uint16_t packetId) const
 {
     std::lock_guard<std::mutex> lock(m_videoMutex);
     if (!m_hasSelectedVideoStream)
         return true;
 
-    auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
-        [streamIndex](const VideoStreamInfo& info) {
-            return info.streamIndex == streamIndex;
-        });
-    if (it == m_videoStreams.end())
-        return true;
-
-    if (it->packetId != m_selectedVideoPacketId)
-        return false;
-    if (it->componentTag >= 0 && m_selectedVideoComponentTag >= 0)
-        return it->componentTag == m_selectedVideoComponentTag;
-    return true;
+    // Compare the packetId the data actually came from. Looking the stream up by
+    // its stream index first would mix up two identities: the index is assigned
+    // per asset position and is reused by the next channel's assets, so after a
+    // channel change it resolves to the wrong entry.
+    return packetId == m_selectedVideoPacketId;
 }
 
 std::vector<CFilterDemuxerHandler::VideoStreamInfo> CFilterDemuxerHandler::getVideoStreams() const
@@ -571,9 +611,9 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             }
         }
 
-        // Only pick a default; an explicit selection must survive MPT updates.
-        if (!m_hasSelectedVideoStream)
-            selectDefaultVideoStreamLocked();
+        // An explicit selection survives MPT updates, but only while the asset
+        // it points at is still there.
+        ensureVideoSelectionLocked();
     }
 
     if (!discovered.empty()) {
@@ -803,8 +843,7 @@ void CFilterDemuxerHandler::setKnownVideoStreams(const std::vector<VideoStreamIn
 {
     std::lock_guard<std::mutex> lock(m_videoMutex);
     m_videoStreams = streams;
-    if (!m_hasSelectedVideoStream)
-        selectDefaultVideoStreamLocked();
+    ensureVideoSelectionLocked();
 }
 
 void CFilterDemuxerHandler::setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams)
@@ -884,7 +923,7 @@ void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const M
     // The video pin assembles one access unit at a time, so fragments from a
     // second hev1 asset would clear the accumulator mid-AU and splice their NAL
     // units into the primary stream. Deliver the selected stream only.
-    if (!shouldProcessVideoStream(static_cast<int>(stream.getStreamIndex())))
+    if (!shouldProcessVideoStream(stream.getPacketId()))
         return;
 
     long long pts = toRefTime(static_cast<int64_t>(mfu.pts), stream);

@@ -99,9 +99,11 @@ public:
 private:
     long long toRefTime(int64_t pts, const MmtTlv::MmtStream& stream);
     void rememberVideoStream(const MmtTlv::MmtStream& stream);
-    bool shouldProcessVideoStream(int streamIndex) const;
+    bool shouldProcessVideoStream(uint16_t packetId) const;
     // Callers must hold m_videoMutex.
     void selectDefaultVideoStreamLocked();
+    // Callers must hold m_videoMutex.
+    void ensureVideoSelectionLocked();
     void rememberAudioStream(const MmtTlv::MmtStream& stream);
     void rememberLatmConfig(int streamIndex, const uint8_t* data, size_t size);
     void rememberAdtsConvertibleAudioStream(int streamIndex);
