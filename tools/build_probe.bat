@@ -6,4 +6,5 @@ if not exist obj mkdir obj
 cl.exe /O2 /EHsc /std:c++20 /W0 /I"..\src" /I"..\..\dantto4k\src" /I"..\..\dantto4k\thirdparty\pugixml\src" mmts_probe2.cpp @sources.rsp /Fe:mmts_probe2.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
 cl.exe /O2 /EHsc /std:c++20 /W0 /I"..\src" /I"..\..\dantto4k\src" /I"..\..\dantto4k\thirdparty\pugixml\src" mmts_audio_split.cpp @sources.rsp /Fe:mmts_audio_split.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
 cl.exe /O2 /EHsc /std:c++20 /W0 /I"..\src" /I"..\..\dantto4k\src" mmts_track_probe.cpp @sources.rsp /Fe:mmts_track_probe.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
+cl.exe /O2 /EHsc /std:c++20 /W0 /I"..\src" /I"..\..\dantto4k\src" mmts_video_ps_probe.cpp @sources.rsp /Fe:mmts_video_ps_probe.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
 cl.exe /O2 /EHsc /std:c++20 /W0 /utf-8 /I"..\src" /I"..\..\dantto4k\src" /I"..\..\dantto4k\thirdparty\pugixml\src" subtitle_ttml_dump.cpp @sources.rsp /Fe:subtitle_ttml_dump.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
