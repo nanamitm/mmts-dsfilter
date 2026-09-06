@@ -763,6 +763,12 @@ int CFilterDemuxerHandler::getSubtitleComponentTag(int streamIndex) const
     return it != m_subtitleStreams.end() ? it->componentTag : -1;
 }
 
+size_t CFilterDemuxerHandler::getSubtitleStreamCount() const
+{
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    return m_subtitleStreams.size();
+}
+
 void CFilterDemuxerHandler::resetAudioSelection()
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);

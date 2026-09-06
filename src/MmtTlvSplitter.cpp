@@ -4085,7 +4085,7 @@ void CMmtTlvSplitter::CreatePins()
             if (sampleStop <= sampleStart)
                 sampleStop = sampleStart + kDefaultSubtitleDuration;
 
-            FlushPendingSubtitleCue(streamIndex, sampleStart);
+            FlushPendingSubtitleCue(streamIndex, componentTag, sampleStart);
 
             if (repeatUntilNextCue) {
                 PendingSubtitleCue pending;
@@ -4264,10 +4264,28 @@ void CMmtTlvSplitter::ClearPendingSubtitleCues()
     m_deferredSubtitleSamples.clear();
 }
 
-void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME stopTime)
+// Whether the MPT in force still places this component tag at the stream index
+// the cue arrived on. Unknown mappings count as current, so a cue is never
+// dropped just because the subtitle list has not been filled in yet.
+bool CMmtTlvSplitter::SubtitleTrackStillCurrent(int streamIndex, int componentTag) const
+{
+    if (componentTag < 0 || m_handler.getSubtitleStreamCount() == 0)
+        return true;
+    return m_handler.getSubtitleComponentTag(streamIndex) == componentTag;
+}
+
+void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, int componentTag,
+                                              REFERENCE_TIME stopTime)
 {
     for (auto it = m_pendingSubtitleCues.begin(); it != m_pendingSubtitleCues.end();) {
-        if (it->streamIndex != streamIndex) {
+        // Close the pending cue of the same track. Match on the component tag,
+        // because across a channel change the next cue of a track turns up on a
+        // different stream index and would otherwise leave the previous cue
+        // repeating forever.
+        const bool sameTrack = (componentTag >= 0 && it->componentTag >= 0)
+            ? it->componentTag == componentTag
+            : it->streamIndex == streamIndex;
+        if (!sameTrack) {
             ++it;
             continue;
         }
@@ -4349,7 +4367,7 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
         if (sampleStop <= sampleStart)
             sampleStop = sampleStart + kDefaultSubtitleDuration;
 
-        FlushPendingSubtitleCue(sample.streamIndex, sampleStart);
+        FlushPendingSubtitleCue(sample.streamIndex, sample.componentTag, sampleStart);
         DeliverSubtitleCue(sample.streamIndex, sample.componentTag, sampleStart, sampleStop, cue.assEvents, cue.assText);
         LogDetail(L"SUBTITLE deferred delivered: callback=%ld streamIndex=%d start=%I64d ms stop=%I64d ms\n",
                   sample.callbackNo, sample.streamIndex, sampleStart / 10000, sampleStop / 10000);
@@ -4363,10 +4381,30 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
     if (currentTime < 0 || m_pendingSubtitleCues.empty())
         return;
 
-    for (auto& cue : m_pendingSubtitleCues) {
+    for (auto it = m_pendingSubtitleCues.begin(); it != m_pendingSubtitleCues.end();) {
+        auto& cue = *it;
+
+        // A cue with no end time repeats until the next cue of the same track
+        // arrives. When the recording spans a channel change that next cue can
+        // be a long way off, so also stop repeating as soon as the MPT stops
+        // placing this cue's track where it came from - otherwise the last
+        // caption of the previous channel keeps showing over the new one.
+        if (!SubtitleTrackStillCurrent(cue.streamIndex, cue.componentTag)) {
+            if (currentTime > cue.nextChunkStart) {
+                DeliverSubtitleCue(cue.streamIndex, cue.componentTag, cue.nextChunkStart,
+                                   currentTime, cue.assEvents, cue.assText);
+            }
+            LogDetail(L"SUBTITLE pending dropped after MPT change: streamIndex=%d, componentTag=%d, stop=%I64d ms\n",
+                      cue.streamIndex, cue.componentTag, currentTime / 10000);
+            it = m_pendingSubtitleCues.erase(it);
+            continue;
+        }
+
         if (cue.nextChunkStart == cue.start) {
-            if (cue.start + kSubtitleInitialDelay > currentTime)
+            if (cue.start + kSubtitleInitialDelay > currentTime) {
+                ++it;
                 continue;
+            }
 
             REFERENCE_TIME chunkStart = cue.start;
             REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
@@ -4390,6 +4428,8 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
                       chunkStop / 10000,
                       currentTime / 10000);
         }
+
+        ++it;
     }
 }
 
