@@ -59,12 +59,14 @@ public:
         { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; m_audioLatm = false; m_audioPcm = true; m_audioExtraData.clear(); }
     void SetHevcExtradata(const std::vector<uint8_t>& extra) { m_hevcExtradata = extra; }
     void SetTrackName(const std::wstring& name) { m_trackName = name; }
+    void SetSubtitleComponentTag(int tag) { m_subtitleComponentTag = tag; }
 
     bool IsVideo() const { return m_kind == MmtTlvPinKind::Video; }
     bool IsAudio() const { return m_kind == MmtTlvPinKind::Audio; }
     bool IsSubtitle() const { return m_kind == MmtTlvPinKind::Subtitle; }
     int AudioStreamIndex() const { return m_audioStreamIndex; }
     int StreamIndex() const { return m_audioStreamIndex; }
+    int SubtitleComponentTag() const { return m_subtitleComponentTag; }
 
     // Reset accumulation state after a seek (called by SeekTo)
     void ResetForSeek();
@@ -106,6 +108,10 @@ private:
     MmtTlvPinKind m_kind{MmtTlvPinKind::Audio};
     bool m_isVideo;
     int m_audioStreamIndex{-1};
+    // Subtitle pins are matched by component tag: the stream index is assigned
+    // per asset position and the next channel's assets reuse it, so it stops
+    // identifying a track once a recording spans a channel change.
+    int m_subtitleComponentTag{-1};
 
     // Video
     int m_width{3840};

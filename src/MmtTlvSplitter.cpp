@@ -3832,6 +3832,7 @@ void CMmtTlvSplitter::CreatePins()
             auto* pin = new CMmtTlvOutputPin(MmtTlvPinKind::Subtitle, &hr, this, &m_pinLock,
                                              pinName, subtitleStreams[i].streamIndex);
             pin->SetTrackName(trackName);
+            pin->SetSubtitleComponentTag(subtitleStreams[i].componentTag);
             m_pins.push_back(pin);
             LogMsg(L"MMT/TLV Splitter: CreatePins created %s for streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
                    pinName,
@@ -3962,6 +3963,10 @@ void CMmtTlvSplitter::CreatePins()
 
             TtmlDebugStats stats;
             TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, streamIndex);
+            // Resolve the track identity now, against the MPT in force at this
+            // point of the file; a cue that gets deferred or repeated later must
+            // keep going to the pin it belongs to.
+            const int componentTag = m_handler.getSubtitleComponentTag(streamIndex);
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
             DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
@@ -3972,6 +3977,7 @@ void CMmtTlvSplitter::CreatePins()
             if (cue.hasBegin && waitingForProgramStart) {
                 DeferredSubtitleSample sample;
                 sample.streamIndex = streamIndex;
+                sample.componentTag = componentTag;
                 sample.pts = pts;
                 sample.callbackNo = callbackNo;
                 sample.data.assign(d, d + sz);
@@ -3990,6 +3996,7 @@ void CMmtTlvSplitter::CreatePins()
             if (cue.missingGlyph && !cue.text.empty()) {
                 DeferredSubtitleSample sample;
                 sample.streamIndex = streamIndex;
+                sample.componentTag = componentTag;
                 sample.pts = pts;
                 sample.callbackNo = callbackNo;
                 sample.data.assign(d, d + sz);
@@ -4083,6 +4090,7 @@ void CMmtTlvSplitter::CreatePins()
             if (repeatUntilNextCue) {
                 PendingSubtitleCue pending;
                 pending.streamIndex = streamIndex;
+                pending.componentTag = componentTag;
                 pending.start = sampleStart;
                 pending.nextChunkStart = sampleStart;
                 pending.assEvents = cue.assEvents;
@@ -4094,7 +4102,7 @@ void CMmtTlvSplitter::CreatePins()
                           (sampleStart + kSubtitleInitialDelay) / 10000,
                           sampleStop / 10000);
             } else {
-                DeliverSubtitleCue(streamIndex, sampleStart, sampleStop, cue.assEvents, cue.assText);
+                DeliverSubtitleCue(streamIndex, componentTag, sampleStart, sampleStop, cue.assEvents, cue.assText);
             }
         });
 
@@ -4265,7 +4273,7 @@ void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME st
         }
 
         if (stopTime > it->nextChunkStart) {
-            DeliverSubtitleCue(it->streamIndex, it->nextChunkStart, stopTime,
+            DeliverSubtitleCue(it->streamIndex, it->componentTag, it->nextChunkStart, stopTime,
                                it->assEvents, it->assText);
             LogDetail(L"SUBTITLE pending close deliver: streamIndex=%d, start=%I64d ms, stop=%I64d ms\n",
                       streamIndex,
@@ -4285,7 +4293,7 @@ void CMmtTlvSplitter::FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime)
 {
     for (const auto& cue : m_pendingSubtitleCues) {
         if (stopTime > cue.nextChunkStart) {
-            DeliverSubtitleCue(cue.streamIndex, cue.nextChunkStart, stopTime,
+            DeliverSubtitleCue(cue.streamIndex, cue.componentTag, cue.nextChunkStart, stopTime,
                                cue.assEvents, cue.assText);
             LogDetail(L"SUBTITLE pending final deliver: streamIndex=%d, start=%I64d ms, stop=%I64d ms\n",
                       cue.streamIndex,
@@ -4342,7 +4350,7 @@ void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
             sampleStop = sampleStart + kDefaultSubtitleDuration;
 
         FlushPendingSubtitleCue(sample.streamIndex, sampleStart);
-        DeliverSubtitleCue(sample.streamIndex, sampleStart, sampleStop, cue.assEvents, cue.assText);
+        DeliverSubtitleCue(sample.streamIndex, sample.componentTag, sampleStart, sampleStop, cue.assEvents, cue.assText);
         LogDetail(L"SUBTITLE deferred delivered: callback=%ld streamIndex=%d start=%I64d ms stop=%I64d ms\n",
                   sample.callbackNo, sample.streamIndex, sampleStart / 10000, sampleStop / 10000);
     }
@@ -4362,7 +4370,7 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
 
             REFERENCE_TIME chunkStart = cue.start;
             REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
-            DeliverSubtitleCue(cue.streamIndex, chunkStart, chunkStop, cue.assEvents, cue.assText);
+            DeliverSubtitleCue(cue.streamIndex, cue.componentTag, chunkStart, chunkStop, cue.assEvents, cue.assText);
             cue.nextChunkStart = chunkStop;
             LogDetail(L"SUBTITLE pending first: streamIndex=%d, start=%I64d ms, stop=%I64d ms, current=%I64d ms\n",
                       cue.streamIndex,
@@ -4374,7 +4382,7 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
         while (cue.nextChunkStart + kSubtitleChunkDuration <= currentTime) {
             REFERENCE_TIME chunkStart = cue.nextChunkStart;
             REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
-            DeliverSubtitleCue(cue.streamIndex, chunkStart, chunkStop, cue.assEvents, cue.assText);
+            DeliverSubtitleCue(cue.streamIndex, cue.componentTag, chunkStart, chunkStop, cue.assEvents, cue.assText);
             cue.nextChunkStart = chunkStop;
             LogDetail(L"SUBTITLE pending repeat: streamIndex=%d, start=%I64d ms, stop=%I64d ms, current=%I64d ms\n",
                       cue.streamIndex,
@@ -4385,7 +4393,8 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
     }
 }
 
-void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, REFERENCE_TIME stop,
+void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
+                                         REFERENCE_TIME start, REFERENCE_TIME stop,
                                          const std::vector<std::string>& assEvents,
                                          const std::string& assText)
 {
@@ -4411,10 +4420,19 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, 
         delivered = true;
     };
 
+    // Route by component tag (0x30 = main caption, 0x38 = its management
+    // stream). The stream index is assigned per asset position and the next
+    // channel's assets reuse it, so it stops identifying a track once a
+    // recording spans a channel change: the cue would land on whichever pin
+    // happens to sit at that index. Fall back to the index when no tag is known.
     for (auto* pin : m_pins) {
-        if (pin->IsSubtitle() && pin->StreamIndex() == streamIndex) {
+        if (!pin->IsSubtitle())
+            continue;
+        const bool matched = (componentTag >= 0 && pin->SubtitleComponentTag() >= 0)
+            ? pin->SubtitleComponentTag() == componentTag
+            : pin->StreamIndex() == streamIndex;
+        if (matched)
             deliverToPin(pin);
-        }
     }
 
     int fallbackStreamIndex = -1;

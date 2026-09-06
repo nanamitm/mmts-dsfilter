@@ -84,6 +84,9 @@ public:
     bool selectVideoStreamByStreamIndex(int streamIndex);
     std::vector<AudioStreamInfo> getAudioStreams() const;
     std::vector<SubtitleStreamInfo> getSubtitleStreams() const;
+    // Component tag of the subtitle asset sitting at this stream index in the
+    // MPT that is currently in force, or -1 when it is not known.
+    int getSubtitleComponentTag(int streamIndex) const;
     void setKnownVideoStreams(const std::vector<VideoStreamInfo>& streams);
     void setKnownAudioStreams(const std::vector<AudioStreamInfo>& streams);
     void setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams);

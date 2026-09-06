@@ -703,9 +703,13 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
     if (!discoveredSubtitles.empty()) {
         std::lock_guard<std::mutex> lock(m_subtitleMutex);
         for (auto& info : discoveredSubtitles) {
+            // Match on the packetId, which identifies one asset. The stream
+            // index is assigned per asset position and the next channel's
+            // assets reuse it, so matching on it would carry the flag over to a
+            // different asset once a recording spans a channel change.
             auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
                 [&info](const SubtitleStreamInfo& known) {
-                    return known.streamIndex == info.streamIndex;
+                    return known.packetId == info.packetId;
                 });
             if (it != m_subtitleStreams.end())
                 info.hasData = it->hasData;
@@ -747,6 +751,16 @@ std::vector<CFilterDemuxerHandler::SubtitleStreamInfo> CFilterDemuxerHandler::ge
 {
     std::lock_guard<std::mutex> lock(m_subtitleMutex);
     return m_subtitleStreams;
+}
+
+int CFilterDemuxerHandler::getSubtitleComponentTag(int streamIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
+        [streamIndex](const SubtitleStreamInfo& info) {
+            return info.streamIndex == streamIndex;
+        });
+    return it != m_subtitleStreams.end() ? it->componentTag : -1;
 }
 
 void CFilterDemuxerHandler::resetAudioSelection()

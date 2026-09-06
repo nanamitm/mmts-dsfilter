@@ -108,7 +108,8 @@ private:
     void FlushPendingSubtitleCue(int streamIndex, REFERENCE_TIME stopTime);
     void FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime);
     void PumpPendingSubtitleChunks(REFERENCE_TIME currentTime);
-    void DeliverSubtitleCue(int streamIndex, REFERENCE_TIME start, REFERENCE_TIME stop,
+    void DeliverSubtitleCue(int streamIndex, int componentTag,
+                           REFERENCE_TIME start, REFERENCE_TIME stop,
                             const std::vector<std::string>& assEvents,
                             const std::string& assText);
     void ProcessDeferredSubtitleSamples();
@@ -179,6 +180,9 @@ private:
 
     struct PendingSubtitleCue {
         int streamIndex = -1;
+        // Resolved when the cue was opened; the stream index alone stops
+        // identifying the track once the MPT changes.
+        int componentTag = -1;
         REFERENCE_TIME start = 0;
         REFERENCE_TIME nextChunkStart = 0;
         std::vector<std::string> assEvents;
@@ -188,6 +192,9 @@ private:
 
     struct DeferredSubtitleSample {
         int streamIndex = -1;
+        // Resolved when the sample was deferred, for the same reason as
+        // PendingSubtitleCue::componentTag.
+        int componentTag = -1;
         long long pts = -1;
         LONG callbackNo = 0;
         std::vector<uint8_t> data;
