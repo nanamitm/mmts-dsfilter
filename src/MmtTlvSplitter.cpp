@@ -33,11 +33,12 @@ extern "C" {
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
 // A cue with no end time is held on screen by repeating it in chunks until the
-// next cue arrives. Each chunk is delivered as the playhead reaches its start,
-// so the chunks are contiguous; the length is what a cue can overhang the next
-// one by, so keep it short.
-static constexpr REFERENCE_TIME kSubtitleChunkDuration = 10 * 1000000LL; // 1 sec
-static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
+// next cue arrives. Each chunk is delivered as the demux position reaches its
+// start, which is ahead of the renderer, so the chunks are contiguous and the
+// cue does not blink. A sample already handed over cannot be retracted, so the
+// chunk length is also how far a cue can overhang the cue that replaces it -
+// keep it short enough not to be seen.
+static constexpr REFERENCE_TIME kSubtitleChunkDuration = 2 * 1000000LL; // 200 ms
 // Subtitle MFUs carry no PTS. Anchor each TTML timeline to the video position
 // where that timeline is first observed, then preserve TTML spacing until a
 // clear TTML begin rollback indicates a program boundary (see
@@ -4079,15 +4080,27 @@ void CMmtTlvSplitter::CreatePins()
                     cursor += used;
                     remaining -= used;
                 }
-                LogMsg(L"SUBTITLE CALLBACK empty text #%ld: streamIndex=%d, firstBytes=%s\n",
-                       callbackNo, streamIndex, hex);
+                // A document that carries no text is a clear. Live captioning
+                // streams send one between utterances, so honour it: end what is
+                // on this track instead of leaving the previous cue repeating
+                // until the next utterance turns up.
+                const REFERENCE_TIME clearAt = ToSegmentTime(SubtitleTimingAnchor(), m_segmentStart);
+                FlushPendingSubtitleCue(streamIndex, componentTag, clearAt);
+                LogMsg(L"SUBTITLE CALLBACK empty text #%ld: streamIndex=%d, componentTag=%d, cleared at %I64d ms, firstBytes=%s\n",
+                       callbackNo, streamIndex, componentTag, clearAt / 10000, hex);
                 return;
             }
 
             REFERENCE_TIME sampleStart;
             REFERENCE_TIME sampleStop;
             bool repeatUntilNextCue = false;
-            if (cue.hasBegin) {
+            // A live captioning stream stamps every document begin="00:00:00.000"
+            // and relies on the moment it arrives instead. Resolving that against
+            // the TTML timeline maps every cue to the same media time, so they
+            // all pile up on one another. Treat it as untimed and use the
+            // arrival position, which is what such a stream means.
+            const bool timedCue = cue.hasBegin && cue.begin > 0;
+            if (timedCue) {
                 const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
                 const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
                 sampleStart = sourceBegin - subtitleTimeOffset;
@@ -4130,11 +4143,28 @@ void CMmtTlvSplitter::CreatePins()
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
                 sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
             } else {
-                // No TTML begin: use the same stable anchor as timed cues.
+                // Untimed cue: it starts where it arrives, and it holds until
+                // the next cue of the track or a clear, the same way a receiver
+                // keeps an ARIB caption up.
                 REFERENCE_TIME anchor = SubtitleTimingAnchor();
                 sampleStart = ToSegmentTime(anchor, m_segmentStart);
-                sampleStop = sampleStart + kDefaultSubtitleDuration;
+                sampleStop = sampleStart + kSubtitleChunkDuration;
+                repeatUntilNextCue = true;
             }
+            // Start where the cue being replaced actually ends. Its last chunk
+            // was delivered ahead of the demux position and cannot be taken
+            // back, so beginning at the nominal time would put both captions on
+            // screen for the remainder of that chunk.
+            const REFERENCE_TIME paintedTo = PendingSubtitlePaintedTo(streamIndex, componentTag);
+            if (paintedTo > sampleStart) {
+                LogDetail(L"SUBTITLE start held for the previous cue: streamIndex=%d, componentTag=%d, start=%I64d -> %I64d ms\n",
+                          streamIndex, componentTag, sampleStart / 10000, paintedTo / 10000);
+                const REFERENCE_TIME duration = sampleStop - sampleStart;
+                sampleStart = paintedTo;
+                if (duration > 0)
+                    sampleStop = sampleStart + duration;
+            }
+
             if (sampleStop <= sampleStart)
                 sampleStop = sampleStart + kDefaultSubtitleDuration;
 
@@ -4149,10 +4179,10 @@ void CMmtTlvSplitter::CreatePins()
                 pending.assEvents = cue.assEvents;
                 pending.assText = cue.assText;
                 m_pendingSubtitleCues.push_back(std::move(pending));
-                LogDetail(L"SUBTITLE pending open: streamIndex=%d, start=%I64d ms, firstDeadline=%I64d ms, chunkStop=%I64d ms\n",
+                LogDetail(L"SUBTITLE pending open: streamIndex=%d, componentTag=%d, start=%I64d ms, chunkStop=%I64d ms\n",
                           streamIndex,
+                          componentTag,
                           sampleStart / 10000,
-                          (sampleStart + kSubtitleInitialDelay) / 10000,
                           sampleStop / 10000);
             } else {
                 DeliverSubtitleCue(streamIndex, componentTag, sampleStart, sampleStop, cue.assEvents, cue.assText);
@@ -4364,6 +4394,21 @@ REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMedia
     return best;
 }
 
+// How far the pending cue of this track has already been painted, or -1 when
+// there is none. A sample handed to the renderer cannot be retracted, so this
+// is the earliest a replacement can start without the two overlapping.
+REFERENCE_TIME CMmtTlvSplitter::PendingSubtitlePaintedTo(int streamIndex, int componentTag) const
+{
+    for (const auto& cue : m_pendingSubtitleCues) {
+        const bool sameTrack = (componentTag >= 0 && cue.componentTag >= 0)
+            ? cue.componentTag == componentTag
+            : cue.streamIndex == streamIndex;
+        if (sameTrack)
+            return cue.nextChunkStart;
+    }
+    return -1;
+}
+
 // Whether the MPT in force still places this component tag at the stream index
 // the cue arrived on. Unknown mappings count as current, so a cue is never
 // dropped just because the subtitle list has not been filled in yet.
@@ -4500,27 +4545,20 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
             continue;
         }
 
-        if (cue.nextChunkStart == cue.start) {
-            if (cue.start + kSubtitleInitialDelay > currentTime) {
-                ++it;
-                continue;
-            }
-
-            REFERENCE_TIME chunkStart = cue.start;
-            REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
-            DeliverSubtitleCue(cue.streamIndex, cue.componentTag, chunkStart, chunkStop, cue.assEvents, cue.assText);
-            cue.nextChunkStart = chunkStop;
-            LogDetail(L"SUBTITLE pending first: streamIndex=%d, start=%I64d ms, stop=%I64d ms, current=%I64d ms\n",
-                      cue.streamIndex,
-                      chunkStart / 10000,
-                      chunkStop / 10000,
-                      currentTime / 10000);
+        // A cue whose start ended up behind the demux position would otherwise
+        // be walked forward one chunk at a time, emitting hundreds of samples
+        // that are all in the past. Skip to where it can still be seen.
+        if (cue.nextChunkStart + kSubtitleChunkDuration < currentTime) {
+            LogDetail(L"SUBTITLE pending skipped forward: streamIndex=%d, next=%I64d -> %I64d ms\n",
+                      cue.streamIndex, cue.nextChunkStart / 10000, currentTime / 10000);
+            cue.nextChunkStart = currentTime;
         }
 
-        // Deliver a chunk as the playhead reaches its start. Waiting for its end
-        // (nextChunkStart + duration <= currentTime) handed the renderer every
-        // chunk after its display window had already passed, so the cue blinked
-        // instead of staying up.
+        // Deliver a chunk as the demux position reaches its start. Waiting for
+        // its end (nextChunkStart + duration <= currentTime) handed the renderer
+        // every chunk after its display window had already passed, so the cue
+        // blinked instead of staying up. The first chunk is no different: its
+        // own delay used to be longer than a chunk now is.
         while (cue.nextChunkStart <= currentTime) {
             REFERENCE_TIME chunkStart = cue.nextChunkStart;
             REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;

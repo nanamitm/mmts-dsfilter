@@ -106,6 +106,7 @@ private:
                                long long startOffset, REFERENCE_TIME& nextBegin) const;
     void ClearPendingSubtitleCues();
     REFERENCE_TIME NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime) const;
+    REFERENCE_TIME PendingSubtitlePaintedTo(int streamIndex, int componentTag) const;
     bool SubtitleTrackStillCurrent(int streamIndex, int componentTag) const;
     void FlushPendingSubtitleCue(int streamIndex, int componentTag, REFERENCE_TIME stopTime);
     void FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime);
