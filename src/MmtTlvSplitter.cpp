@@ -4074,6 +4074,21 @@ void CMmtTlvSplitter::CreatePins()
                                   lookaheadOffset);
                     }
                 }
+
+                // A caption must not outlive the package it came from. A
+                // recording that spans a channel change carries cues whose
+                // declared end reaches well past the change (28 s is normal for
+                // a caption that is meant to stay until the next one), and the
+                // next channel's picture would otherwise come up underneath it.
+                const REFERENCE_TIME boundary = NextMptChangeMediaTime(sampleStart);
+                if (boundary > 0 && sampleStop > boundary) {
+                    LogDetail(L"SUBTITLE clipped at MPT change: streamIndex=%d, componentTag=%d, start=%I64d ms, stop=%I64d -> %I64d ms\n",
+                              streamIndex, componentTag,
+                              sampleStart / 10000, sampleStop / 10000, boundary / 10000);
+                    sampleStop = boundary;
+                    repeatUntilNextCue = false;
+                }
+
                 sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
                 sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
             } else {
@@ -4283,6 +4298,24 @@ void CMmtTlvSplitter::ClearPendingSubtitleCues()
 {
     m_pendingSubtitleCues.clear();
     m_deferredSubtitleSamples.clear();
+}
+
+// Media time of the first MPT change after `afterMediaTime`, or -1 when there is
+// none (or no sidecar map to read it from). Entry 0 of the map is the MPT the
+// file starts with, not a change, so it is skipped. The times are converted the
+// same way video sample times are, so the result lines up with the picture.
+REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime) const
+{
+    if (m_firstPts < 0)
+        return -1;
+
+    REFERENCE_TIME best = -1;
+    for (size_t i = 1; i < m_sidecarMapMptChanges.size(); ++i) {
+        const REFERENCE_TIME mediaTime = m_sidecarMapMptChanges[i].time - m_firstPts;
+        if (mediaTime > afterMediaTime && (best < 0 || mediaTime < best))
+            best = mediaTime;
+    }
+    return best;
 }
 
 // Whether the MPT in force still places this component tag at the stream index
