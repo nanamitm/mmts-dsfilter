@@ -3798,6 +3798,34 @@ void CMmtTlvSplitter::CreatePins()
            const CFilterDemuxerHandler::SubtitleStreamInfo& b) {
             return SubtitlePinPriority(a) < SubtitlePinPriority(b);
         });
+
+    // A recording that spans a channel change carries the same logical track
+    // twice, once per channel, as two assets with different packet ids but the
+    // same component tag. They are one track to the viewer and cues are routed
+    // by component tag, so give them one pin - two pins would both receive
+    // every cue. Streams whose tag is unknown keep a pin each, since there is
+    // nothing to merge them on. The list is already ordered by pin priority, so
+    // the entry kept for a tag is the best one.
+    {
+        std::vector<int> seenTags;
+        auto duplicateTag = [&seenTags](const CFilterDemuxerHandler::SubtitleStreamInfo& info) {
+            if (info.componentTag < 0)
+                return false;
+            if (std::find(seenTags.begin(), seenTags.end(), info.componentTag) != seenTags.end())
+                return true;
+            seenTags.push_back(info.componentTag);
+            return false;
+        };
+        const size_t before = subtitleStreams.size();
+        subtitleStreams.erase(
+            std::remove_if(subtitleStreams.begin(), subtitleStreams.end(), duplicateTag),
+            subtitleStreams.end());
+        if (subtitleStreams.size() != before) {
+            LogMsg(L"MMT/TLV Splitter: CreatePins merged %zu subtitle stream(s) sharing a component tag\n",
+                   before - subtitleStreams.size());
+        }
+    }
+
     if (kEnableSubtitlePins) {
         int primarySubtitleStreamIndex = -1;
         for (const auto& info : subtitleStreams) {
@@ -4088,7 +4116,7 @@ void CMmtTlvSplitter::CreatePins()
                 // next channel's picture would otherwise come up underneath it.
                 const REFERENCE_TIME boundary = NextMptChangeMediaTime(sampleStart);
                 if (boundary > 0 && sampleStop > boundary) {
-                    LogDetail(L"SUBTITLE clipped at MPT change: streamIndex=%d, componentTag=%d, start=%I64d ms, stop=%I64d -> %I64d ms\n",
+                    LogMsg(L"SUBTITLE clipped at MPT change: streamIndex=%d, componentTag=%d, start=%I64d ms, stop=%I64d -> %I64d ms\n",
                               streamIndex, componentTag,
                               sampleStart / 10000, sampleStop / 10000, boundary / 10000);
                     sampleStop = boundary;
