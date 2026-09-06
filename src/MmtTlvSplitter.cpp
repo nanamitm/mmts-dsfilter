@@ -32,7 +32,11 @@ extern "C" {
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
 static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
-static constexpr REFERENCE_TIME kSubtitleChunkDuration = kDefaultSubtitleDuration;
+// A cue with no end time is held on screen by repeating it in chunks until the
+// next cue arrives. Each chunk is delivered as the playhead reaches its start,
+// so the chunks are contiguous; the length is what a cue can overhang the next
+// one by, so keep it short.
+static constexpr REFERENCE_TIME kSubtitleChunkDuration = 10 * 1000000LL; // 1 sec
 static constexpr REFERENCE_TIME kSubtitleInitialDelay = 300 * 10000LL; // 300 ms
 // Subtitle MFUs carry no PTS. Anchor each TTML timeline to the video position
 // where that timeline is first observed, then preserve TTML spacing until a
@@ -4513,7 +4517,11 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
                       currentTime / 10000);
         }
 
-        while (cue.nextChunkStart + kSubtitleChunkDuration <= currentTime) {
+        // Deliver a chunk as the playhead reaches its start. Waiting for its end
+        // (nextChunkStart + duration <= currentTime) handed the renderer every
+        // chunk after its display window had already passed, so the cue blinked
+        // instead of staying up.
+        while (cue.nextChunkStart <= currentTime) {
             REFERENCE_TIME chunkStart = cue.nextChunkStart;
             REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
             DeliverSubtitleCue(cue.streamIndex, cue.componentTag, chunkStart, chunkStop, cue.assEvents, cue.assText);
