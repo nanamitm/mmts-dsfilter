@@ -7,3 +7,7 @@
 *.bat text eol=crlf
 *.ps1 text eol=crlf
 *.md text eol=lf
+
+# Static FFmpeg (thirdparty/ffmpeg): the build script runs under MSYS bash
+thirdparty/ffmpeg/*.sh text eol=lf
+thirdparty/ffmpeg/lib/**/*.lib binary

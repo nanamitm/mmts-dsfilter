@@ -17,6 +17,9 @@
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <PlatformToolset>v143</PlatformToolset>
     <TargetExt>.ax</TargetExt>
+    <!-- FFmpeg comes from thirdparty\ffmpeg; keep a user-wide vcpkg
+         integration from auto-linking its FFmpeg import libraries. -->
+    <VcpkgEnabled>false</VcpkgEnabled>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -42,10 +45,13 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <TargetName>mmts-dsfilter</TargetName>
     <TargetExt>.ax</TargetExt>
+    <!-- Static FFmpeg built for this runtime (see thirdparty\ffmpeg\NOTICE.txt) -->
+    <FFmpegLibDir>..\thirdparty\ffmpeg\lib\MDd\</FFmpegLibDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <TargetName>mmts-dsfilter</TargetName>
     <TargetExt>.ax</TargetExt>
+    <FFmpegLibDir>..\thirdparty\ffmpeg\lib\MD\</FFmpegLibDir>
   </PropertyGroup>
 
   <!-- ==================== Common settings ==================== -->
@@ -57,7 +63,7 @@
         ..\baseclasses\Samples\Win7Samples\multimedia\directshow\baseclasses;
         ..\..\dantto4k\src;
         ..\..\dantto4k\thirdparty\asio\asio\include;
-        C:\vcpkg\packages\ffmpeg_x64-windows\include;
+        ..\thirdparty\ffmpeg\include;
         %(AdditionalIncludeDirectories)
       </AdditionalIncludeDirectories>
       <PreprocessorDefinitions>
@@ -73,24 +79,17 @@
     <Link>
       <ModuleDefinitionFile>..\msvc\mmts-dsfilter.def</ModuleDefinitionFile>
       <AdditionalLibraryDirectories>
-        C:\vcpkg\packages\ffmpeg_x64-windows\lib;
+        $(FFmpegLibDir);
         %(AdditionalLibraryDirectories)
       </AdditionalLibraryDirectories>
+      <!-- FFmpeg is linked statically; libavutil's random seed needs bcrypt -->
       <AdditionalDependencies>
         strmiids.lib;winmm.lib;ole32.lib;oleaut32.lib;uuid.lib;
         Winscard.lib;ws2_32.lib;
-        avcodec.lib;avutil.lib;swresample.lib;
+        avcodec.lib;avutil.lib;swresample.lib;bcrypt.lib;
         %(AdditionalDependencies)
       </AdditionalDependencies>
     </Link>
-    <PostBuildEvent>
-      <!-- Match the SONAME by wildcard: vcpkg bumps ffmpeg (and with it
-           avcodec-NN / avutil-NN / swresample-N) without notice, and a
-           hard-coded number turns that into a post-build failure. -->
-      <Command>copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avcodec-*.dll "$(OutDir)"
-copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\avutil-*.dll "$(OutDir)"
-copy /Y C:\vcpkg\packages\ffmpeg_x64-windows\bin\swresample-*.dll "$(OutDir)"</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
 
   <!-- ==================== Debug ==================== -->

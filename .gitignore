@@ -25,6 +25,7 @@ tools/*.exe
 *.exe
 *.exp
 *.lib
+!thirdparty/ffmpeg/lib/*/*.lib
 *.ilk
 *.iobj
 *.ipdb

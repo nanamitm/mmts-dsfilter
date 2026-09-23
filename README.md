@@ -33,6 +33,7 @@ settings/     Sample INI configuration file
 tools/        Local probe/debug helper sources
 scripts/      Registration helper scripts
 baseclasses/  DirectShow BaseClasses copy from Microsoft samples
+thirdparty/   Static FFmpeg libraries and headers (see thirdparty/ffmpeg/NOTICE.txt)
 ```
 
 Build outputs are intentionally ignored by Git.
@@ -42,7 +43,6 @@ Build outputs are intentionally ignored by Git.
 - Windows
 - Visual Studio 2022 with C++ desktop workload
 - Windows SDK
-- vcpkg x64-windows dependencies used by `dantto4k`
 - `dantto4k` checked out next to this repository:
 
 ```text
@@ -53,6 +53,11 @@ Build outputs are intentionally ignored by Git.
 
 The Visual Studio project currently references `..\..\dantto4k` from
 `msvc/mmts-dsfilter.vcxproj`.
+
+FFmpeg (AAC LATM decoding for 22.2ch audio) is linked statically from
+`thirdparty/ffmpeg`, so neither vcpkg nor FFmpeg DLLs are needed. To rebuild
+those libraries, run `thirdparty\ffmpeg\build_static_msvc.cmd <ffmpeg-source>`
+with an FFmpeg n9.0.1 checkout; see `thirdparty/ffmpeg/NOTICE.txt`.
 
 ## Build
 
@@ -158,19 +163,16 @@ and creates a ZIP package containing:
 
 ```text
 mmts-dsfilter.ax
-avcodec-<soname>.dll
-avutil-<soname>.dll
-swresample-<soname>.dll
 mmts-dsfilter.ini
 Install_mmts-dsfilter_64.cmd
 Uninstall_mmts-dsfilter_64.cmd
 README.md
+FFmpeg-NOTICE.txt
+FFmpeg-LICENSE.txt
 ```
 
-The ffmpeg DLL names carry the SONAME of whatever version vcpkg installed, so
-they change when ffmpeg is bumped (ffmpeg 8 ships `avutil-60.dll`, ffmpeg 9
-ships `avutil-61.dll`). Both the post-build copy and the packaging step match
-them by wildcard.
+FFmpeg is linked into `mmts-dsfilter.ax`, so the package carries no FFmpeg
+DLLs, only its LGPL notice and license text.
 
 The workflow can be run manually from GitHub Actions to create an artifact. It
 also publishes the ZIP as a GitHub Release asset when a `v*` tag is pushed, for

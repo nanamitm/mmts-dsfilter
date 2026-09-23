@@ -30,12 +30,6 @@ jobs:
           ref: v20260905e
           path: dantto4k
 
-      - name: Install vcpkg dependencies
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & C:\vcpkg\vcpkg.exe install ffmpeg:x64-windows
-
       - name: Build Release
         shell: pwsh
         working-directory: mmts-dsfilter
@@ -74,16 +68,9 @@ jobs:
 
           Copy-Item -LiteralPath "msvc\x64\Release\mmts-dsfilter.ax" -Destination $packageRoot
 
-          # The ffmpeg SONAMEs follow whatever vcpkg installs, so match them by
-          # wildcard and fail loudly if one of the three is missing rather than
-          # shipping a package that cannot load.
-          foreach ($library in @('avcodec', 'avutil', 'swresample')) {
-            $dll = Get-ChildItem -Path "msvc\x64\Release\$library-*.dll" -File
-            if ($dll.Count -ne 1) {
-              throw "Expected exactly one $library-*.dll in the output directory, found $($dll.Count)."
-            }
-            Copy-Item -LiteralPath $dll[0].FullName -Destination $packageRoot
-          }
+          # FFmpeg is linked into the .ax statically; ship its LGPL notice.
+          Copy-Item -LiteralPath "thirdparty\ffmpeg\NOTICE.txt" -Destination (Join-Path $packageRoot "FFmpeg-NOTICE.txt")
+          Copy-Item -LiteralPath "thirdparty\ffmpeg\COPYING.LGPLv2.1" -Destination (Join-Path $packageRoot "FFmpeg-LICENSE.txt")
           Copy-Item -LiteralPath "scripts\Install_mmts-dsfilter_64.cmd" -Destination $packageRoot
           Copy-Item -LiteralPath "scripts\Uninstall_mmts-dsfilter_64.cmd" -Destination $packageRoot
           Copy-Item -LiteralPath "settings\mmts-dsfilter.ini" -Destination $packageRoot

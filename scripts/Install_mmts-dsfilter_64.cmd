@@ -8,7 +8,7 @@
 @echo.
 @echo    Please do not delete the mmts-dsfilter.ax file.
 @echo    The installer has not copied the files anywhere.
-@echo    Keep the bundled DLL files and mmts-dsfilter.ini in this folder.
+@echo    Keep mmts-dsfilter.ini in this folder.
 @echo.
 @goto done
 :error
