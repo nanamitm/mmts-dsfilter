@@ -1946,6 +1946,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_virtualEnd = 0;
     m_hasSidecarIndex = false;
     m_seekTarget = 0;
+    m_stopPos = _I64_MAX;
     m_currentPts = 0;
     m_currentDts = -1;
     m_segmentStart = 0;
@@ -3908,6 +3909,10 @@ void CMmtTlvSplitter::CreatePins()
                 normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
                 normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
             }
+            if (normPts >= m_stopPos.load(std::memory_order_acquire)) {
+                m_active = false;
+                return;
+            }
             if (last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
             if (last && normDts >= 0)
@@ -3937,6 +3942,8 @@ void CMmtTlvSplitter::CreatePins()
                 normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
                 normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
             }
+            if (normPts >= m_stopPos.load(std::memory_order_acquire))
+                return;
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
@@ -4590,6 +4597,11 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
         start = (std::max)(static_cast<REFERENCE_TIME>(0), start + offset);
         stop = (std::max)(start + 1, stop + offset);
     }
+    const REFERENCE_TIME stopPosition = m_stopPos.load(std::memory_order_acquire);
+    if (start >= stopPosition)
+        return;
+    if (stop > stopPosition)
+        stop = stopPosition;
 
     bool delivered = false;
     size_t deliveredSamples = 0;
@@ -4850,7 +4862,7 @@ void CMmtTlvSplitter::DemuxLoop()
     // Sample timestamps are also normalised to 0-based (see CreatePins callbacks),
     // so the segment time and sample times share the same [0, m_duration] range.
     for (auto* pin : m_pins)
-        pin->DeliverNewSegment(seekTarget, _I64_MAX, m_rate);
+        pin->DeliverNewSegment(seekTarget, m_stopPos.load(std::memory_order_acquire), m_rate);
 
     std::vector<uint8_t> buf;
     buf.reserve(kChunk * 2);
