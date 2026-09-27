@@ -1946,6 +1946,7 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_virtualEnd = 0;
     m_hasSidecarIndex = false;
     m_seekTarget = 0;
+    m_stopPos = _I64_MAX;
     m_currentPts = 0;
     m_currentDts = -1;
     m_segmentStart = 0;
@@ -1960,10 +1961,12 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     // Get file size
     std::ifstream tmp(m_filename, std::ios::binary | std::ios::ate);
     bool openOk = tmp.is_open();
-    if (openOk) {
-        m_fileSize = static_cast<std::streamsize>(tmp.tellg());
-        tmp.close();
-    }
+    if (!openOk)
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    m_fileSize = static_cast<std::streamsize>(tmp.tellg());
+    tmp.close();
+    if (m_fileSize <= 0)
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
     if (loadEdit)
@@ -2003,13 +2006,13 @@ void CMmtTlvSplitter::LoadSidecarEdit(const std::wstring& editPath)
     long long version = 0;
     long long sourceSize = -1;
     ExtractJsonInt64Value(text, "version", version);
-    ExtractJsonInt64Value(text, "sourceSize", sourceSize);
+    const bool hasSourceSize = ExtractJsonInt64Value(text, "sourceSize", sourceSize);
 
     if (version != 1) {
         LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, version=%I64d\n", version);
         return;
     }
-    if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
+    if (!hasSourceSize || sourceSize < 0 || sourceSize != static_cast<long long>(m_fileSize)) {
         LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, size mismatch: edit=%I64d file=%I64d\n",
                sourceSize, static_cast<long long>(m_fileSize));
         return;
@@ -2025,9 +2028,11 @@ void CMmtTlvSplitter::LoadSidecarEdit(const std::wstring& editPath)
         if (afterStart == std::string::npos)
             break;
         long long endMs = 0;
+        // An end belonging to a later object must not complete this segment.
+        const size_t objectEnd = text.find('}', afterStart);
         const size_t afterEnd = ExtractJsonInt64ValueAt(text, "sourceEndMs", afterStart, endMs);
-        scan = (afterEnd != std::string::npos) ? afterEnd : afterStart;
-        if (afterEnd == std::string::npos)
+        scan = (objectEnd != std::string::npos) ? objectEnd + 1 : text.size();
+        if (objectEnd == std::string::npos || afterEnd == std::string::npos || afterEnd > objectEnd)
             continue; // a start without an end is not a usable cut
         if (startMs < 0 || startMs > kMaxMmtsMapTimeMs || endMs <= startMs || endMs > kMaxMmtsMapTimeMs) {
             LogMsg(L"MMT/TLV Splitter: mmtsedit skipping invalid segment start=%I64d end=%I64d\n", startMs, endMs);
@@ -3904,15 +3909,25 @@ void CMmtTlvSplitter::CreatePins()
                 normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
                 normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
             }
-            if (last && normPts > 0)
+            // Stop in decode order: a reference frame shown after the stop can
+            // still precede B-frames shown before it, so it has to be delivered
+            // (as preroll, decoded but not shown) for those to decode.
+            const REFERENCE_TIME stopPos = m_stopPos.load(std::memory_order_acquire);
+            const REFERENCE_TIME decodeTime = (normDts >= 0) ? normDts : normPts;
+            if (decodeTime > stopPos) {
+                m_active = false;
+                return;
+            }
+            const bool preroll = normPts > stopPos;
+            if (!preroll && last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
-            if (last && normDts >= 0)
+            if (!preroll && last && normDts >= 0)
                 m_currentDts.store(normDts, std::memory_order_relaxed);
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
             PumpPendingSubtitleChunks(samplePts);
-            videoPin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
+            videoPin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz, preroll);
         });
 
     m_handler.setAudioCallback(
@@ -3933,6 +3948,8 @@ void CMmtTlvSplitter::CreatePins()
                 normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
                 normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
             }
+            if (normPts > m_stopPos.load(std::memory_order_acquire))
+                return;
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
@@ -4586,6 +4603,15 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
         start = (std::max)(static_cast<REFERENCE_TIME>(0), start + offset);
         stop = (std::max)(start + 1, stop + offset);
     }
+    // Cue times are segment-relative; the stop position is program time.
+    const REFERENCE_TIME stopPosition = m_stopPos.load(std::memory_order_acquire);
+    if (stopPosition != _I64_MAX) {
+        const REFERENCE_TIME segmentStop = stopPosition - m_segmentStart;
+        if (start >= segmentStop)
+            return;
+        if (stop > segmentStop)
+            stop = segmentStop;
+    }
 
     bool delivered = false;
     size_t deliveredSamples = 0;
@@ -4683,7 +4709,11 @@ STDMETHODIMP CMmtTlvSplitter::Pause()
 
 STDMETHODIMP CMmtTlvSplitter::Stop()
 {
+    for (auto* pin : m_pins)
+        if (pin->IsConnected()) pin->DeliverBeginFlush();
     StopThread();
+    for (auto* pin : m_pins)
+        if (pin->IsConnected()) pin->DeliverEndFlush();
     return CBaseFilter::Stop();
 }
 
@@ -4706,7 +4736,9 @@ void CMmtTlvSplitter::StopThread()
     LogMsg(L"MMT/TLV Splitter: StopThread begin handle=%p\n", m_hThread);
     m_active = false;
     SetEvent(m_hStop);
-    DWORD wait = WaitForSingleObject(m_hThread, 5000);
+    // The worker uses this object and its pins. A timeout cannot make either
+    // safe to reset or destroy; wait until the flush has released delivery.
+    DWORD wait = WaitForSingleObject(m_hThread, INFINITE);
     LogMsg(L"MMT/TLV Splitter: StopThread wait=%lu\n", wait);
     CloseHandle(m_hThread);
     m_hThread = NULL;
@@ -4840,7 +4872,7 @@ void CMmtTlvSplitter::DemuxLoop()
     // Sample timestamps are also normalised to 0-based (see CreatePins callbacks),
     // so the segment time and sample times share the same [0, m_duration] range.
     for (auto* pin : m_pins)
-        pin->DeliverNewSegment(seekTarget, _I64_MAX, m_rate);
+        pin->DeliverNewSegment(seekTarget, m_stopPos.load(std::memory_order_acquire), m_rate);
 
     std::vector<uint8_t> buf;
     buf.reserve(kChunk * 2);

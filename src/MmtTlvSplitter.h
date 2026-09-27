@@ -166,7 +166,7 @@ private:
     bool m_hasSidecarMap{false};
     REFERENCE_TIME m_mapDuration{0};
     REFERENCE_TIME m_mapFirstVideoPts{-1};
-    REFERENCE_TIME m_stopPos{_I64_MAX};
+    std::atomic<REFERENCE_TIME> m_stopPos{_I64_MAX};
     std::atomic<REFERENCE_TIME> m_currentPts{0};  // updated from video callback
     std::atomic<REFERENCE_TIME> m_currentDts{-1}; // updated from video callback; subtitle PCR anchor
     std::streamsize m_fileSize{0};
