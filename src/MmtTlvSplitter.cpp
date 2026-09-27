@@ -2005,13 +2005,13 @@ void CMmtTlvSplitter::LoadSidecarEdit(const std::wstring& editPath)
     long long version = 0;
     long long sourceSize = -1;
     ExtractJsonInt64Value(text, "version", version);
-    ExtractJsonInt64Value(text, "sourceSize", sourceSize);
+    const bool hasSourceSize = ExtractJsonInt64Value(text, "sourceSize", sourceSize);
 
     if (version != 1) {
         LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, version=%I64d\n", version);
         return;
     }
-    if (sourceSize >= 0 && sourceSize != static_cast<long long>(m_fileSize)) {
+    if (!hasSourceSize || sourceSize < 0 || sourceSize != static_cast<long long>(m_fileSize)) {
         LogMsg(L"MMT/TLV Splitter: mmtsedit ignored, size mismatch: edit=%I64d file=%I64d\n",
                sourceSize, static_cast<long long>(m_fileSize));
         return;
@@ -2027,9 +2027,11 @@ void CMmtTlvSplitter::LoadSidecarEdit(const std::wstring& editPath)
         if (afterStart == std::string::npos)
             break;
         long long endMs = 0;
+        // An end belonging to a later object must not complete this segment.
+        const size_t objectEnd = text.find('}', afterStart);
         const size_t afterEnd = ExtractJsonInt64ValueAt(text, "sourceEndMs", afterStart, endMs);
-        scan = (afterEnd != std::string::npos) ? afterEnd : afterStart;
-        if (afterEnd == std::string::npos)
+        scan = (objectEnd != std::string::npos) ? objectEnd + 1 : text.size();
+        if (objectEnd == std::string::npos || afterEnd == std::string::npos || afterEnd > objectEnd)
             continue; // a start without an end is not a usable cut
         if (startMs < 0 || startMs > kMaxMmtsMapTimeMs || endMs <= startMs || endMs > kMaxMmtsMapTimeMs) {
             LogMsg(L"MMT/TLV Splitter: mmtsedit skipping invalid segment start=%I64d end=%I64d\n", startMs, endMs);
