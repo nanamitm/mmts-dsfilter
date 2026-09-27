@@ -3909,19 +3909,25 @@ void CMmtTlvSplitter::CreatePins()
                 normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
                 normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
             }
-            if (normPts >= m_stopPos.load(std::memory_order_acquire)) {
+            // Stop in decode order: a reference frame shown after the stop can
+            // still precede B-frames shown before it, so it has to be delivered
+            // (as preroll, decoded but not shown) for those to decode.
+            const REFERENCE_TIME stopPos = m_stopPos.load(std::memory_order_acquire);
+            const REFERENCE_TIME decodeTime = (normDts >= 0) ? normDts : normPts;
+            if (decodeTime > stopPos) {
                 m_active = false;
                 return;
             }
-            if (last && normPts > 0)
+            const bool preroll = normPts > stopPos;
+            if (!preroll && last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
-            if (last && normDts >= 0)
+            if (!preroll && last && normDts >= 0)
                 m_currentDts.store(normDts, std::memory_order_relaxed);
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
 
             PumpPendingSubtitleChunks(samplePts);
-            videoPin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
+            videoPin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz, preroll);
         });
 
     m_handler.setAudioCallback(
@@ -3942,7 +3948,7 @@ void CMmtTlvSplitter::CreatePins()
                 normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
                 normDts = (dts >= 0 && m_firstPts >= 0) ? dts - m_firstPts : dts;
             }
-            if (normPts >= m_stopPos.load(std::memory_order_acquire))
+            if (normPts > m_stopPos.load(std::memory_order_acquire))
                 return;
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
@@ -4597,11 +4603,15 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
         start = (std::max)(static_cast<REFERENCE_TIME>(0), start + offset);
         stop = (std::max)(start + 1, stop + offset);
     }
+    // Cue times are segment-relative; the stop position is program time.
     const REFERENCE_TIME stopPosition = m_stopPos.load(std::memory_order_acquire);
-    if (start >= stopPosition)
-        return;
-    if (stop > stopPosition)
-        stop = stopPosition;
+    if (stopPosition != _I64_MAX) {
+        const REFERENCE_TIME segmentStop = stopPosition - m_segmentStart;
+        if (start >= segmentStop)
+            return;
+        if (stop > segmentStop)
+            stop = segmentStop;
+    }
 
     bool delivered = false;
     size_t deliveredSamples = 0;

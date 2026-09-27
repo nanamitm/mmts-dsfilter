@@ -45,7 +45,7 @@ public:
     // Deliver one ES fragment. Returns S_OK or an error.
     HRESULT DeliverSample(bool keyframe, REFERENCE_TIME pts, REFERENCE_TIME dts,
                           bool isFirstFragment, bool isLastFragment,
-                          const uint8_t* data, size_t size);
+                          const uint8_t* data, size_t size, bool preroll = false);
     HRESULT DeliverTextSample(REFERENCE_TIME start, REFERENCE_TIME stop,
                               const char* text, size_t size);
     HRESULT DeliverEOS();
@@ -132,6 +132,7 @@ private:
     REFERENCE_TIME m_accumPts{-1};
     REFERENCE_TIME m_accumDts{-1};
     bool m_accumKey{false};
+    bool m_accumPreroll{false};
     bool m_firstSample{true};
     bool m_logNextSample{false};
     bool m_waitForVideoRap{false};

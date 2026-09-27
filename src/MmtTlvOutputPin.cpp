@@ -429,7 +429,7 @@ HRESULT CMmtTlvOutputPin::DeliverNewSegment(REFERENCE_TIME tStart, REFERENCE_TIM
 HRESULT CMmtTlvOutputPin::DeliverSample(
     bool keyframe, REFERENCE_TIME pts, REFERENCE_TIME dts,
     bool isFirstFragment, bool isLastFragment,
-    const uint8_t* data, size_t size)
+    const uint8_t* data, size_t size, bool preroll)
 {
     if (!IsConnected()) return S_FALSE;
 
@@ -443,6 +443,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         m_accumPts = pts;
         m_accumDts = dts;
         m_accumKey = keyframe;
+        m_accumPreroll = preroll;
     }
 
     m_accum.insert(m_accum.end(), data, data + size);
@@ -594,7 +595,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     pSample->SetSyncPoint(m_isVideo
         ? ((m_accumKey || wasFirstSample) ? TRUE : FALSE)
         : TRUE);
-    pSample->SetPreroll(FALSE);
+    pSample->SetPreroll(m_accumPreroll ? TRUE : FALSE);
     pSample->SetDiscontinuity(sampleDiscontinuity ? TRUE : FALSE);
     m_firstSample = false;
 
