@@ -1960,10 +1960,12 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     // Get file size
     std::ifstream tmp(m_filename, std::ios::binary | std::ios::ate);
     bool openOk = tmp.is_open();
-    if (openOk) {
-        m_fileSize = static_cast<std::streamsize>(tmp.tellg());
-        tmp.close();
-    }
+    if (!openOk)
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    m_fileSize = static_cast<std::streamsize>(tmp.tellg());
+    tmp.close();
+    if (m_fileSize <= 0)
+        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
     LogMsg(L"MMT/TLV Splitter: File open status = %d, size = %I64d bytes\n", openOk, m_fileSize);
 
     if (loadEdit)
@@ -4683,7 +4685,11 @@ STDMETHODIMP CMmtTlvSplitter::Pause()
 
 STDMETHODIMP CMmtTlvSplitter::Stop()
 {
+    for (auto* pin : m_pins)
+        if (pin->IsConnected()) pin->DeliverBeginFlush();
     StopThread();
+    for (auto* pin : m_pins)
+        if (pin->IsConnected()) pin->DeliverEndFlush();
     return CBaseFilter::Stop();
 }
 
@@ -4706,7 +4712,9 @@ void CMmtTlvSplitter::StopThread()
     LogMsg(L"MMT/TLV Splitter: StopThread begin handle=%p\n", m_hThread);
     m_active = false;
     SetEvent(m_hStop);
-    DWORD wait = WaitForSingleObject(m_hThread, 5000);
+    // The worker uses this object and its pins. A timeout cannot make either
+    // safe to reset or destroy; wait until the flush has released delivery.
+    DWORD wait = WaitForSingleObject(m_hThread, INFINITE);
     LogMsg(L"MMT/TLV Splitter: StopThread wait=%lu\n", wait);
     CloseHandle(m_hThread);
     m_hThread = NULL;
