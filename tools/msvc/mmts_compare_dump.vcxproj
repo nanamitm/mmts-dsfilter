@@ -132,10 +132,7 @@
     <ClCompile Include="..\..\..\dantto4k\src\accessControlDescriptor.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\adtsConverter.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\aes.cpp" />
-    <ClCompile Include="..\..\..\dantto4k\src\aribEncoder.cpp" />
-    <ClCompile Include="..\..\..\dantto4k\src\aribUtil.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\b24Color.cpp" />
-    <ClCompile Include="..\..\..\dantto4k\src\b24SubtitleConvertor.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\caMessage.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\compressedIPPacket.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\config.cpp" />
@@ -222,8 +219,19 @@
     <ClCompile Include="..\..\..\dantto4k\src\tlvDescriptors.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\tlvTableFactory.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\transmissionControlSignal.cpp" />
-    <ClCompile Include="..\..\..\dantto4k\src\ttml.cpp" />
     <ClCompile Include="..\..\..\dantto4k\src\videoComponentDescriptor.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\additionalAribSubtitleInfo.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\aribCharsetEncoder.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\aribCharsetTables.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\aribTextEncoder.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\b24SubtitleConverter.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ntpTimestamp.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml\b24_converter.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml\drcs.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml\drcs_font.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml\parser.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml\resolver.cpp" />
+    <ClCompile Include="..\..\..\dantto4k\src\ttml\style.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
