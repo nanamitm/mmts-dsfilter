@@ -58,6 +58,7 @@ struct ISampleGrabber : IUnknown {
 class PinCounter : public ISampleGrabberCB {
 public:
     std::string name;
+    bool subtitle = false;
     std::atomic<long> samples{0};
     std::atomic<LONGLONG> firstMs{-1};
     std::atomic<LONGLONG> lastMs{-1};
@@ -139,9 +140,17 @@ void PrintUsage()
 {
     std::fwprintf(stderr,
         L"usage: mmts_pin_probe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH]\n"
-        L"  --seek SEC  start playback at SEC seconds (default 0)\n"
-        L"  --run SEC   play for SEC seconds of real time (default 60)\n"
-        L"  --ax PATH   load this mmts-dsfilter.ax instead of the registered one\n");
+        L"                      [--expect-main-subtitle] [--expect-pin NAME]...\n"
+        L"  --seek SEC              start playback at SEC seconds (default 0)\n"
+        L"  --run SEC               play for SEC seconds of real time (default 60)\n"
+        L"  --ax PATH               load this mmts-dsfilter.ax instead of the registered one\n"
+        L"  --expect-main-subtitle  fail unless the first subtitle pin (the main\n"
+        L"                          caption) received samples and no other subtitle\n"
+        L"                          pin did\n"
+        L"  --expect-pin NAME       fail unless a pin whose name starts with NAME\n"
+        L"                          received samples (repeatable)\n"
+        L"exit code: 0 = ran (and every expectation held), 1 = an expectation\n"
+        L"failed or the graph could not be built, 2 = bad arguments\n");
 }
 
 } // namespace
@@ -152,8 +161,14 @@ int wmain(int argc, wchar_t** argv)
     const wchar_t* axPath = nullptr;
     double seekSec = 0;
     double runSec = 60;
+    bool expectMainSubtitle = false;
+    std::vector<std::string> expectedPins;
     for (int i = 1; i < argc; ++i) {
-        if (std::wcscmp(argv[i], L"--seek") == 0 && i + 1 < argc) {
+        if (std::wcscmp(argv[i], L"--expect-main-subtitle") == 0) {
+            expectMainSubtitle = true;
+        } else if (std::wcscmp(argv[i], L"--expect-pin") == 0 && i + 1 < argc) {
+            expectedPins.push_back(ToUtf8(argv[++i]));
+        } else if (std::wcscmp(argv[i], L"--seek") == 0 && i + 1 < argc) {
             seekSec = _wtof(argv[++i]);
         } else if (std::wcscmp(argv[i], L"--run") == 0 && i + 1 < argc) {
             runSec = _wtof(argv[++i]);
@@ -242,6 +257,7 @@ int wmain(int argc, wchar_t** argv)
             if (SUCCEEDED(hr)) {
                 auto* counter = new PinCounter;
                 counter->name = name;
+                counter->subtitle = isSubtitle;
                 counters.push_back(counter);
                 grabberControl->SetCallback(counter, 0);
                 graph->AddFilter(grabber, filterName);
@@ -280,6 +296,49 @@ int wmain(int argc, wchar_t** argv)
     for (const auto* counter : counters) {
         std::printf("%-40s %10ld %12lld %12lld\n", counter->name.c_str(), counter->samples.load(),
                     counter->firstMs.load(), counter->lastMs.load());
+    }
+
+    // The splitter creates the main caption pin first among its subtitle pins.
+    std::vector<std::string> failures;
+    if (expectMainSubtitle) {
+        bool first = true;
+        bool any = false;
+        for (const auto* counter : counters) {
+            if (!counter->subtitle)
+                continue;
+            any = true;
+            const long samples = counter->samples.load();
+            if (first && samples == 0)
+                failures.push_back("main subtitle pin '" + counter->name + "' received no samples");
+            if (!first && samples > 0)
+                failures.push_back("subtitle pin '" + counter->name + "' received " +
+                                   std::to_string(samples) + " samples (expected only the main one)");
+            first = false;
+        }
+        if (!any)
+            failures.push_back("no subtitle pin");
+    }
+    for (const auto& expected : expectedPins) {
+        const PinCounter* match = nullptr;
+        for (const auto* counter : counters) {
+            if (counter->name.compare(0, expected.size(), expected) == 0) {
+                match = counter;
+                break;
+            }
+        }
+        if (!match)
+            failures.push_back("no counted pin named '" + expected + "*' (the video pin is not counted)");
+        else if (match->samples.load() == 0)
+            failures.push_back("pin '" + match->name + "' received no samples");
+    }
+
+    if (expectMainSubtitle || !expectedPins.empty()) {
+        std::printf("\n");
+        for (const auto& failure : failures)
+            std::printf("FAIL: %s\n", failure.c_str());
+        std::printf("RESULT: %s\n", failures.empty() ? "PASS" : "FAIL");
+        if (!failures.empty())
+            return 1;
     }
     return 0;
 }

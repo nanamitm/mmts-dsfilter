@@ -113,7 +113,7 @@ tools\subtitle_ttml_dump.exe <input.mmts> [outdir] [--verbose]
 DirectShow graph and prints how many samples each output pin delivered:
 
 ```powershell
-tools\mmts_pin_probe.exe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH]
+tools\mmts_pin_probe.exe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH] [--expect-main-subtitle] [--expect-pin NAME]...
 ```
 
 - `--run SEC` is real playback time (default 60). Cover an MPT change - a
@@ -123,6 +123,11 @@ tools\mmts_pin_probe.exe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH]
   `msvc\x64\Release\mmts-dsfilter.ax`; it reads the `.ini` next to it, so set
   `DebugLogPath` there to log the same run. Without it the registered filter
   is used.
+- `--expect-main-subtitle` fails the run unless the main caption pin received
+  samples and no other subtitle pin did; `--expect-pin NAME` (repeatable)
+  fails it unless the pin whose name starts with `NAME` received samples. The
+  exit code is 1 on a failed expectation, so runs can be scripted as a
+  regression check.
 - Demuxer-only probes miss routing bugs: the filter locks its stream lists
   once pins exist, which only a real graph reproduces.
 

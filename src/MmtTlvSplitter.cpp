@@ -4063,7 +4063,7 @@ void CMmtTlvSplitter::CreatePins()
         });
 
     m_handler.setSubtitleCallback(
-        [this](int streamIndex, int streamComponentTag, long long pts, long long,
+        [this](int streamIndex, uint16_t packetId, int streamComponentTag, long long pts, long long,
                const uint8_t* d, size_t sz) {
             static volatile LONG s_subtitleCallbacks = 0;
             LONG callbackNo = InterlockedIncrement(&s_subtitleCallbacks);
@@ -4183,8 +4183,8 @@ void CMmtTlvSplitter::CreatePins()
                     // The lookahead reads ahead on the demux thread, so its
                     // cost stalls delivery; log it to spot slow storage.
                     const ULONGLONG lookaheadStartMs = GetTickCount64();
-                    const bool foundNext = FindNextSubtitleBegin(streamIndex, componentTag, cue.begin,
-                                                                 lookaheadOffset, nextBegin);
+                    const bool foundNext = FindNextSubtitleBegin(streamIndex, packetId, componentTag,
+                                                                 cue.begin, lookaheadOffset, nextBegin);
                     const ULONGLONG lookaheadMs = GetTickCount64() - lookaheadStartMs;
                     if (foundNext) {
                         sampleStop = SubtitleSourceTime(nextBegin) - subtitleTimeOffset;
@@ -4210,7 +4210,9 @@ void CMmtTlvSplitter::CreatePins()
                 // declared end reaches well past the change (28 s is normal for
                 // a caption that is meant to stay until the next one), and the
                 // next channel's picture would otherwise come up underneath it.
-                const REFERENCE_TIME boundary = NextMptChangeMediaTime(sampleStart);
+                // Only the change where this cue's asset leaves the package
+                // counts; one that merely renumbers assets does not.
+                const REFERENCE_TIME boundary = NextMptChangeMediaTime(sampleStart, packetId);
                 if (boundary > 0 && sampleStop > boundary) {
                     LogMsg(L"SUBTITLE clipped at MPT change: streamIndex=%d, componentTag=%d, start=%I64d ms, stop=%I64d -> %I64d ms\n",
                               streamIndex, componentTag,
@@ -4253,6 +4255,7 @@ void CMmtTlvSplitter::CreatePins()
                 PendingSubtitleCue pending;
                 pending.streamIndex = streamIndex;
                 pending.componentTag = componentTag;
+                pending.packetId = packetId;
                 pending.start = sampleStart;
                 pending.nextChunkStart = sampleStart;
                 pending.assEvents = cue.assEvents;
@@ -4345,7 +4348,7 @@ REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, 
                                             m_segmentTimeOffset.load(std::memory_order_acquire));
 }
 
-bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, int componentTag,
+bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, uint16_t packetId, int componentTag,
                                             REFERENCE_TIME currentBegin,
                                             long long startOffset, REFERENCE_TIME& nextBegin) const
 {
@@ -4371,28 +4374,37 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, int componentTag,
     bool trackEnded = false;
     CFilterDemuxerHandler handler;
     handler.setSubtitleCallback(
-        [&](int si, int siTag, long long, long long, const uint8_t* d, size_t sz) {
+        [&](int si, uint16_t siPacketId, int siTag, long long, long long, const uint8_t* d, size_t sz) {
             if (found || trackEnded)
                 return;
 
-            // Stop at a channel change. Once the MPT no longer places this track
-            // where it was, the caption belongs to a package that has ended: it
-            // must not be stretched to the next cue, which is already part of
-            // the following channel.
-            if (componentTag >= 0 && handler.getSubtitleStreamCount() > 0 &&
-                handler.getSubtitleComponentTag(streamIndex) != componentTag) {
-                trackEnded = true;
-                return;
-            }
-
-            // Match the track by component tag; the stream index is assigned per
-            // asset position and is not stable across an MPT change.
             const int tag = siTag >= 0 ? siTag : handler.getSubtitleComponentTag(si);
-            const bool sameTrack = (componentTag >= 0 && tag >= 0)
-                ? tag == componentTag
-                : si == streamIndex;
-            if (!sameTrack)
-                return;
+            if (packetId != 0) {
+                // Stop at a channel change: the same track now comes from
+                // another asset, so the caption's package has ended and it
+                // must not be stretched to the next cue, which is already
+                // part of the following channel. An MPT change that only
+                // renumbers assets keeps the asset, and the search goes on.
+                if (siPacketId != packetId) {
+                    if (componentTag >= 0 && tag == componentTag)
+                        trackEnded = true;
+                    return;
+                }
+            } else {
+                // Asset unknown: the old position-based check. Once the MPT no
+                // longer places this track where it was, treat the package as
+                // ended.
+                if (componentTag >= 0 && handler.getSubtitleStreamCount() > 0 &&
+                    handler.getSubtitleComponentTag(streamIndex) != componentTag) {
+                    trackEnded = true;
+                    return;
+                }
+                const bool sameTrack = (componentTag >= 0 && tag >= 0)
+                    ? tag == componentTag
+                    : si == streamIndex;
+                if (!sameTrack)
+                    return;
+            }
 
             TtmlDebugStats stats;
             TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, si);
@@ -4447,10 +4459,15 @@ void CMmtTlvSplitter::ClearPendingSubtitleCues()
     m_deferredSubtitleSamples.clear();
 }
 
-// Media time of the first MPT change after `afterMediaTime`, or -1 when there is
-// none (or no sidecar map to read it from). Entry 0 of the map is the MPT the
-// file starts with, not a change, so it is skipped.
-REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime) const
+// Media time of the first MPT change after `afterMediaTime` at which the
+// subtitle asset `packetId` leaves the package, or -1 when there is none (or
+// no sidecar map to read it from). A change that keeps the asset - one that
+// only renumbers assets, e.g. a commentary audio asset appearing - is not an
+// end for its captions. With packetId 0, or an asset the map does not list on
+// either side of a change, every change counts, as before. Entry 0 of the map
+// is the MPT the file starts with, not a change, so it is skipped.
+REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime,
+                                                       uint16_t packetId) const
 {
     if (m_firstPts < 0)
         return -1;
@@ -4464,11 +4481,27 @@ REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMedia
         ? m_mapFirstVideoPts - m_firstPts
         : -m_firstPts;
 
+    auto carriesAsset = [packetId](const SidecarMapMptChange& change) {
+        return std::any_of(change.tracks.begin(), change.tracks.end(),
+            [packetId](const SidecarMapTrack& track) {
+                return track.type == "subtitle" && track.packetId == packetId;
+            });
+    };
+
     REFERENCE_TIME best = -1;
     for (size_t i = 1; i < m_sidecarMapMptChanges.size(); ++i) {
         const REFERENCE_TIME mediaTime = m_sidecarMapMptChanges[i].time + base;
-        if (mediaTime > afterMediaTime && (best < 0 || mediaTime < best))
-            best = mediaTime;
+        if (mediaTime <= afterMediaTime || (best >= 0 && mediaTime >= best))
+            continue;
+        if (packetId != 0) {
+            const bool before = carriesAsset(m_sidecarMapMptChanges[i - 1]);
+            const bool after = carriesAsset(m_sidecarMapMptChanges[i]);
+            if (after && before)
+                continue; // the asset stays: not this cue's boundary
+            if (after && !before)
+                continue; // the asset starts here: nothing of it to end
+        }
+        best = mediaTime;
     }
     return best;
 }
@@ -4488,12 +4521,19 @@ REFERENCE_TIME CMmtTlvSplitter::PendingSubtitlePaintedTo(int streamIndex, int co
     return -1;
 }
 
-// Whether the MPT in force still places this component tag at the stream index
-// the cue arrived on. Unknown mappings count as current, so a cue is never
-// dropped just because the subtitle list has not been filled in yet.
-bool CMmtTlvSplitter::SubtitleTrackStillCurrent(int streamIndex, int componentTag) const
+// Whether the MPT in force still carries the asset the cue came from. A change
+// that only renumbers assets keeps it; a channel change replaces it. Unknown
+// mappings count as current, so a cue is never dropped just because the
+// subtitle list has not been filled in yet. Without a packetId, fall back to
+// whether this component tag still sits at the stream index the cue arrived on.
+bool CMmtTlvSplitter::SubtitleTrackStillCurrent(int streamIndex, uint16_t packetId,
+                                                int componentTag) const
 {
-    if (componentTag < 0 || m_handler.getSubtitleStreamCount() == 0)
+    if (m_handler.getSubtitleStreamCount() == 0)
+        return true;
+    if (packetId != 0)
+        return m_handler.hasSubtitlePacket(packetId);
+    if (componentTag < 0)
         return true;
     return m_handler.getSubtitleComponentTag(streamIndex) == componentTag;
 }
@@ -4610,10 +4650,10 @@ void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
 
         // A cue with no end time repeats until the next cue of the same track
         // arrives. When the recording spans a channel change that next cue can
-        // be a long way off, so also stop repeating as soon as the MPT stops
-        // placing this cue's track where it came from - otherwise the last
+        // be a long way off, so also stop repeating as soon as the MPT no
+        // longer carries the asset the cue came from - otherwise the last
         // caption of the previous channel keeps showing over the new one.
-        if (!SubtitleTrackStillCurrent(cue.streamIndex, cue.componentTag)) {
+        if (!SubtitleTrackStillCurrent(cue.streamIndex, cue.packetId, cue.componentTag)) {
             if (currentTime > cue.nextChunkStart) {
                 DeliverSubtitleCue(cue.streamIndex, cue.componentTag, cue.nextChunkStart,
                                    currentTime, cue.assEvents, cue.assText);
