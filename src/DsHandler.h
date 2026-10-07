@@ -53,6 +53,7 @@ public:
     // identify the track on its own.
     using SubtitleCallback = std::function<void(
         int streamIndex,
+        uint16_t packetId,
         int componentTag,
         long long pts,
         long long dts,
@@ -111,6 +112,8 @@ public:
     // MPT that is currently in force, or -1 when it is not known.
     int getSubtitleComponentTag(int streamIndex) const;
     size_t getSubtitleStreamCount() const;
+    // Whether the subtitle list (the MPT in force) still holds this asset.
+    bool hasSubtitlePacket(uint16_t packetId) const;
     void setKnownVideoStreams(const std::vector<VideoStreamInfo>& streams);
     void setKnownAudioStreams(const std::vector<AudioStreamInfo>& streams);
     void setKnownSubtitleStreams(const std::vector<SubtitleStreamInfo>& streams);

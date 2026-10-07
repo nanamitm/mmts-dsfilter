@@ -102,12 +102,17 @@ private:
                                  int& width, int& height);
     static DWORD WINAPI ThreadProc(LPVOID pv);
     void DemuxLoop();
-    bool FindNextSubtitleBegin(int streamIndex, int componentTag, REFERENCE_TIME currentBegin,
+    // The subtitle-ending checks below identify the cue's asset by packetId
+    // (0 = unknown, falling back to the stream index / component tag): an MPT
+    // change that only renumbers assets - a commentary audio asset appearing -
+    // must not end a caption; only its asset leaving the package does.
+    bool FindNextSubtitleBegin(int streamIndex, uint16_t packetId, int componentTag,
+                               REFERENCE_TIME currentBegin,
                                long long startOffset, REFERENCE_TIME& nextBegin) const;
     void ClearPendingSubtitleCues();
-    REFERENCE_TIME NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime) const;
+    REFERENCE_TIME NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime, uint16_t packetId) const;
     REFERENCE_TIME PendingSubtitlePaintedTo(int streamIndex, int componentTag) const;
-    bool SubtitleTrackStillCurrent(int streamIndex, int componentTag) const;
+    bool SubtitleTrackStillCurrent(int streamIndex, uint16_t packetId, int componentTag) const;
     void FlushPendingSubtitleCue(int streamIndex, int componentTag, REFERENCE_TIME stopTime);
     void FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime);
     void PumpPendingSubtitleChunks(REFERENCE_TIME currentTime);
@@ -186,6 +191,8 @@ private:
         // Resolved when the cue was opened; the stream index alone stops
         // identifying the track once the MPT changes.
         int componentTag = -1;
+        // The asset the cue came from; it decides when the cue's package ends.
+        uint16_t packetId = 0;
         REFERENCE_TIME start = 0;
         REFERENCE_TIME nextChunkStart = 0;
         std::vector<std::string> assEvents;

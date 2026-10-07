@@ -851,6 +851,15 @@ size_t CFilterDemuxerHandler::getSubtitleStreamCount() const
     return m_subtitleStreams.size();
 }
 
+bool CFilterDemuxerHandler::hasSubtitlePacket(uint16_t packetId) const
+{
+    std::lock_guard<std::mutex> lock(m_subtitleMutex);
+    return std::any_of(m_subtitleStreams.begin(), m_subtitleStreams.end(),
+        [packetId](const SubtitleStreamInfo& info) {
+            return info.packetId == packetId;
+        });
+}
+
 void CFilterDemuxerHandler::resetAudioSelection()
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
@@ -1167,7 +1176,7 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
         return;
 
     m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
-                       stream.getComponentTag(), pts, dts,
+                       stream.getPacketId(), stream.getComponentTag(), pts, dts,
                        mfu.data.data(), mfu.data.size());
 }
 
