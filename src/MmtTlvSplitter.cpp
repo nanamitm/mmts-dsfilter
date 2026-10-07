@@ -4180,20 +4180,28 @@ void CMmtTlvSplitter::CreatePins()
                 } else {
                     REFERENCE_TIME nextBegin = -1;
                     const long long lookaheadOffset = m_demuxByteOffset.load(std::memory_order_acquire);
-                    if (FindNextSubtitleBegin(streamIndex, componentTag, cue.begin, lookaheadOffset, nextBegin)) {
+                    // The lookahead reads ahead on the demux thread, so its
+                    // cost stalls delivery; log it to spot slow storage.
+                    const ULONGLONG lookaheadStartMs = GetTickCount64();
+                    const bool foundNext = FindNextSubtitleBegin(streamIndex, componentTag, cue.begin,
+                                                                 lookaheadOffset, nextBegin);
+                    const ULONGLONG lookaheadMs = GetTickCount64() - lookaheadStartMs;
+                    if (foundNext) {
                         sampleStop = SubtitleSourceTime(nextBegin) - subtitleTimeOffset;
-                        LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d\n",
+                        LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d, took=%I64u ms\n",
                                   streamIndex,
                                   cue.begin / 10000,
                                   nextBegin / 10000,
-                                  lookaheadOffset);
+                                  lookaheadOffset,
+                                  lookaheadMs);
                     } else {
                         sampleStop = sampleStart + kSubtitleChunkDuration;
                         repeatUntilNextCue = true;
-                        LogDetail(L"SUBTITLE lookahead miss, pending chunk: streamIndex=%d, current=%I64d ms, byte=%I64d\n",
+                        LogDetail(L"SUBTITLE lookahead miss, pending chunk: streamIndex=%d, current=%I64d ms, byte=%I64d, took=%I64u ms\n",
                                   streamIndex,
                                   cue.begin / 10000,
-                                  lookaheadOffset);
+                                  lookaheadOffset,
+                                  lookaheadMs);
                     }
                 }
 
@@ -4669,7 +4677,10 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
 
     bool delivered = false;
     size_t deliveredSamples = 0;
+    int deliveredPinTag = -1;
     auto deliverToPin = [&](CMmtTlvOutputPin* pin) {
+        if (!delivered)
+            deliveredPinTag = pin->SubtitleComponentTag();
         if (!assEvents.empty()) {
             for (const auto& sampleText : assEvents) {
                 pin->DeliverTextSample(start, stop, sampleText.c_str(), sampleText.size());
@@ -4711,9 +4722,11 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
     static volatile LONG s_subtitleDeliverCueLogs = 0;
     LONG deliverLogNo = InterlockedIncrement(&s_subtitleDeliverCueLogs);
     if (deliverLogNo <= 160 || !delivered) {
-        LogMsg(L"SUBTITLE DeliverCue #%ld: streamIndex=%d start=%I64d ms stop=%I64d ms assEvents=%zu assTextBytes=%zu delivered=%d samples=%zu pins=%zu fallbackStreamIndex=%d\n",
+        LogMsg(L"SUBTITLE DeliverCue #%ld: streamIndex=%d componentTag=%d pinComponentTag=%d start=%I64d ms stop=%I64d ms assEvents=%zu assTextBytes=%zu delivered=%d samples=%zu pins=%zu fallbackStreamIndex=%d\n",
                deliverLogNo,
                streamIndex,
+               componentTag,
+               deliveredPinTag,
                start / 10000,
                stop / 10000,
                assEvents.size(),
