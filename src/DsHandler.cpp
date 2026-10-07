@@ -539,6 +539,17 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
 
 void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 {
+    if (mpt.mmtPackageIdByte.size() >= 2) {
+        const uint16_t serviceId = static_cast<uint16_t>(
+            (mpt.mmtPackageIdByte[0] << 8) | mpt.mmtPackageIdByte[1]);
+        if (!m_hasServiceId || serviceId != m_serviceId) {
+            LogMsg(L"MMT/TLV MPT service: serviceId=0x%04X%s\n", serviceId,
+                   m_hasServiceId ? L" (changed)" : L"");
+            m_serviceId = serviceId;
+            m_hasServiceId = true;
+        }
+    }
+
     std::vector<VideoStreamInfo> discoveredVideos;
     std::vector<AudioStreamInfo> discovered;
     std::vector<SubtitleStreamInfo> discoveredSubtitles;
@@ -1164,6 +1175,18 @@ void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
 {
     if (!mhEit.isPf() || mhEit.sectionNumber != 0)
         return;
+
+    // Until an MPT names the service, any present event is taken (as before);
+    // the right service's EIT then corrects it, since a different service
+    // means a different program id.
+    if (m_hasServiceId && mhEit.serviceId != m_serviceId) {
+        static volatile LONG s_otherServiceEitLogs = 0;
+        if (InterlockedIncrement(&s_otherServiceEitLogs) <= 8) {
+            LogDetail(L"MMT/TLV EIT ignored for another service: serviceId=0x%04X, playing=0x%04X\n",
+                      mhEit.serviceId, m_serviceId);
+        }
+        return;
+    }
 
     for (const auto& mhEvent : mhEit.events) {
         if (!mhEvent)
