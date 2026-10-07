@@ -10,3 +10,4 @@ cl.exe /O2 /EHsc /std:c++20 /W0 /I"..\src" /I"..\..\dantto4k\src" mmts_video_ps_
 cl.exe /O2 /EHsc /std:c++20 /W0 /I"..\src" /I"..\..\dantto4k\src" mmts_gap_probe.cpp @sources.rsp /Fe:mmts_gap_probe.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
 cl.exe /O2 /EHsc /std:c++20 /W0 /utf-8 /I"..\src" /I"..\..\dantto4k\src" mmts_cue_probe.cpp @sources.rsp /Fe:mmts_cue_probe.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
 cl.exe /O2 /EHsc /std:c++20 /W0 /utf-8 /I"..\src" /I"..\..\dantto4k\src" /I"..\..\dantto4k\thirdparty\pugixml\src" subtitle_ttml_dump.cpp @sources.rsp /Fe:subtitle_ttml_dump.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE
+cl.exe /O2 /EHsc /std:c++20 /W0 /utf-8 mmts_pin_probe.cpp /Fe:mmts_pin_probe.exe /Fo:obj\ /link /SUBSYSTEM:CONSOLE

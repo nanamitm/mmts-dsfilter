@@ -109,6 +109,23 @@ tools\subtitle_ttml_dump.exe <input.mmts> [outdir] [--verbose]
   from, so a `MISMATCH` (also the exit code) is a caption it will lay out
   wrong - ruby drifting off the character it annotates, for instance.
 
+`tools/mmts_pin_probe.exe` plays a file through the real filter in a
+DirectShow graph and prints how many samples each output pin delivered:
+
+```powershell
+tools\mmts_pin_probe.exe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH]
+```
+
+- `--run SEC` is real playback time (default 60). Cover an MPT change - a
+  commentary track starting, a channel boundary - to check that captions stay
+  on the main subtitle pin and every audio pin keeps receiving its stream.
+- `--ax PATH` loads an unregistered build, e.g.
+  `msvc\x64\Release\mmts-dsfilter.ax`; it reads the `.ini` next to it, so set
+  `DebugLogPath` there to log the same run. Without it the registered filter
+  is used.
+- Demuxer-only probes miss routing bugs: the filter locks its stream lists
+  once pins exist, which only a real graph reproduces.
+
 ## Non-destructive edits (`.mmtsedit`)
 
 The filter supports a non-destructive edit decision list in a `.mmtsedit` JSON
