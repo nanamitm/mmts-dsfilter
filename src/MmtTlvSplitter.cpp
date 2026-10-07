@@ -3837,35 +3837,35 @@ void CMmtTlvSplitter::CreatePins()
     }
 
     if (kEnableSubtitlePins) {
-        int primarySubtitleStreamIndex = -1;
+        const CFilterDemuxerHandler::SubtitleStreamInfo* primarySubtitle = nullptr;
         for (const auto& info : subtitleStreams) {
             if (info.hasData && IsCaptionComponentTag(info.componentTag)) {
-                primarySubtitleStreamIndex = info.streamIndex;
+                primarySubtitle = &info;
                 break;
             }
         }
-        if (primarySubtitleStreamIndex < 0) {
+        if (!primarySubtitle) {
             for (const auto& info : subtitleStreams) {
                 if (IsCaptionComponentTag(info.componentTag)) {
-                    primarySubtitleStreamIndex = info.streamIndex;
+                    primarySubtitle = &info;
                     break;
                 }
             }
         }
-        if (primarySubtitleStreamIndex < 0) {
+        if (!primarySubtitle) {
             for (const auto& info : subtitleStreams) {
                 if (info.hasData) {
-                    primarySubtitleStreamIndex = info.streamIndex;
+                    primarySubtitle = &info;
                     break;
                 }
             }
         }
-        if (primarySubtitleStreamIndex < 0 && !subtitleStreams.empty())
-            primarySubtitleStreamIndex = subtitleStreams.front().streamIndex;
+        if (!primarySubtitle && !subtitleStreams.empty())
+            primarySubtitle = &subtitleStreams.front();
         for (size_t i = 0; i < subtitleStreams.size(); ++i) {
             WCHAR pinName[64];
             WCHAR trackName[128];
-            if (subtitleStreams[i].streamIndex == primarySubtitleStreamIndex) {
+            if (&subtitleStreams[i] == primarySubtitle) {
                 StringCchCopyW(trackName, ARRAYSIZE(trackName), L"\x4E3B\x5B57\x5E55");
             } else {
                 StringCchPrintfW(trackName, ARRAYSIZE(trackName),

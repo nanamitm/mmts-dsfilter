@@ -427,11 +427,39 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
 {
     std::lock_guard<std::mutex> lock(m_subtitleMutex);
     int streamIndex = static_cast<int>(stream.getStreamIndex());
+    const uint16_t packetId = stream.getPacketId();
+    const int componentTag = stream.getComponentTag();
+
+    // The stream index is an asset position, and an MPT change can hand it to
+    // another asset (a commentary audio asset appearing shifts every later
+    // index by one). Entries are therefore matched on the packetId, and any
+    // other entry still holding this index is stale: it must not answer
+    // getSubtitleComponentTag() for this stream.
+    auto releaseIndex = [this, streamIndex, packetId]() {
+        for (auto& known : m_subtitleStreams) {
+            if (known.streamIndex == streamIndex && known.packetId != packetId) {
+                LogDetail(L"MMT/TLV Subtitle stale stream index released: streamIndex=%d packetId=0x%04X componentTag=%d\n",
+                          known.streamIndex, known.packetId, known.componentTag);
+                known.streamIndex = -1;
+            }
+        }
+    };
+
     auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
-        [streamIndex](const SubtitleStreamInfo& info) {
-            return info.streamIndex == streamIndex;
+        [packetId](const SubtitleStreamInfo& info) {
+            return info.packetId == packetId;
         });
     if (it != m_subtitleStreams.end()) {
+        if (it->streamIndex != streamIndex ||
+            (componentTag >= 0 && it->componentTag != componentTag)) {
+            LogMsg(L"MMT/TLV Subtitle stream moved: packetId=0x%04X streamIndex=%d -> %d componentTag=%d -> %d\n",
+                   packetId, it->streamIndex, streamIndex, it->componentTag,
+                   componentTag >= 0 ? componentTag : it->componentTag);
+            it->streamIndex = streamIndex;
+            if (componentTag >= 0)
+                it->componentTag = componentTag;
+            releaseIndex();
+        }
         if (!it->hasData) {
             it->hasData = true;
             LogDetail(L"MMT/TLV Subtitle data seen streamIndex=%d, packetId=0x%04X, componentTag=%d\n",
@@ -442,8 +470,8 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
 
     SubtitleStreamInfo info;
     info.streamIndex = streamIndex;
-    info.packetId = stream.getPacketId();
-    info.componentTag = stream.getComponentTag();
+    info.packetId = packetId;
+    info.componentTag = componentTag;
     info.hasData = true;
 
     if (IsCaptionComponentTag(info.componentTag)) {
@@ -461,10 +489,12 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
                    info.packetId,
                    info.componentTag);
             *companion = info;
+            releaseIndex();
             return;
         }
     }
 
+    releaseIndex();
     m_subtitleStreams.push_back(info);
     LogDetail(L"MMT/TLV Subtitle discovered streamIndex=%d, packetId=0x%04X, componentTag=%d, data=1\n",
            info.streamIndex, info.packetId, info.componentTag);
@@ -616,6 +646,50 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
         ensureVideoSelectionLocked();
     }
 
+    // Update subtitles before audio: the audio block returns early once the
+    // audio list is locked after pin creation, and an MPT change that shifts
+    // the stream indices (e.g. a commentary audio asset appearing) must still
+    // reach the subtitle list, or captions get resolved to the wrong track.
+    if (!discoveredSubtitles.empty()) {
+        std::lock_guard<std::mutex> lock(m_subtitleMutex);
+        for (auto& info : discoveredSubtitles) {
+            // Match on the packetId, which identifies one asset. The stream
+            // index is assigned per asset position and the next channel's
+            // assets reuse it, so matching on it would carry the flag over to a
+            // different asset once a recording spans a channel change.
+            auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
+                [&info](const SubtitleStreamInfo& known) {
+                    return known.packetId == info.packetId;
+                });
+            if (it != m_subtitleStreams.end())
+                info.hasData = it->hasData;
+        }
+
+        bool changed = discoveredSubtitles.size() != m_subtitleStreams.size();
+        if (!changed) {
+            for (size_t i = 0; i < discoveredSubtitles.size(); ++i) {
+                if (discoveredSubtitles[i].streamIndex != m_subtitleStreams[i].streamIndex ||
+                    discoveredSubtitles[i].packetId != m_subtitleStreams[i].packetId ||
+                    discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag ||
+                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        if (changed) {
+            m_subtitleStreams = discoveredSubtitles;
+            LogMsg(L"MMT/TLV Subtitle MPT updated: assets=%u, subtitleStreams=%zu\n",
+                   static_cast<unsigned>(mpt.assets.size()), m_subtitleStreams.size());
+            for (size_t i = 0; i < m_subtitleStreams.size(); ++i) {
+                const auto& info = m_subtitleStreams[i];
+                LogDetail(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
+                       i, info.streamIndex, info.packetId, info.componentTag, info.hasData ? 1 : 0);
+            }
+        }
+    }
+
     if (!discovered.empty()) {
         std::lock_guard<std::mutex> lock(m_audioMutex);
         for (auto& info : discovered) {
@@ -696,46 +770,6 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 LogDetail(L"MMT/TLV Audio MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, samplingRate=%u, format=%s, channels=%u, extra=%zu\n",
                        i, info.streamIndex, info.packetId, info.componentTag, info.samplingRate,
                        info.latm ? L"LATM" : L"ADTS", info.channels, info.extraData.size());
-            }
-        }
-    }
-
-    if (!discoveredSubtitles.empty()) {
-        std::lock_guard<std::mutex> lock(m_subtitleMutex);
-        for (auto& info : discoveredSubtitles) {
-            // Match on the packetId, which identifies one asset. The stream
-            // index is assigned per asset position and the next channel's
-            // assets reuse it, so matching on it would carry the flag over to a
-            // different asset once a recording spans a channel change.
-            auto it = std::find_if(m_subtitleStreams.begin(), m_subtitleStreams.end(),
-                [&info](const SubtitleStreamInfo& known) {
-                    return known.packetId == info.packetId;
-                });
-            if (it != m_subtitleStreams.end())
-                info.hasData = it->hasData;
-        }
-
-        bool changed = discoveredSubtitles.size() != m_subtitleStreams.size();
-        if (!changed) {
-            for (size_t i = 0; i < discoveredSubtitles.size(); ++i) {
-                if (discoveredSubtitles[i].streamIndex != m_subtitleStreams[i].streamIndex ||
-                    discoveredSubtitles[i].packetId != m_subtitleStreams[i].packetId ||
-                    discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag ||
-                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData) {
-                    changed = true;
-                    break;
-                }
-            }
-        }
-
-        if (changed) {
-            m_subtitleStreams = discoveredSubtitles;
-            LogMsg(L"MMT/TLV Subtitle MPT updated: assets=%u, subtitleStreams=%zu\n",
-                   static_cast<unsigned>(mpt.assets.size()), m_subtitleStreams.size());
-            for (size_t i = 0; i < m_subtitleStreams.size(); ++i) {
-                const auto& info = m_subtitleStreams[i];
-                LogDetail(L"MMT/TLV Subtitle MPT stream[%zu]: streamIndex=%d, packetId=0x%04X, componentTag=%d, data=%d\n",
-                       i, info.streamIndex, info.packetId, info.componentTag, info.hasData ? 1 : 0);
             }
         }
     }
