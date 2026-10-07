@@ -278,7 +278,15 @@ public:
     }
     void onMhSdtActual(const MhSdt& v) override { m_remuxer.onMhSdtActual(v); }
     void onMhTot(const MhTot& v) override { m_remuxer.onMhTot(v); }
-    void onMpt(const Mpt& v) override { m_remuxer.onMpt(v); }
+    // The filter handler needs every MPT as well: it tracks the asset layout,
+    // follows the video selection across a channel change and picks the
+    // service whose EIT is used. Without it the schedule stops matching the
+    // live filter at the first layout change.
+    void onMpt(const Mpt& v) override
+    {
+        m_remuxer.onMpt(v);
+        m_filterHandler.onMpt(v);
+    }
     void onPlt(const Plt& v) override { m_remuxer.onPlt(v); }
     void onNit(const Nit& v) override { m_remuxer.onNit(v); }
     void onNtp(const NTPv4& v) override
