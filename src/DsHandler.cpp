@@ -316,7 +316,10 @@ int CFilterDemuxerHandler::audioStreamIndexFor(const MmtTlv::MmtStream& stream) 
     // the asset had when the audio list was built. The demuxer renumbers assets
     // on every MPT, so an asset can arrive under another index later on (or
     // under an index another asset's pin owns). Report the known entry's index,
-    // found by asset identity, so the data keeps going to its own pin.
+    // found by asset identity, so the data keeps going to its own pin. An
+    // unknown asset with a known component tag is the same logical track from
+    // another channel's package (the recording spans a channel change), so it
+    // continues on that track's pin.
     const int streamIndex = static_cast<int>(stream.getStreamIndex());
     AudioStreamInfo info;
     info.packetId = stream.getPacketId();
@@ -327,6 +330,12 @@ int CFilterDemuxerHandler::audioStreamIndexFor(const MmtTlv::MmtStream& stream) 
         [&info](const AudioStreamInfo& known) {
             return SameAudioIdentity(known, info);
         });
+    if (it == m_audioStreams.end() && info.componentTag >= 0) {
+        it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+            [&info](const AudioStreamInfo& known) {
+                return known.componentTag == info.componentTag;
+            });
+    }
     if (it == m_audioStreams.end() || it->streamIndex < 0 || it->streamIndex == streamIndex)
         return streamIndex;
 

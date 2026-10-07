@@ -2557,17 +2557,25 @@ std::wstring CMmtTlvSplitter::AudioTimelineLabel(const CFilterDemuxerHandler::Au
             labels.push_back(label);
     };
 
+    // Match the asset, not its position: the stream index is renumbered on
+    // every MPT and can belong to another asset. After a channel change the
+    // same logical track comes from another packetId under the same component
+    // tag, so fall back to the tag.
     for (const auto& change : m_sidecarMapMptChanges) {
+        const SidecarMapTrack* match = nullptr;
         for (const auto& track : change.tracks) {
-            if (track.type != "audio")
+            if (track.type != "audio" || track.componentTag != info.componentTag)
                 continue;
-            if (track.streamIndex != info.streamIndex &&
-                !(track.packetId == info.packetId && track.componentTag == info.componentTag)) {
-                continue;
+            if (track.packetId == info.packetId) {
+                match = &track;
+                break;
             }
-            const uint16_t channels = track.channels > 0 ? track.channels : (track.latm ? 24 : 2);
-            pushLabel(track.latm, channels);
-            break;
+            if (!match && info.componentTag >= 0)
+                match = &track;
+        }
+        if (match) {
+            const uint16_t channels = match->channels > 0 ? match->channels : (match->latm ? 24 : 2);
+            pushLabel(match->latm, channels);
         }
     }
 
@@ -2613,18 +2621,51 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
         mapTracks.insert(mapTracks.end(), change.tracks.begin(), change.tracks.end());
     }
 
+    // Map tracks are matched by asset (packetId + component tag). The stream
+    // index is only the asset's position in one MPT: the same asset appears
+    // under different indices across MPT changes, and one index can belong to
+    // different assets, so matching on it would skip or overwrite a track.
+    // A track whose component tag is already known is the same logical track
+    // from another channel's package (the recording spans a channel change);
+    // it shares the existing entry's pin, as the handler routes it by tag.
+    //
+    // A track added here keeps its map index unless another audio entry
+    // already owns it. Audio pins are routed by index, so a shared index would
+    // feed one asset's data to both pins; the handler reports audio data under
+    // the index of the entry matching its asset, so any unused index works.
+    constexpr int kSyntheticAudioStreamIndexBase = 0x1000;
+    auto audioIndexInUse = [&audioStreams](int streamIndex) {
+        return std::any_of(audioStreams.begin(), audioStreams.end(),
+            [streamIndex](const CFilterDemuxerHandler::AudioStreamInfo& info) {
+                return info.streamIndex == streamIndex;
+            });
+    };
+    auto freeAudioIndex = [&](int preferred) {
+        if (preferred >= 0 && !audioIndexInUse(preferred))
+            return preferred;
+        int candidate = kSyntheticAudioStreamIndexBase;
+        while (audioIndexInUse(candidate))
+            ++candidate;
+        return candidate;
+    };
+
     for (const auto& track : mapTracks) {
         if (track.type == "audio") {
             auto it = std::find_if(audioStreams.begin(), audioStreams.end(),
                 [&track](const CFilterDemuxerHandler::AudioStreamInfo& info) {
-                    return info.streamIndex == track.streamIndex ||
-                           (info.packetId == track.packetId && info.componentTag == track.componentTag);
+                    return info.packetId == track.packetId && info.componentTag == track.componentTag;
                 });
+            if (it == audioStreams.end() && track.componentTag >= 0) {
+                const bool tagKnown = std::any_of(audioStreams.begin(), audioStreams.end(),
+                    [&track](const CFilterDemuxerHandler::AudioStreamInfo& info) {
+                        return info.componentTag == track.componentTag;
+                    });
+                if (tagKnown)
+                    continue;
+            }
             if (it != audioStreams.end()) {
+                // Keep the entry's index: pins and decoders may already use it.
                 if (isBetterMapAudio(track, *it)) {
-                    it->streamIndex = track.streamIndex;
-                    it->packetId = track.packetId;
-                    it->componentTag = track.componentTag;
                     it->samplingRate = track.samplingRate;
                     it->channels = mapTrackChannels(track);
                     it->latm = track.latm;
@@ -2634,7 +2675,11 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
             }
 
             CFilterDemuxerHandler::AudioStreamInfo info;
-            info.streamIndex = track.streamIndex;
+            info.streamIndex = freeAudioIndex(track.streamIndex);
+            if (info.streamIndex != track.streamIndex) {
+                LogMsg(L"MMT/TLV Splitter: mmtsmap audio track index %d already in use; packetId=0x%04X componentTag=%d uses %d\n",
+                       track.streamIndex, track.packetId, track.componentTag, info.streamIndex);
+            }
             info.packetId = track.packetId;
             info.componentTag = track.componentTag;
             info.samplingRate = track.samplingRate;
@@ -2645,14 +2690,20 @@ void CMmtTlvSplitter::ApplySidecarMapTracks(REFERENCE_TIME sourceTarget)
         } else if (track.type == "subtitle") {
             auto it = std::find_if(subtitleStreams.begin(), subtitleStreams.end(),
                 [&track](const CFilterDemuxerHandler::SubtitleStreamInfo& info) {
-                    return info.streamIndex == track.streamIndex ||
-                           (info.packetId == track.packetId && info.componentTag == track.componentTag);
+                    return info.packetId == track.packetId ||
+                           (track.componentTag >= 0 && info.componentTag == track.componentTag);
                 });
             if (it != subtitleStreams.end())
                 continue;
 
+            // Subtitles are routed by component tag; the index is only a
+            // fallback, so leave it unset rather than share another entry's.
+            const bool indexInUse = std::any_of(subtitleStreams.begin(), subtitleStreams.end(),
+                [&track](const CFilterDemuxerHandler::SubtitleStreamInfo& info) {
+                    return info.streamIndex == track.streamIndex;
+                });
             CFilterDemuxerHandler::SubtitleStreamInfo info;
-            info.streamIndex = track.streamIndex;
+            info.streamIndex = indexInUse ? -1 : track.streamIndex;
             info.packetId = track.packetId;
             info.componentTag = track.componentTag;
             info.hasData = false;
