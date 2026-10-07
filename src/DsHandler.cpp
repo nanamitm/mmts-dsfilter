@@ -310,6 +310,34 @@ bool CFilterDemuxerHandler::selectVideoStreamByStreamIndex(int streamIndex)
     return true;
 }
 
+int CFilterDemuxerHandler::audioStreamIndexFor(const MmtTlv::MmtStream& stream) const
+{
+    // Audio pins, LATM decoders and the selection are keyed by the stream index
+    // the asset had when the audio list was built. The demuxer renumbers assets
+    // on every MPT, so an asset can arrive under another index later on (or
+    // under an index another asset's pin owns). Report the known entry's index,
+    // found by asset identity, so the data keeps going to its own pin.
+    const int streamIndex = static_cast<int>(stream.getStreamIndex());
+    AudioStreamInfo info;
+    info.packetId = stream.getPacketId();
+    info.componentTag = stream.getComponentTag();
+
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [&info](const AudioStreamInfo& known) {
+            return SameAudioIdentity(known, info);
+        });
+    if (it == m_audioStreams.end() || it->streamIndex < 0 || it->streamIndex == streamIndex)
+        return streamIndex;
+
+    static volatile LONG s_audioIndexRemapLogs = 0;
+    if (InterlockedIncrement(&s_audioIndexRemapLogs) <= 8) {
+        LogMsg(L"MMT/TLV Audio stream index remapped: packetId=0x%04X componentTag=%d streamIndex=%d -> %d\n",
+               info.packetId, info.componentTag, streamIndex, it->streamIndex);
+    }
+    return it->streamIndex;
+}
+
 void CFilterDemuxerHandler::rememberAudioStream(const MmtTlv::MmtStream& stream)
 {
     std::lock_guard<std::mutex> lock(m_audioMutex);
@@ -994,7 +1022,7 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
         return;
 
     rememberAudioStream(stream);
-    const int streamIndex = static_cast<int>(stream.getStreamIndex());
+    const int streamIndex = audioStreamIndexFor(stream);
 
     {
         std::lock_guard<std::mutex> lock(m_audioMutex);
@@ -1119,7 +1147,7 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
         return;
 
     m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
-                       true, pts, dts, true, true,
+                       stream.getComponentTag(), pts, dts,
                        mfu.data.data(), mfu.data.size());
 }
 

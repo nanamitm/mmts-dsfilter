@@ -347,7 +347,7 @@ int main(int argc, char* argv[])
             collector.OnVideo(pts, dts);
         });
     filterHandler.setSubtitleCallback(
-        [&](int streamIndex, bool, long long, long long, bool, bool, const uint8_t* d, size_t sz) {
+        [&](int streamIndex, int, long long, long long, const uint8_t* d, size_t sz) {
             bool hasBegin = false, hasEnd = false;
             int64_t begin = 0, end = 0;
             std::string text = ExtractPlainTextAndTiming(d, sz, hasBegin, begin, hasEnd, end);
