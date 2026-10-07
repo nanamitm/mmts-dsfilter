@@ -4012,17 +4012,20 @@ void CMmtTlvSplitter::CreatePins()
         });
 
     m_handler.setSubtitleCallback(
-        [this](int streamIndex, bool, long long pts, long long,
-               bool, bool, const uint8_t* d, size_t sz) {
+        [this](int streamIndex, int streamComponentTag, long long pts, long long,
+               const uint8_t* d, size_t sz) {
             static volatile LONG s_subtitleCallbacks = 0;
             LONG callbackNo = InterlockedIncrement(&s_subtitleCallbacks);
 
             TtmlDebugStats stats;
             TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, streamIndex);
-            // Resolve the track identity now, against the MPT in force at this
-            // point of the file; a cue that gets deferred or repeated later must
-            // keep going to the pin it belongs to.
-            const int componentTag = m_handler.getSubtitleComponentTag(streamIndex);
+            // Take the track identity from the asset the sample came from, now;
+            // a cue that gets deferred or repeated later must keep going to the
+            // pin it belongs to. The stream index is renumbered on every MPT, so
+            // it is only a fallback for an asset without a component tag.
+            const int componentTag = streamComponentTag >= 0
+                ? streamComponentTag
+                : m_handler.getSubtitleComponentTag(streamIndex);
 
             REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
             DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
@@ -4309,7 +4312,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, int componentTag,
     bool trackEnded = false;
     CFilterDemuxerHandler handler;
     handler.setSubtitleCallback(
-        [&](int si, bool, long long, long long, bool, bool, const uint8_t* d, size_t sz) {
+        [&](int si, int siTag, long long, long long, const uint8_t* d, size_t sz) {
             if (found || trackEnded)
                 return;
 
@@ -4325,7 +4328,7 @@ bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, int componentTag,
 
             // Match the track by component tag; the stream index is assigned per
             // asset position and is not stable across an MPT change.
-            const int tag = handler.getSubtitleComponentTag(si);
+            const int tag = siTag >= 0 ? siTag : handler.getSubtitleComponentTag(si);
             const bool sameTrack = (componentTag >= 0 && tag >= 0)
                 ? tag == componentTag
                 : si == streamIndex;

@@ -48,6 +48,17 @@ public:
         const uint8_t* data,
         size_t size)>;
 
+    // Subtitle TTML samples carry the component tag of the asset they came
+    // from: the stream index is renumbered on every MPT, so it does not
+    // identify the track on its own.
+    using SubtitleCallback = std::function<void(
+        int streamIndex,
+        int componentTag,
+        long long pts,
+        long long dts,
+        const uint8_t* data,
+        size_t size)>;
+
     using SubtitleResourceCallback = std::function<void(
         int streamIndex,
         int dataType,
@@ -63,7 +74,7 @@ public:
 
     void setVideoCallback(SampleCallback cb) { m_videoCallback = std::move(cb); }
     void setAudioCallback(SampleCallback cb) { m_audioCallback = std::move(cb); }
-    void setSubtitleCallback(SampleCallback cb) { m_subtitleCallback = std::move(cb); }
+    void setSubtitleCallback(SubtitleCallback cb) { m_subtitleCallback = std::move(cb); }
     void setSubtitleResourceCallback(SubtitleResourceCallback cb) { m_subtitleResourceCallback = std::move(cb); }
     void setProgramStartCallback(ProgramStartCallback cb) { m_programStartCallback = std::move(cb); }
     void setNtpCallback(NtpCallback cb) { m_ntpCallback = std::move(cb); }
@@ -109,6 +120,7 @@ private:
     // Callers must hold m_videoMutex.
     void ensureVideoSelectionLocked();
     void rememberAudioStream(const MmtTlv::MmtStream& stream);
+    int audioStreamIndexFor(const MmtTlv::MmtStream& stream) const;
     void rememberLatmConfig(int streamIndex, const uint8_t* data, size_t size);
     void rememberAdtsConvertibleAudioStream(int streamIndex);
     void rememberSubtitleStream(const MmtTlv::MmtStream& stream);
@@ -116,7 +128,7 @@ private:
 
     SampleCallback m_videoCallback;
     SampleCallback m_audioCallback;
-    SampleCallback m_subtitleCallback;
+    SubtitleCallback m_subtitleCallback;
     SubtitleResourceCallback m_subtitleResourceCallback;
     ProgramStartCallback m_programStartCallback;
     NtpCallback m_ntpCallback;
