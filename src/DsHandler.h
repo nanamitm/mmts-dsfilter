@@ -90,7 +90,15 @@ public:
     void onNtp(const MmtTlv::NTPv4& ntp) override;
     void onMpt(const MmtTlv::Mpt& mpt) override;
 
-    void reset() { m_basePts = -1; m_programStartTimeSec = -1; m_programId = 0; m_hasProgramId = false; }
+    void reset()
+    {
+        m_basePts = -1;
+        m_programStartTimeSec = -1;
+        m_programId = 0;
+        m_hasProgramId = false;
+        m_serviceId = 0;
+        m_hasServiceId = false;
+    }
     void resetAudioSelection();
     std::vector<VideoStreamInfo> getVideoStreams() const;
     int getSelectedVideoStreamIndex() const;
@@ -141,6 +149,11 @@ private:
     long long m_programStartTimeSec{-1};
     uint32_t m_programId{0};
     bool m_hasProgramId{false};
+    // Service of the package the MPT describes (the first two bytes of the
+    // MMT package id). A TLV stream can carry EIT p/f for several services;
+    // only this one's present event is the program being played.
+    uint16_t m_serviceId{0};
+    bool m_hasServiceId{false};
     // A BS4K package can carry more than one hev1 asset (e.g. a 4K main video
     // plus a 1080p simulcast). They share one DirectShow video pin, so exactly
     // one of them may be delivered - mixing their MFU fragments produces
