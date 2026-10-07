@@ -4036,8 +4036,8 @@ void CMmtTlvSplitter::CreatePins()
         });
 
     m_handler.setProgramStartCallback(
-        [this](long long programStartRt) {
-            const REFERENCE_TIME oldStart = m_subtitleResolver.OnProgramStart(programStartRt);
+        [this](long long programStartRt, uint32_t programId) {
+            const REFERENCE_TIME oldStart = m_subtitleResolver.OnProgramStart(programStartRt, programId);
             if (oldStart != programStartRt) {
                 LogMsg(L"SUBTITLE EIT program start updated: old=%I64d ms, new=%I64d ms\n",
                        oldStart / 10000,

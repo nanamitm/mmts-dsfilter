@@ -69,7 +69,11 @@ public:
         const uint8_t* data,
         size_t size)>;
 
-    using ProgramStartCallback = std::function<void(long long programStartRt)>;
+    // programId identifies the present event: (service_id << 16) | event_id.
+    // Two programs can share a start time (a recording switched channels
+    // between programs that both began on the hour), so the start time alone
+    // does not tell that the program changed.
+    using ProgramStartCallback = std::function<void(long long programStartRt, uint32_t programId)>;
     using NtpCallback = std::function<void(long long ntpRt)>;
 
     void setVideoCallback(SampleCallback cb) { m_videoCallback = std::move(cb); }
@@ -86,7 +90,7 @@ public:
     void onNtp(const MmtTlv::NTPv4& ntp) override;
     void onMpt(const MmtTlv::Mpt& mpt) override;
 
-    void reset() { m_basePts = -1; m_programStartTimeSec = -1; }
+    void reset() { m_basePts = -1; m_programStartTimeSec = -1; m_programId = 0; m_hasProgramId = false; }
     void resetAudioSelection();
     std::vector<VideoStreamInfo> getVideoStreams() const;
     int getSelectedVideoStreamIndex() const;
@@ -135,6 +139,8 @@ private:
     ADTSConverter  m_adtsConverter;
     long long m_basePts{-1};  // first valid PTS seen, in 100ns units
     long long m_programStartTimeSec{-1};
+    uint32_t m_programId{0};
+    bool m_hasProgramId{false};
     // A BS4K package can carry more than one hev1 asset (e.g. a 4K main video
     // plus a 1080p simulcast). They share one DirectShow video pin, so exactly
     // one of them may be delivered - mixing their MFU fragments produces
