@@ -1177,17 +1177,22 @@ void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
             continue;
 
         const long long programStartSec = static_cast<long long>(startSec);
-        if (programStartSec == m_programStartTimeSec)
+        const uint32_t programId =
+            (static_cast<uint32_t>(mhEit.serviceId) << 16) | mhEvent->eventId;
+        if (programStartSec == m_programStartTimeSec && m_hasProgramId && programId == m_programId)
             return;
 
         m_programStartTimeSec = programStartSec;
+        m_programId = programId;
+        m_hasProgramId = true;
         const long long programStartRt = programStartSec * 10000000LL;
-        LogMsg(L"MMT/TLV EIT program start: unix=%I64d, rt=%I64d ms, eventId=%u\n",
+        LogMsg(L"MMT/TLV EIT program start: unix=%I64d, rt=%I64d ms, serviceId=0x%04X, eventId=%u\n",
                programStartSec,
                programStartRt / 10000,
+               mhEit.serviceId,
                mhEvent->eventId);
         if (m_programStartCallback)
-            m_programStartCallback(programStartRt);
+            m_programStartCallback(programStartRt, programId);
         return;
     }
 }

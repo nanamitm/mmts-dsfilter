@@ -129,9 +129,9 @@ public:
             m_currentAnchor = 0;
     }
 
-    void OnProgramStart(long long programStartRt)
+    void OnProgramStart(long long programStartRt, uint32_t programId)
     {
-        m_resolver.OnProgramStart(programStartRt);
+        m_resolver.OnProgramStart(programStartRt, programId);
         DrainDeferred();
     }
 
@@ -353,8 +353,8 @@ int main(int argc, char* argv[])
             std::string text = ExtractPlainTextAndTiming(d, sz, hasBegin, begin, hasEnd, end);
             collector.OnSubtitle(streamIndex, text, hasBegin, begin, hasEnd, end);
         });
-    filterHandler.setProgramStartCallback([&](long long programStartRt) {
-        collector.OnProgramStart(programStartRt);
+    filterHandler.setProgramStartCallback([&](long long programStartRt, uint32_t programId) {
+        collector.OnProgramStart(programStartRt, programId);
     });
     filterHandler.setNtpCallback([&](long long ntpRt) {
         collector.OnNtp(ntpRt);

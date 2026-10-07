@@ -16,8 +16,12 @@ public:
     void Reset(bool awaitProgramStart = false);
 
     // Returns the previous program-start value (-1 if none was known), so the
-    // caller can log a change the same way CMmtTlvSplitter did.
-    int64_t OnProgramStart(int64_t programStartRt);
+    // caller can log a change the same way CMmtTlvSplitter did. programId
+    // identifies the program ((service_id << 16) | event_id): each program's
+    // TTML has its own time base, and two programs can share a start time (a
+    // recording that switched channels between programs that both began on
+    // the hour), so a change of either one recalibrates.
+    int64_t OnProgramStart(int64_t programStartRt, uint32_t programId);
     void OnNtpAnchor(int64_t ntpRt, int64_t ntpMediaRt);
 
     bool AwaitingProgramStart() const { return m_awaitProgramStart.load(std::memory_order_acquire); }
@@ -48,6 +52,7 @@ private:
     static constexpr int64_t kResyncBackToleranceRt = 5 * 10000000LL; // 5s, 100ns units
 
     std::atomic<int64_t> m_programStartRt{-1};
+    std::atomic<uint32_t> m_programId{0};
     std::atomic<bool> m_awaitProgramStart{false};
     std::atomic<int64_t> m_ntpRt{-1};
     std::atomic<int64_t> m_ntpMediaRt{-1};
@@ -55,6 +60,7 @@ private:
     std::atomic<int64_t> m_timeOffset{0};
     std::atomic<int64_t> m_lastTtmlBegin{-1};
     std::atomic<int64_t> m_offsetProgramStartRt{-1};
+    std::atomic<uint32_t> m_offsetProgramId{0};
     std::atomic<bool> m_offsetUsesNtp{false};
     // Whether m_timeOffset holds a calibrated value. A separate flag is
     // required because a legitimate offset can be negative (TTML begin <

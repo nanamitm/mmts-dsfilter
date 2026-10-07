@@ -7,6 +7,7 @@
 void SubtitleTimingResolver::Reset(bool awaitProgramStart)
 {
     m_programStartRt.store(-1, std::memory_order_release);
+    m_programId.store(0, std::memory_order_release);
     m_awaitProgramStart.store(awaitProgramStart, std::memory_order_release);
     m_ntpRt.store(-1, std::memory_order_release);
     m_ntpMediaRt.store(-1, std::memory_order_release);
@@ -14,12 +15,14 @@ void SubtitleTimingResolver::Reset(bool awaitProgramStart)
     m_timeOffset.store(0, std::memory_order_release);
     m_lastTtmlBegin.store(-1, std::memory_order_release);
     m_offsetProgramStartRt.store(-1, std::memory_order_release);
+    m_offsetProgramId.store(0, std::memory_order_release);
     m_offsetUsesNtp.store(false, std::memory_order_release);
     m_offsetValid.store(false, std::memory_order_release);
 }
 
-int64_t SubtitleTimingResolver::OnProgramStart(int64_t programStartRt)
+int64_t SubtitleTimingResolver::OnProgramStart(int64_t programStartRt, uint32_t programId)
 {
+    m_programId.store(programId, std::memory_order_release);
     const int64_t oldStart = m_programStartRt.exchange(programStartRt, std::memory_order_acq_rel);
     m_awaitProgramStart.store(false, std::memory_order_release);
     return oldStart;
@@ -45,6 +48,7 @@ int64_t SubtitleTimingResolver::ResolveOffset(int64_t ttmlBegin, int64_t sourceB
                                               int64_t segmentStartForLog, int64_t segmentTimeOffsetForLog)
 {
     const int64_t programStartRt = m_programStartRt.load(std::memory_order_acquire);
+    const uint32_t programId = m_programId.load(std::memory_order_acquire);
     const int64_t ntpRt = m_ntpRt.load(std::memory_order_acquire);
     const int64_t ntpMediaRt = m_ntpMediaRt.load(std::memory_order_acquire);
     const bool canUseNtp = (programStartRt >= 0 && ntpRt >= 0 && ntpMediaRt >= 0);
@@ -63,6 +67,16 @@ int64_t SubtitleTimingResolver::ResolveOffset(int64_t ttmlBegin, int64_t sourceB
         if (programStartRt >= 0 && calibratedProgramStart != programStartRt) {
             LogMsg(L"SUBTITLE timing resync: programStart changed old=%I64d ms, new=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
                    calibratedProgramStart / 10000,
+                   programStartRt / 10000,
+                   candidate / 10000,
+                   anchor / 10000,
+                   ttmlBegin / 10000);
+            valid = false;
+        } else if (programStartRt >= 0 &&
+                   m_offsetProgramId.load(std::memory_order_acquire) != programId) {
+            LogMsg(L"SUBTITLE timing resync: program changed old=0x%08X, new=0x%08X, programStart=%I64d ms, candidateStart=%I64d ms, anchor=%I64d ms, ttmlBegin=%I64d ms\n",
+                   m_offsetProgramId.load(std::memory_order_acquire),
+                   programId,
                    programStartRt / 10000,
                    candidate / 10000,
                    anchor / 10000,
@@ -102,6 +116,7 @@ int64_t SubtitleTimingResolver::ResolveOffset(int64_t ttmlBegin, int64_t sourceB
         offset = sourceBegin - baseAnchor;
         m_timeOffset.store(offset, std::memory_order_release);
         m_offsetProgramStartRt.store(programStartRt, std::memory_order_release);
+        m_offsetProgramId.store(programId, std::memory_order_release);
         m_offsetUsesNtp.store(canUseNtp, std::memory_order_release);
         m_offsetValid.store(true, std::memory_order_release);
         LogMsg(L"SUBTITLE timing base set: sourceOffset=%I64d ms, anchor=%I64d ms, current=%I64d ms, currentDts=%I64d ms, segmentStart=%I64d ms, rapOffset=%I64d ms, programStart=%I64d ms, ntp=%I64d ms, ntpMedia=%I64d ms, useNtp=%d, ttmlBegin=%I64d ms, sourceBegin=%I64d ms\n",
