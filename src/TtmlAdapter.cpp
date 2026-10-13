@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 #include <variant>
+#include <algorithm>
 
 namespace {
 
@@ -112,34 +113,27 @@ std::string ToText(const std::vector<arib::ttml::ast::SpanContent>& content)
     return text;
 }
 
-// Sync mode is what yields the begin/end the model exposes, but it also parses
-// the timing attributes strictly. Fall back to Async - which skips timing
-// entirely - so a document with an unparsable timestamp still renders its text
-// instead of throwing the whole cue away.
-std::optional<arib::ttml::resolved::Document> ResolveDocument(const std::string& xml)
+std::optional<arib::ttml::resolved::Document> ResolveDocument(const std::string& xml, bool synchronized)
 {
-    for (const SyncMode mode : {SyncMode::Sync, SyncMode::Async}) {
-        auto parsed = arib::ttml::parse(xml, mode);
-        if (parsed.has_error() || !parsed.document)
-            continue;
+    const SyncMode mode = synchronized ? SyncMode::Sync : SyncMode::Async;
+    auto parsed = arib::ttml::parse(xml, mode);
+    if (parsed.has_error() || !parsed.document)
+        return std::nullopt;
 
-        auto resolved = arib::ttml::resolve(*parsed.document, mode);
-        if (resolved.has_error() || !resolved.document)
-            continue;
+    auto resolved = arib::ttml::resolve(*parsed.document, mode);
+    if (resolved.has_error() || !resolved.document)
+        return std::nullopt;
 
-        return std::move(*resolved.document);
-    }
-
-    return std::nullopt;
+    return std::move(*resolved.document);
 }
 
 }
 
 namespace DsTtml {
 
-Document Parse(const std::string& xml)
+Document Parse(const std::string& xml, bool synchronized)
 {
-    const auto source = ResolveDocument(xml);
+    const auto source = ResolveDocument(xml, synchronized);
     if (!source.has_value())
         throw std::runtime_error("failed to parse TTML document");
 
@@ -158,15 +152,65 @@ Document Parse(const std::string& xml)
         Paragraph& p = div.pTags.emplace_back();
         p.id = sourceP.id.value_or(std::string());
         p.region = ToRegion(sourceP);
+        if (sourceP.timing.begin) p.begin = sourceP.timing.begin->count();
+        if (sourceP.timing.end) p.end = sourceP.timing.end->count();
 
         for (const auto& sourceSpan : sourceP.spans) {
             Span& span = p.spanTags.emplace_back();
             span.text = ToText(sourceSpan.content);
             span.style = ToStyle(sourceSpan.style);
+            if (sourceSpan.timing.begin) span.begin = sourceSpan.timing.begin->count();
+            if (sourceSpan.timing.end) span.end = sourceSpan.timing.end->count();
         }
     }
 
     return document;
+}
+
+std::vector<Slice> Slices(const Document& document)
+{
+    std::vector<uint64_t> boundaries{0};
+    auto add = [&](const auto& element) {
+        if (element.begin) boundaries.push_back(*element.begin);
+        if (element.end) boundaries.push_back(*element.end);
+    };
+    for (const auto& div : document.divTags) {
+        add(div);
+        for (const auto& p : div.pTags) {
+            add(p);
+            for (const auto& span : p.spanTags) add(span);
+        }
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    auto active = [](const auto& element, uint64_t at) {
+        return (!element.begin || at >= *element.begin) && (!element.end || at < *element.end);
+    };
+    std::vector<Slice> result;
+    for (size_t i = 0; i < boundaries.size(); ++i) {
+        Slice slice;
+        slice.begin = boundaries[i];
+        if (i + 1 < boundaries.size()) slice.end = boundaries[i + 1];
+        for (const auto& div : document.divTags) {
+            if (!active(div, slice.begin)) continue;
+            Division visibleDiv;
+            visibleDiv.begin = slice.begin;
+            visibleDiv.end = slice.end;
+            for (const auto& p : div.pTags) {
+                if (!active(p, slice.begin)) continue;
+                Paragraph visibleP = p;
+                bool hasText = false;
+                for (auto& span : visibleP.spanTags) {
+                    span.visible = active(span, slice.begin);
+                    hasText |= span.visible && !span.text.empty();
+                }
+                if (hasText) visibleDiv.pTags.push_back(std::move(visibleP));
+            }
+            if (!visibleDiv.pTags.empty()) slice.document.divTags.push_back(std::move(visibleDiv));
+        }
+        if (!slice.document.divTags.empty()) result.push_back(std::move(slice));
+    }
+    return result;
 }
 
 }
