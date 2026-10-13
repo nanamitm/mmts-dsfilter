@@ -5,6 +5,7 @@
 #include <cstdint>
 #include "demuxerHandler.h"
 #include "adtsConverter.h"
+#include "additionalAribSubtitleInfo.h"
 
 namespace MmtTlv { class MmtStream; struct MfuData; class MhEit; class NTPv4; }
 
@@ -36,7 +37,13 @@ public:
         uint16_t packetId{0};
         int componentTag{-1};
         bool hasData{false};
+        std::optional<MmtTlv::AdditionalAribSubtitleInfo> control;
     };
+
+    using SubtitleDocumentCallback = std::function<void(
+        const SubtitleStreamInfo&, long long pts, long long dts,
+        const uint8_t* data, size_t size)>;
+    using SubtitleControlCallback = std::function<void(const std::vector<SubtitleStreamInfo>&)>;
 
     using SampleCallback = std::function<void(
         int streamIndex,
@@ -80,6 +87,8 @@ public:
     void setVideoCallback(SampleCallback cb) { m_videoCallback = std::move(cb); }
     void setAudioCallback(SampleCallback cb) { m_audioCallback = std::move(cb); }
     void setSubtitleCallback(SubtitleCallback cb) { m_subtitleCallback = std::move(cb); }
+    void setSubtitleDocumentCallback(SubtitleDocumentCallback cb) { m_subtitleDocumentCallback = std::move(cb); }
+    void setSubtitleControlCallback(SubtitleControlCallback cb) { m_subtitleControlCallback = std::move(cb); }
     void setSubtitleResourceCallback(SubtitleResourceCallback cb) { m_subtitleResourceCallback = std::move(cb); }
     void setProgramStartCallback(ProgramStartCallback cb) { m_programStartCallback = std::move(cb); }
     void setNtpCallback(NtpCallback cb) { m_ntpCallback = std::move(cb); }
@@ -144,6 +153,8 @@ private:
     SampleCallback m_videoCallback;
     SampleCallback m_audioCallback;
     SubtitleCallback m_subtitleCallback;
+    SubtitleDocumentCallback m_subtitleDocumentCallback;
+    SubtitleControlCallback m_subtitleControlCallback;
     SubtitleResourceCallback m_subtitleResourceCallback;
     ProgramStartCallback m_programStartCallback;
     NtpCallback m_ntpCallback;
