@@ -1,4 +1,5 @@
 #include "TtmlModel.h"
+#include "SubtitleDocumentState.h"
 #include <stdexcept>
 #include <iostream>
 
@@ -27,6 +28,19 @@ int main()
         try { DsTtml::Parse(R"(<tt><body><div begin="invalid"><p><span>A</span></p></div></body></tt>)"); }
         catch (const std::runtime_error&) { rejected = true; }
         require(rejected, "invalid sync timing must not silently switch modes");
+        DsSubtitle::Control control{MmtTlv::AdditionalAribSubtitleInfo{}};
+        control->tmd = 2;
+        control->referenceStartTime.seconds = 2208989800U;
+        control->referenceStartTime.fraction = 0x80000000U;
+        require(DsSubtitle::ReferenceTime(control) == 10005000000LL, "reference fraction must retain half-second precision");
+        auto changed = control;
+        changed->referenceStartTime.fraction++;
+        require(!DsSubtitle::SameControl(control, changed), "fraction-only descriptor updates must initialize captions");
+        changed = control;
+        changed->dmf++;
+        require(!DsSubtitle::SameControl(control, changed), "display-mode-only descriptor updates must initialize captions");
+        control->tmd = 15;
+        require(!DsSubtitle::ReferenceTime(control) && !DsSubtitle::Synchronized(control), "async must not use reference timestamp");
         std::cout << "Subtitle model timing tests passed\n";
         return 0;
     } catch (const std::exception& e) {

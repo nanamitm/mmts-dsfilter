@@ -124,6 +124,7 @@
     <ClCompile Include="..\src\SubtitleDebugLogShim.cpp" />
     <ClCompile Include="..\src\SubtitleTimingResolver.cpp" />
     <ClCompile Include="..\src\TtmlAdapter.cpp" />
+    <ClCompile Include="..\src\SubtitleFileIndex.cpp" />
     <ClCompile Include="..\src\FilterFactory.cpp" />
   </ItemGroup>
 
