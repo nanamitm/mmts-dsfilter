@@ -151,6 +151,7 @@
   <!-- ==================== dantto4k core (no TSDuck files) ==================== -->
   <ItemGroup>
     <ClCompile Include="..\..\dantto4k\src\accessControlDescriptor.cpp" />
+    <ClCompile Include="..\..\dantto4k\src\applicationServiceDescriptor.cpp" />
     <ClCompile Include="..\..\dantto4k\src\adtsConverter.cpp" />
     <ClCompile Include="..\..\dantto4k\src\aes.cpp" />
     <ClCompile Include="..\..\dantto4k\src\b24Color.cpp" />
