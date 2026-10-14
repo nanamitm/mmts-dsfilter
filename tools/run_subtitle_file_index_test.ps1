@@ -24,6 +24,7 @@ $objects | Set-Content -LiteralPath $rsp -Encoding ascii
 $batch = Join-Path $PSScriptRoot 'obj\run_subtitle_index.cmd'
 @"
 @echo off
+set "PATH=$(Split-Path $vswhere);%PATH%"
 call "$vcvars" -vcvars_ver=$toolsetVersion >nul
 if errorlevel 1 exit /b 1
 cd /d "$PSScriptRoot"
@@ -31,7 +32,7 @@ cl /nologo /c /EHsc /std:c++20 /utf-8 /MD /permissive /wd4596 /DUNICODE /D_UNICO
 if errorlevel 1 exit /b 1
 link /nologo obj\$Test.obj @"$rsp" /OUT:$Test.exe /LTCG /LIBPATH:"..\thirdparty\ffmpeg\lib\MD" strmiids.lib winmm.lib ole32.lib oleaut32.lib uuid.lib Winscard.lib ws2_32.lib bcrypt.lib user32.lib gdi32.lib advapi32.lib avcodec.lib avutil.lib swresample.lib
 if errorlevel 1 exit /b 1
-$Test.exe
+"$PSScriptRoot\$Test.exe"
 "@ | Set-Content -LiteralPath $batch -Encoding ascii
 & $batch
 if ($LASTEXITCODE -ne 0) { throw 'Subtitle file index tests failed' }
