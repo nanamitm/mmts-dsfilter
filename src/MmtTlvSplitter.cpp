@@ -2794,7 +2794,7 @@ int CMmtTlvSplitter::SegmentAtProgram(REFERENCE_TIME programRT, REFERENCE_TIME& 
 }
 
 bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut,
-                                bool video, bool* preroll)
+                                bool video, bool* preroll, REFERENCE_TIME absDts)
 {
     if (preroll) *preroll = false;
     if (absPts < 0 || m_origFirstPts < 0) {
@@ -2807,18 +2807,24 @@ bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programO
     }
     const REFERENCE_TIME srcRel = absPts - m_origFirstPts;
     const EditSeg& seg = m_editSegments[m_curSegment];
-    if (srcRel >= seg.end) {
+    const REFERENCE_TIME decodeRel = (absDts >= 0 ? absDts : absPts) - m_origFirstPts;
+    if (video && decodeRel >= seg.end) {
         const int next = m_curSegment + 1;
         m_pendingSegmentJump.store(next < static_cast<int>(m_editSegments.size()) ? next : -2,
                                    std::memory_order_release);
-        return false; // past this segment -> drop and trigger jump/EOS
+        return false;
     }
+    // Audio can lead video, and reference pictures can be shown after the cut
+    // while preceding in-range B pictures in decode order. Neither may trigger
+    // the source jump before the video decoder has consumed the interval.
+    if (!video && srcRel >= seg.end)
+        return false;
     if (srcRel < seg.start && !video)
         return false;
     programOut = m_curSegmentBase + (srcRel - seg.start);
     // A RAP preceding a cut/seek and its dependent frames must reach the
     // decoder, but must not be presented or advance the playback position.
-    if (preroll) *preroll = video && (srcRel < seg.start || programOut < m_segmentStart);
+    if (preroll) *preroll = video && (srcRel < seg.start || srcRel >= seg.end || programOut < m_segmentStart);
     return true;
 }
 
@@ -3945,7 +3951,7 @@ void CMmtTlvSplitter::CreatePins()
             REFERENCE_TIME normPts, normDts;
             bool editPreroll = false;
             if (IsMultiSegment()) {
-                if (!EditMapPts(pts, normPts, true, &editPreroll))
+                if (!EditMapPts(pts, normPts, true, &editPreroll, dts))
                     return; // sample is in a cut gap / past the segment -> drop
                 const REFERENCE_TIME off = pts - normPts;
                 normDts = (dts >= 0) ? dts - off : dts;
@@ -4552,8 +4558,8 @@ void CMmtTlvSplitter::DemuxLoop()
             if (ifs.eof() || !ifs.good()) break;
         }
 
-        // EDL: a segment boundary was reached (a video sample past the current
-        // segment end). Jump to the next segment, or stop after the last one.
+        // EDL: video decode time reached the current segment end. Complete
+        // this packet batch before jumping, so buffered in-range audio is kept.
         if (IsMultiSegment()) {
             const int jump = m_pendingSegmentJump.exchange(-1, std::memory_order_acq_rel);
             if (jump == -2) {
