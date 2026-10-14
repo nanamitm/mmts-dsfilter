@@ -4471,13 +4471,8 @@ void CMmtTlvSplitter::DemuxLoop()
 
     if (sourceSeekTarget > 0 && m_fileSize > 0) {
         long long mappedOffset = -1;
-        // Map RAP offsets are keyed by absolute PTS; the single-range path passes
-        // relative time (and falls back to ratio). For the EDL path we query with
-        // absolute time so segment starts land on a real RAP at/just before them.
-        const REFERENCE_TIME mapQuery = IsMultiSegment()
-            ? sourceSeekTarget + (m_mapFirstVideoPts >= 0 ? m_mapFirstVideoPts : 0)
-            : sourceSeekTarget;
-        bool usedMap = FindSidecarMapSeekOffset(mapQuery, mappedOffset);
+        // LoadSidecarMap normalizes all point times to source-relative time.
+        bool usedMap = FindSidecarMapSeekOffset(sourceSeekTarget, mappedOffset);
         double ratio = 0.0;
         std::streamoff byteOffset = 0;
         if (usedMap) {
@@ -4561,13 +4556,11 @@ void CMmtTlvSplitter::DemuxLoop()
                 m_curSegment = jump;
                 m_curSegmentBase = SegmentBase(jump);
                 const REFERENCE_TIME srcRel = m_editSegments[jump].start;
-                // Prefer a precise map RAP offset (absolute-time query); fall back
-                // to a duration-ratio estimate. Both land at/just before srcRel, so
-                // the RAP wait + EditMapPts drop trims to the exact segment start.
+                // Query the normalized source-relative RAP map before falling
+                // back to a duration-ratio estimate.
                 long long mappedOffset = -1;
                 std::streamoff byteOffset = 0;
-                const REFERENCE_TIME mapQuery = srcRel + (m_mapFirstVideoPts >= 0 ? m_mapFirstVideoPts : 0);
-                if (FindSidecarMapSeekOffset(mapQuery, mappedOffset)) {
+                if (FindSidecarMapSeekOffset(srcRel, mappedOffset)) {
                     byteOffset = static_cast<std::streamoff>(mappedOffset);
                 } else if (m_sourceDuration > 0) {
                     byteOffset = static_cast<std::streamoff>(static_cast<double>(srcRel) / m_sourceDuration * m_fileSize);
