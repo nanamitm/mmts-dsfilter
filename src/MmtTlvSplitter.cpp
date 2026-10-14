@@ -2793,8 +2793,10 @@ int CMmtTlvSplitter::SegmentAtProgram(REFERENCE_TIME programRT, REFERENCE_TIME& 
     return 0;
 }
 
-bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut)
+bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut,
+                                bool video, bool* preroll, REFERENCE_TIME absDts)
 {
+    if (preroll) *preroll = false;
     if (absPts < 0 || m_origFirstPts < 0) {
         programOut = absPts;
         return true;
@@ -2805,15 +2807,26 @@ bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programO
     }
     const REFERENCE_TIME srcRel = absPts - m_origFirstPts;
     const EditSeg& seg = m_editSegments[m_curSegment];
-    if (srcRel >= seg.end) {
+    const REFERENCE_TIME decodeRel = (absDts >= 0 ? absDts : absPts) - m_origFirstPts;
+    if (video && decodeRel >= seg.end) {
         const int next = m_curSegment + 1;
         m_pendingSegmentJump.store(next < static_cast<int>(m_editSegments.size()) ? next : -2,
                                    std::memory_order_release);
-        return false; // past this segment -> drop and trigger jump/EOS
+        return false;
     }
-    if (srcRel < seg.start)
-        return false; // before this segment (pre-roll / gap) -> drop
+    // Audio can lead video, and reference pictures can be shown after the cut
+    // while preceding in-range B pictures in decode order. Neither may trigger
+    // the source jump before the video decoder has consumed the interval.
+    if (!video && srcRel >= seg.end)
+        return false;
+    if (srcRel < seg.start && !video)
+        return false;
     programOut = m_curSegmentBase + (srcRel - seg.start);
+    if (!video && programOut < m_segmentStart)
+        return false; // audio before the requested seek position must not play at zero
+    // A RAP preceding a cut/seek and its dependent frames must reach the
+    // decoder, but must not be presented or advance the playback position.
+    if (preroll) *preroll = video && (srcRel < seg.start || srcRel >= seg.end || programOut < m_segmentStart);
     return true;
 }
 
@@ -3938,8 +3951,9 @@ void CMmtTlvSplitter::CreatePins()
         [videoPin, this](int, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
             REFERENCE_TIME normPts, normDts;
+            bool editPreroll = false;
             if (IsMultiSegment()) {
-                if (!EditMapPts(pts, normPts))
+                if (!EditMapPts(pts, normPts, true, &editPreroll, dts))
                     return; // sample is in a cut gap / past the segment -> drop
                 const REFERENCE_TIME off = pts - normPts;
                 normDts = (dts >= 0) ? dts - off : dts;
@@ -3956,7 +3970,7 @@ void CMmtTlvSplitter::CreatePins()
                 m_active = false;
                 return;
             }
-            const bool preroll = normPts > stopPos;
+            const bool preroll = editPreroll || normPts > stopPos;
             if (!preroll && last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
             if (!preroll && last && normDts >= 0)
@@ -4076,7 +4090,10 @@ void CMmtTlvSplitter::NotifyVideoRap(REFERENCE_TIME segmentTime)
     if (m_waitingForVideoRap.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
         if (segmentTime < 0)
             segmentTime = 0;
-        m_segmentTimeOffset.store(segmentTime, std::memory_order_release);
+        // EDL samples already include the preceding segments' duration.
+        // Rebasing each new RAP would rewind queued audio/video to time zero
+        // while the subtitle and graph clocks continue on the program timeline.
+        m_segmentTimeOffset.store(IsMultiSegment() ? 0 : segmentTime, std::memory_order_release);
         LogMsg(L"MMT/TLV Splitter: segment RAP time offset=%I64d ms\n", segmentTime / 10000);
     }
 }
@@ -4325,6 +4342,7 @@ CBasePin* CMmtTlvSplitter::GetPin(int n)
 // ---------------------------------------------------------------------------
 STDMETHODIMP CMmtTlvSplitter::Run(REFERENCE_TIME tStart)
 {
+    CAutoLock lock(&m_pinLock);
     HRESULT hr = CBaseFilter::Run(tStart);
     if (SUCCEEDED(hr))
         StartThread();
@@ -4333,6 +4351,7 @@ STDMETHODIMP CMmtTlvSplitter::Run(REFERENCE_TIME tStart)
 
 STDMETHODIMP CMmtTlvSplitter::Pause()
 {
+    CAutoLock lock(&m_pinLock);
     HRESULT hr = CBaseFilter::Pause();
     if (SUCCEEDED(hr) && m_State == State_Paused && !m_hThread)
         StartThread();
@@ -4341,6 +4360,7 @@ STDMETHODIMP CMmtTlvSplitter::Pause()
 
 STDMETHODIMP CMmtTlvSplitter::Stop()
 {
+    CAutoLock lock(&m_pinLock);
     for (auto* pin : m_pins)
         if (pin->IsConnected()) pin->DeliverBeginFlush();
     StopThread();
@@ -4377,7 +4397,7 @@ void CMmtTlvSplitter::StopThread()
     ResetEvent(m_hStop);
 }
 
-void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
+void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos, const std::function<void()>& changeStream)
 {
     LogMsg(L"MMT/TLV Splitter: SeekTo begin pos=%I64d ms, state=%d, thread=%p\n",
            pos / 10000, m_State, m_hThread);
@@ -4389,6 +4409,7 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
     m_isSeeking = true;
     StopThread();
     m_isSeeking = false;
+    if (changeStream) changeStream();
 
     for (auto* pin : m_pins)
         if (pin->IsConnected()) pin->DeliverEndFlush();
@@ -4467,13 +4488,8 @@ void CMmtTlvSplitter::DemuxLoop()
 
     if (sourceSeekTarget > 0 && m_fileSize > 0) {
         long long mappedOffset = -1;
-        // Map RAP offsets are keyed by absolute PTS; the single-range path passes
-        // relative time (and falls back to ratio). For the EDL path we query with
-        // absolute time so segment starts land on a real RAP at/just before them.
-        const REFERENCE_TIME mapQuery = IsMultiSegment()
-            ? sourceSeekTarget + (m_mapFirstVideoPts >= 0 ? m_mapFirstVideoPts : 0)
-            : sourceSeekTarget;
-        bool usedMap = FindSidecarMapSeekOffset(mapQuery, mappedOffset);
+        // LoadSidecarMap normalizes all point times to source-relative time.
+        bool usedMap = FindSidecarMapSeekOffset(sourceSeekTarget, mappedOffset);
         double ratio = 0.0;
         std::streamoff byteOffset = 0;
         if (usedMap) {
@@ -4544,8 +4560,8 @@ void CMmtTlvSplitter::DemuxLoop()
             if (ifs.eof() || !ifs.good()) break;
         }
 
-        // EDL: a segment boundary was reached (a video sample past the current
-        // segment end). Jump to the next segment, or stop after the last one.
+        // EDL: video decode time reached the current segment end. Complete
+        // this packet batch before jumping, so buffered in-range audio is kept.
         if (IsMultiSegment()) {
             const int jump = m_pendingSegmentJump.exchange(-1, std::memory_order_acq_rel);
             if (jump == -2) {
@@ -4557,13 +4573,11 @@ void CMmtTlvSplitter::DemuxLoop()
                 m_curSegment = jump;
                 m_curSegmentBase = SegmentBase(jump);
                 const REFERENCE_TIME srcRel = m_editSegments[jump].start;
-                // Prefer a precise map RAP offset (absolute-time query); fall back
-                // to a duration-ratio estimate. Both land at/just before srcRel, so
-                // the RAP wait + EditMapPts drop trims to the exact segment start.
+                // Query the normalized source-relative RAP map before falling
+                // back to a duration-ratio estimate.
                 long long mappedOffset = -1;
                 std::streamoff byteOffset = 0;
-                const REFERENCE_TIME mapQuery = srcRel + (m_mapFirstVideoPts >= 0 ? m_mapFirstVideoPts : 0);
-                if (FindSidecarMapSeekOffset(mapQuery, mappedOffset)) {
+                if (FindSidecarMapSeekOffset(srcRel, mappedOffset)) {
                     byteOffset = static_cast<std::streamoff>(mappedOffset);
                 } else if (m_sourceDuration > 0) {
                     byteOffset = static_cast<std::streamoff>(static_cast<double>(srcRel) / m_sourceDuration * m_fileSize);
@@ -4579,9 +4593,11 @@ void CMmtTlvSplitter::DemuxLoop()
                     if (decoder)
                         decoder->Reset();
                 m_waitingForVideoRap.store(true, std::memory_order_release);
+                // The worker owns accumulation here. Reset partial AUs and
+                // mark the decoder discontinuity without flushing queued
+                // samples from the preceding program segment.
                 for (auto* pin : m_pins)
-                    if (pin->IsVideo())
-                        pin->SetWaitForVideoRap(true);
+                    pin->ResetForSeek();
                 LogMsg(L"MMT/TLV Splitter: EDL jump to seg=%d base=%I64d ms src=%I64d ms byte=%I64d\n",
                        jump, m_curSegmentBase / 10000, srcRel / 10000, static_cast<long long>(byteOffset));
             }
@@ -4694,6 +4710,7 @@ STDMETHODIMP CMmtTlvSplitter::SetPositions(
     LONGLONG* pCurrent, DWORD dwCurrentFlags,
     LONGLONG* pStop,    DWORD dwStopFlags)
 {
+    CAutoLock lock(&m_pinLock);
     REFERENCE_TIME curBefore = m_currentPts.load(std::memory_order_relaxed);
     LogMsg(L"MMT/TLV Splitter: SetPositions in current=%s %I64d ms flags=0x%08X(%s), stop=%s %I64d ms flags=0x%08X(%s), curBefore=%I64d ms, duration=%I64d ms, thread=%p\n",
            pCurrent ? L"yes" : L"no",
@@ -4917,65 +4934,37 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
 
 STDMETHODIMP CMmtTlvSplitter::Enable(long lIndex, DWORD dwFlags)
 {
+    CAutoLock lock(&m_pinLock);
     if ((dwFlags & AMSTREAMSELECTENABLE_ENABLE) == 0)
         return S_OK;
 
-    auto videoStreams = m_handler.getVideoStreams();
-    if (lIndex >= 0 && static_cast<size_t>(lIndex) < videoStreams.size()) {
-        for (auto* pin : m_pins)
-            if (pin->IsVideo() && pin->IsConnected())
-                pin->DeliverBeginFlush();
-
-        const bool ok = m_handler.selectVideoStreamByListIndex(static_cast<size_t>(lIndex));
-
-        const auto& selected = videoStreams[static_cast<size_t>(lIndex)];
-        if (ok && selected.width > 0 && selected.height > 0) {
-            m_videoWidth = selected.width;
-            m_videoHeight = selected.height;
-        }
-
-        for (auto* pin : m_pins) {
-            if (pin->IsVideo()) {
-                // The connected media type cannot change on the fly; the decoder
-                // picks the new geometry up from the parameter sets the broadcast
-                // stream repeats at every IRAP. Keep the pin's own idea of the
-                // size current for any later reconnect.
-                if (ok && selected.width > 0 && selected.height > 0)
-                    pin->SetVideoInfo(selected.width, selected.height);
-                // ResetForSeek() re-arms the RAP wait, so the newly selected
-                // asset starts at an IRAP with its own parameter sets rather
-                // than mid-GOP.
-                pin->ResetForSeek();
-                if (pin->IsConnected())
-                    pin->DeliverEndFlush();
-            }
-        }
-
-        LogMsg(L"MMT/TLV StreamSelect: Enable video index=%ld flags=0x%08X ok=%d\n",
-               lIndex, dwFlags, ok ? 1 : 0);
-        return ok ? S_OK : E_INVALIDARG;
-    }
-
-    auto streams = m_handler.getAudioStreams();
-    lIndex -= static_cast<long>(videoStreams.size());
-    if (lIndex < 0 || static_cast<size_t>(lIndex) >= streams.size())
+    const auto videos = m_handler.getVideoStreams();
+    const bool video = lIndex >= 0 && static_cast<size_t>(lIndex) < videos.size();
+    const long audioIndex = lIndex - static_cast<long>(videos.size());
+    if (!video && (audioIndex < 0 || static_cast<size_t>(audioIndex) >= m_handler.getAudioStreams().size()))
         return E_INVALIDARG;
 
-    for (auto* pin : m_pins)
-        if (pin->IsAudio() && pin->IsConnected())
-            pin->DeliverBeginFlush();
-
-    bool ok = m_handler.selectAudioStreamByListIndex(static_cast<size_t>(lIndex));
-
-    for (auto* pin : m_pins) {
-        if (pin->IsAudio()) {
-            pin->ResetForSeek();
-            if (pin->IsConnected())
-                pin->DeliverEndFlush();
+    // Flush every connected branch, join the demux worker, and only then
+    // change the selection/accumulators. A downstream flush does not stop
+    // the producer from assembling another access unit.
+    bool ok = false;
+    SeekTo(m_currentPts.load(std::memory_order_acquire), [&] {
+        if (video) {
+            ok = m_handler.selectVideoStreamByListIndex(static_cast<size_t>(lIndex));
+            const auto streams = m_handler.getVideoStreams();
+            if (ok && static_cast<size_t>(lIndex) < streams.size()) {
+                const auto& selected = streams[static_cast<size_t>(lIndex)];
+                if (selected.width > 0 && selected.height > 0) {
+                    m_videoWidth = selected.width;
+                    m_videoHeight = selected.height;
+                    for (auto* pin : m_pins)
+                        if (pin->IsVideo()) pin->SetVideoInfo(selected.width, selected.height);
+                }
+            }
+        } else {
+            ok = m_handler.selectAudioStreamByListIndex(static_cast<size_t>(audioIndex));
         }
-    }
-
-    LogMsg(L"MMT/TLV StreamSelect: Enable index=%ld flags=0x%08X ok=%d\n",
-           lIndex, dwFlags, ok ? 1 : 0);
+    });
+    LogMsg(L"MMT/TLV StreamSelect: Enable index=%ld flags=0x%08X ok=%d\n", lIndex, dwFlags, ok ? 1 : 0);
     return ok ? S_OK : E_INVALIDARG;
 }

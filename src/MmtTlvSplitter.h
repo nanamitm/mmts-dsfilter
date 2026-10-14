@@ -76,7 +76,7 @@ private:
     void CreatePins();
     void StartThread();
     void StopThread();
-    void SeekTo(REFERENCE_TIME pos);
+    void SeekTo(REFERENCE_TIME pos, const std::function<void()>& changeStream = {});
     void PreScanFile();
     void LoadSidecarEdit(const std::wstring& editPath);
     void LoadSidecarMap();
@@ -91,9 +91,10 @@ private:
     REFERENCE_TIME SegmentBase(int index) const;    // program time at start of segment
     int SegmentAtProgram(REFERENCE_TIME programRT, REFERENCE_TIME& srcRelOut) const;
     // Maps an absolute source PTS to program time for the current segment.
-    // Returns false (drop the sample) when the PTS is past the segment end (also
-    // requests the next jump) or before the segment start.
-    bool EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut);
+    // Audio outside the display interval is dropped. Video outside it may be
+    // needed as decoder preroll; only its decode timestamp can request a jump.
+    bool EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut,
+                    bool video = false, bool* preroll = nullptr, REFERENCE_TIME absDts = -1);
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
                                      std::vector<uint8_t>& out,
                                      int* width = nullptr,
