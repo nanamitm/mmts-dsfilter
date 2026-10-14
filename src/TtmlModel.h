@@ -14,6 +14,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace DsTtml {
 
@@ -51,6 +52,9 @@ struct Style {
 struct Span {
     std::string text;
     Style style;
+    std::optional<uint64_t> begin;
+    std::optional<uint64_t> end;
+    bool visible{true}; // inactive spans still occupy their character cells
 };
 
 struct Region {
@@ -64,6 +68,8 @@ struct Paragraph {
     std::string id;  // diagnostic only, carried through for the layout logs
     Region region;
     std::list<Span> spanTags;
+    std::optional<uint64_t> begin;
+    std::optional<uint64_t> end;
 };
 
 struct Division {
@@ -78,6 +84,16 @@ struct Document {
 
 // Parses a TTML document. Propagates whatever the underlying parser throws,
 // matching the previous direct TTMLPaser::parse() behaviour.
-Document Parse(const std::string& xml);
+Document Parse(const std::string& xml, bool synchronized = true);
+
+struct Slice {
+    uint64_t begin{};
+    std::optional<uint64_t> end;
+    Document document;
+};
+
+// Partition at every resolved p/span boundary, preserving the layout of
+// invisible spans. An absent end remains open until the document is replaced.
+std::vector<Slice> Slices(const Document& document);
 
 }

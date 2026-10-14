@@ -1,5 +1,6 @@
 #include "DsHandler.h"
 #include "DebugLog.h"
+#include "SubtitleDocumentState.h"
 #include "mmtStream.h"
 #include "mpt.h"
 #include "mhEit.h"
@@ -8,6 +9,7 @@
 #include "mhStreamIdentificationDescriptor.h"
 #include "mhAudioComponentDescriptor.h"
 #include "videoComponentDescriptor.h"
+#include "mhDataComponentDescriptor.h"
 #include "mpuProcessorBase.h"  // NOPTS_VALUE
 #include "timeUtil.h"
 #include <windows.h>
@@ -637,7 +639,12 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 if (descriptor->getDescriptorTag() == MmtTlv::MhStreamIdentificationDescriptor::kDescriptorTag) {
                     const auto* streamId = static_cast<const MmtTlv::MhStreamIdentificationDescriptor*>(descriptor.get());
                     info.componentTag = streamId->componentTag;
-                    break;
+                } else if (descriptor->getDescriptorTag() == MmtTlv::MhDataComponentDescriptor::kDescriptorTag) {
+                    const auto* data = static_cast<const MmtTlv::MhDataComponentDescriptor*>(descriptor.get());
+                    MmtTlv::AdditionalAribSubtitleInfo control;
+                    MmtTlv::Common::ReadStream bytes(data->additionalDataComponentInfo);
+                    if (data->dataComponentId == 0x0020 && control.unpack(bytes))
+                        info.control = control;
                 }
             }
 
@@ -719,7 +726,8 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 if (discoveredSubtitles[i].streamIndex != m_subtitleStreams[i].streamIndex ||
                     discoveredSubtitles[i].packetId != m_subtitleStreams[i].packetId ||
                     discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag ||
-                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData) {
+                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData ||
+                    !DsSubtitle::SameControl(discoveredSubtitles[i].control, m_subtitleStreams[i].control)) {
                     changed = true;
                     break;
                 }
@@ -737,6 +745,9 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             }
         }
     }
+
+    if (m_subtitleControlCallback)
+        m_subtitleControlCallback(discoveredSubtitles);
 
     if (!discovered.empty()) {
         std::lock_guard<std::mutex> lock(m_audioMutex);
@@ -1172,10 +1183,17 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
         return;
     }
 
-    if (!m_subtitleCallback)
-        return;
-
-    m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
+    if (m_subtitleDocumentCallback) {
+        SubtitleStreamInfo info;
+        info.streamIndex = static_cast<int>(stream.getStreamIndex());
+        info.packetId = stream.getPacketId();
+        info.componentTag = stream.getComponentTag();
+        info.hasData = true;
+        info.control = stream.additionalAribSubtitleInfo();
+        m_subtitleDocumentCallback(info, pts, dts, mfu.data.data(), mfu.data.size());
+    }
+    if (m_subtitleCallback)
+        m_subtitleCallback(static_cast<int>(stream.getStreamIndex()),
                        stream.getPacketId(), stream.getComponentTag(), pts, dts,
                        mfu.data.data(), mfu.data.size());
 }

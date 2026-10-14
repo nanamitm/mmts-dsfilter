@@ -318,5 +318,40 @@ and continues delivering samples to all connected audio pins.
 
 ## Notes
 
+### Subtitle timing and document replacement
+
+ARIB-TTML paragraph and span times are retained as separate display intervals.
+TMD `0010` uses the subtitle descriptor's NTP `reference_start_time` in the
+same absolute clock as the video MPU timestamps; zero `begin` remains a timed
+start. TMD `1111` ignores TTML time attributes and displays from arrival.
+Without a usable descriptor, arrival time is used as a compatibility fallback.
+
+Before submitting ASS events, a second incremental file reader determines the
+end of the current document from its declared end, the next document, a clear
+packet, or a change/removal of the subtitle descriptor. This also clips events
+that were previously sent with long fixed durations and prevents an older
+glyph-waiting document from returning after a clear. Future display intervals
+are held until shortly before their start, rather than filling the output queue
+with all future characters at once.
+
+The reader starts at the beginning to preserve MPT/fragment context, reads each
+byte only once, and caches timing records across seeks. It can therefore add
+read latency on the first subtitle or after a forward seek; an open-ended last
+caption may require scanning to EOF. Stop/seek cancels the scan. This path is
+for fixed recording files; its cached EOF is not a growing-file monitor.
+
+Regression checks (VS v143 and the adjacent `dantto4k` checkout are required):
+
+```powershell
+./build.ps1 -Configuration Release
+./tools/run_subtitle_state_test.cmd
+./tools/run_subtitle_file_index_test.ps1
+./tools/run_subtitle_file_index_test.ps1 -Test subtitle_render_test
+```
+
+These cover element timing, binary MMT/TLV update/clear/descriptor sequences,
+and production ASS cell layout. They do not replace playback validation in the
+target subtitle renderer or certify all ARIB-TTML styling/monomedia features.
+
 This project includes a copy of Microsoft DirectShow BaseClasses under
 `baseclasses/`; see `baseclasses/LICENSE` for that component.
