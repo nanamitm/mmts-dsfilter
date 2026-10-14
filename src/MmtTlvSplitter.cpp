@@ -2793,8 +2793,10 @@ int CMmtTlvSplitter::SegmentAtProgram(REFERENCE_TIME programRT, REFERENCE_TIME& 
     return 0;
 }
 
-bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut)
+bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut,
+                                bool video, bool* preroll)
 {
+    if (preroll) *preroll = false;
     if (absPts < 0 || m_origFirstPts < 0) {
         programOut = absPts;
         return true;
@@ -2811,9 +2813,12 @@ bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programO
                                    std::memory_order_release);
         return false; // past this segment -> drop and trigger jump/EOS
     }
-    if (srcRel < seg.start)
-        return false; // before this segment (pre-roll / gap) -> drop
+    if (srcRel < seg.start && !video)
+        return false;
     programOut = m_curSegmentBase + (srcRel - seg.start);
+    // A RAP preceding a cut/seek and its dependent frames must reach the
+    // decoder, but must not be presented or advance the playback position.
+    if (preroll) *preroll = video && (srcRel < seg.start || programOut < m_segmentStart);
     return true;
 }
 
@@ -3938,8 +3943,9 @@ void CMmtTlvSplitter::CreatePins()
         [videoPin, this](int, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
             REFERENCE_TIME normPts, normDts;
+            bool editPreroll = false;
             if (IsMultiSegment()) {
-                if (!EditMapPts(pts, normPts))
+                if (!EditMapPts(pts, normPts, true, &editPreroll))
                     return; // sample is in a cut gap / past the segment -> drop
                 const REFERENCE_TIME off = pts - normPts;
                 normDts = (dts >= 0) ? dts - off : dts;
@@ -3956,7 +3962,7 @@ void CMmtTlvSplitter::CreatePins()
                 m_active = false;
                 return;
             }
-            const bool preroll = normPts > stopPos;
+            const bool preroll = editPreroll || normPts > stopPos;
             if (!preroll && last && normPts > 0)
                 m_currentPts.store(normPts, std::memory_order_relaxed);
             if (!preroll && last && normDts >= 0)
@@ -4579,9 +4585,11 @@ void CMmtTlvSplitter::DemuxLoop()
                     if (decoder)
                         decoder->Reset();
                 m_waitingForVideoRap.store(true, std::memory_order_release);
+                // The worker owns accumulation here. Reset partial AUs and
+                // mark the decoder discontinuity without flushing queued
+                // samples from the preceding program segment.
                 for (auto* pin : m_pins)
-                    if (pin->IsVideo())
-                        pin->SetWaitForVideoRap(true);
+                    pin->ResetForSeek();
                 LogMsg(L"MMT/TLV Splitter: EDL jump to seg=%d base=%I64d ms src=%I64d ms byte=%I64d\n",
                        jump, m_curSegmentBase / 10000, srcRel / 10000, static_cast<long long>(byteOffset));
             }

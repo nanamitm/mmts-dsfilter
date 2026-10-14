@@ -93,7 +93,8 @@ private:
     // Maps an absolute source PTS to program time for the current segment.
     // Returns false (drop the sample) when the PTS is past the segment end (also
     // requests the next jump) or before the segment start.
-    bool EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut);
+    bool EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programOut,
+                    bool video = false, bool* preroll = nullptr);
     static void ExtractHevcParamSets(const std::vector<uint8_t>& annexb,
                                      std::vector<uint8_t>& out,
                                      int* width = nullptr,
