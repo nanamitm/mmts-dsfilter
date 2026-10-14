@@ -3,8 +3,11 @@
 #include <algorithm>
 
 SubtitleFileIndex::SubtitleFileIndex(const std::wstring& filename, long long initialTime,
-                                    std::function<bool()> cancelled)
-    : m_file(filename, std::ios::binary), m_arrival(initialTime), m_cancelled(std::move(cancelled))
+                                    std::function<bool()> cancelled, long long readThrough,
+                                    long long restartLead)
+    : m_file(filename, std::ios::binary), m_arrival(initialTime),
+      m_readThrough((std::max)(readThrough, 1LL)), m_restartLead((std::max)(restartLead, 0LL)),
+      m_cancelled(std::move(cancelled))
 {
     m_handler.setVideoCallback([this](int, bool, long long pts, long long dts, bool, bool, const uint8_t*, size_t) {
         if (dts >= 0 || pts >= 0) {
@@ -62,6 +65,28 @@ void SubtitleFileIndex::Controls(const std::vector<CFilterDemuxerHandler::Subtit
     m_controls = streams;
 }
 
+// Start a new window shortly before offset, as the splitter does on a seek:
+// the demuxer keeps its stream registration but drops partial MFUs.
+void SubtitleFileIndex::Restart(long long offset)
+{
+    const long long start = (std::max)(0LL, offset - m_restartLead);
+    MmtTlvLogInfo(L"SUBTITLE index restarts at byte=%I64d for byte=%I64d (window was %I64d-%I64d)\n",
+                  start, offset, m_windowStart, m_bufferOffset + static_cast<long long>(m_consumed));
+    m_file.clear();
+    m_file.seekg(start);
+    m_buffer.clear();
+    m_consumed = 0;
+    m_bufferOffset = start;
+    m_packetOffset = start;
+    m_eof = false;
+    m_records.clear();
+    m_demuxer.resetStreams();
+    m_arrival = -1;
+    m_lastPts = -1;
+    m_hasVideoClock = false;
+    m_windowStart = start;
+}
+
 bool SubtitleFileIndex::ReadPacket()
 {
     constexpr size_t chunk = 1024 * 1024;
@@ -85,6 +110,7 @@ bool SubtitleFileIndex::ReadPacket()
         m_buffer.resize(old + chunk);
         m_file.read(reinterpret_cast<char*>(m_buffer.data() + old), chunk);
         const auto got = m_file.gcount();
+        m_bytesRead += got;
         m_buffer.resize(old + static_cast<size_t>(got));
         m_eof = got == 0;
     }
@@ -92,6 +118,10 @@ bool SubtitleFileIndex::ReadPacket()
 
 bool SubtitleFileIndex::Resolve(long long offset, uint16_t packetId, uint64_t hash, Record& record)
 {
+    const long long position = m_bufferOffset + static_cast<long long>(m_consumed);
+    if (offset < m_windowStart || offset > position + m_readThrough) {
+        Restart(offset);
+    }
     size_t cursor = 0;
     std::optional<size_t> found;
     std::optional<long long> boundary;

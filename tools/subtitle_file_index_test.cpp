@@ -78,9 +78,24 @@ int main(){
         const auto so=split.add(subtitle(1,a));split.add(ntp(1015));split.add(subtitle(2,clear));split.save();
         SubtitleFileIndex splitIndex(split.path.wstring(),1000LL*10000000,[]{return false;});
         require(resolve(splitIndex,so,a).stop==1015LL*10000000,"MFU crossing reader chunks must retain its original packet offset");
+        // A seek far ahead restarts the index near the document instead of
+        // reading the gap; a seek back before the window restarts it there.
+        Fixture far("subtitle-seek-far-test.mmts");far.add(ntp(1000));far.add(mpt(1,0));far.add(ntp(1005));const auto early=far.add(subtitle(1,a));far.add(ntp(1015));far.add(subtitle(2,clear));
+        const size_t gapStart=far.bytes.size();
+        for(int i=0;i<40;++i) far.add(tlv(0xff,Bytes(65000,0)));
+        const size_t gap=far.bytes.size()-gapStart;
+        far.add(ntp(2000));far.add(mpt(3,0));far.add(ntp(2005));const auto late=far.add(subtitle(4,b));far.add(ntp(2015));far.add(subtitle(5,clear));far.add(ntp(2050));far.save();
+        const long long readThrough=256*1024;
+        SubtitleFileIndex seeking(far.path.wstring(),1000LL*10000000,[]{return false;},readThrough,32*1024);
+        require(resolve(seeking,early,a).stop==1015LL*10000000,"document before the gap resolves");
+        const auto beforeSeek=seeking.BytesRead();
+        const auto lr=resolve(seeking,late,b);
+        require(lr.stop==2015LL*10000000,"document after a far seek resolves from the restarted window");
+        require(seeking.BytesRead()-beforeSeek<static_cast<long long>(gap)/2,"far seek must not read the gap");
+        require(resolve(seeking,early,a).stop==1015LL*10000000,"seek back before the window restarts it there");
         bool cancelled=true;SubtitleFileIndex stopped(f.path.wstring(),0,[&]{return cancelled;});SubtitleFileIndex::Record unused;
         require(!stopped.Resolve(first,0x100,0,unused),"stop must cancel lookahead");
-        std::cout<<"Subtitle file index tests passed: finite replacement, clear, async, descriptor update, seek, cancellation\n";
+        std::cout<<"Subtitle file index tests passed: finite replacement, clear, async, descriptor update, seek, far seek, cancellation\n";
         return 0;
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
 }
