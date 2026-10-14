@@ -1,4 +1,4 @@
-﻿#include "MmtTlvSplitter.h"
+#include "MmtTlvSplitter.h"
 #include "DebugLog.h"
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
@@ -2822,6 +2822,8 @@ bool CMmtTlvSplitter::EditMapPts(REFERENCE_TIME absPts, REFERENCE_TIME& programO
     if (srcRel < seg.start && !video)
         return false;
     programOut = m_curSegmentBase + (srcRel - seg.start);
+    if (!video && programOut < m_segmentStart)
+        return false; // audio before the requested seek position must not play at zero
     // A RAP preceding a cut/seek and its dependent frames must reach the
     // decoder, but must not be presented or advance the playback position.
     if (preroll) *preroll = video && (srcRel < seg.start || srcRel >= seg.end || programOut < m_segmentStart);
