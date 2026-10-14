@@ -4076,7 +4076,10 @@ void CMmtTlvSplitter::NotifyVideoRap(REFERENCE_TIME segmentTime)
     if (m_waitingForVideoRap.compare_exchange_strong(expected, false, std::memory_order_acq_rel)) {
         if (segmentTime < 0)
             segmentTime = 0;
-        m_segmentTimeOffset.store(segmentTime, std::memory_order_release);
+        // EDL samples already include the preceding segments' duration.
+        // Rebasing each new RAP would rewind queued audio/video to time zero
+        // while the subtitle and graph clocks continue on the program timeline.
+        m_segmentTimeOffset.store(IsMultiSegment() ? 0 : segmentTime, std::memory_order_release);
         LogMsg(L"MMT/TLV Splitter: segment RAP time offset=%I64d ms\n", segmentTime / 10000);
     }
 }
