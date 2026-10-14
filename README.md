@@ -131,6 +131,29 @@ tools\mmts_pin_probe.exe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH] [--ex
 - Demuxer-only probes miss routing bugs: the filter locks its stream lists
   once pins exist, which only a real graph reproduces.
 
+## Regression Tests
+
+Build Release first, then run from the repository root:
+
+```powershell
+./tools/run_subtitle_state_test.cmd
+./tools/run_subtitle_file_index_test.ps1
+./tools/run_subtitle_file_index_test.ps1 -Test subtitle_render_test
+./tools/run_subtitle_file_index_test.ps1 -Test playback_state_test
+```
+
+The playback state test exercises production EDL seek logic, video callbacks,
+queued DirectShow output samples, and video/audio track changes. It checks
+normalized RAP-map lookups, decoder preroll before cuts and seek targets,
+reference/B-picture handling at cut ends, cumulative timestamps across cuts,
+and worker joins with every connected output branch flushed. Fixtures are
+written under `work/playback-state`.
+
+The capture sink inspects timestamps and sample flags; it does not decode HEVC
+or AAC and does not replace playback/seek checks in MPC-BE or MPC-HC with real
+recordings. The runners require Visual Studio C++ tools and the Release build's
+v143 toolset and object files.
+
 ## Non-destructive edits (`.mmtsedit`)
 
 The filter supports a non-destructive edit decision list in a `.mmtsedit` JSON
