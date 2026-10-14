@@ -1,4 +1,4 @@
-#include "MmtTlvSplitter.h"
+﻿#include "MmtTlvSplitter.h"
 #include "DebugLog.h"
 #include "Guids.h"
 #include "stream.h"     // MmtTlv::Common::ReadStream
@@ -4325,6 +4325,7 @@ CBasePin* CMmtTlvSplitter::GetPin(int n)
 // ---------------------------------------------------------------------------
 STDMETHODIMP CMmtTlvSplitter::Run(REFERENCE_TIME tStart)
 {
+    CAutoLock lock(&m_pinLock);
     HRESULT hr = CBaseFilter::Run(tStart);
     if (SUCCEEDED(hr))
         StartThread();
@@ -4333,6 +4334,7 @@ STDMETHODIMP CMmtTlvSplitter::Run(REFERENCE_TIME tStart)
 
 STDMETHODIMP CMmtTlvSplitter::Pause()
 {
+    CAutoLock lock(&m_pinLock);
     HRESULT hr = CBaseFilter::Pause();
     if (SUCCEEDED(hr) && m_State == State_Paused && !m_hThread)
         StartThread();
@@ -4341,6 +4343,7 @@ STDMETHODIMP CMmtTlvSplitter::Pause()
 
 STDMETHODIMP CMmtTlvSplitter::Stop()
 {
+    CAutoLock lock(&m_pinLock);
     for (auto* pin : m_pins)
         if (pin->IsConnected()) pin->DeliverBeginFlush();
     StopThread();
@@ -4377,7 +4380,7 @@ void CMmtTlvSplitter::StopThread()
     ResetEvent(m_hStop);
 }
 
-void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
+void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos, const std::function<void()>& changeStream)
 {
     LogMsg(L"MMT/TLV Splitter: SeekTo begin pos=%I64d ms, state=%d, thread=%p\n",
            pos / 10000, m_State, m_hThread);
@@ -4389,6 +4392,7 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
     m_isSeeking = true;
     StopThread();
     m_isSeeking = false;
+    if (changeStream) changeStream();
 
     for (auto* pin : m_pins)
         if (pin->IsConnected()) pin->DeliverEndFlush();
@@ -4694,6 +4698,7 @@ STDMETHODIMP CMmtTlvSplitter::SetPositions(
     LONGLONG* pCurrent, DWORD dwCurrentFlags,
     LONGLONG* pStop,    DWORD dwStopFlags)
 {
+    CAutoLock lock(&m_pinLock);
     REFERENCE_TIME curBefore = m_currentPts.load(std::memory_order_relaxed);
     LogMsg(L"MMT/TLV Splitter: SetPositions in current=%s %I64d ms flags=0x%08X(%s), stop=%s %I64d ms flags=0x%08X(%s), curBefore=%I64d ms, duration=%I64d ms, thread=%p\n",
            pCurrent ? L"yes" : L"no",
@@ -4917,65 +4922,37 @@ STDMETHODIMP CMmtTlvSplitter::Info(long lIndex, AM_MEDIA_TYPE** ppmt, DWORD* pdw
 
 STDMETHODIMP CMmtTlvSplitter::Enable(long lIndex, DWORD dwFlags)
 {
+    CAutoLock lock(&m_pinLock);
     if ((dwFlags & AMSTREAMSELECTENABLE_ENABLE) == 0)
         return S_OK;
 
-    auto videoStreams = m_handler.getVideoStreams();
-    if (lIndex >= 0 && static_cast<size_t>(lIndex) < videoStreams.size()) {
-        for (auto* pin : m_pins)
-            if (pin->IsVideo() && pin->IsConnected())
-                pin->DeliverBeginFlush();
-
-        const bool ok = m_handler.selectVideoStreamByListIndex(static_cast<size_t>(lIndex));
-
-        const auto& selected = videoStreams[static_cast<size_t>(lIndex)];
-        if (ok && selected.width > 0 && selected.height > 0) {
-            m_videoWidth = selected.width;
-            m_videoHeight = selected.height;
-        }
-
-        for (auto* pin : m_pins) {
-            if (pin->IsVideo()) {
-                // The connected media type cannot change on the fly; the decoder
-                // picks the new geometry up from the parameter sets the broadcast
-                // stream repeats at every IRAP. Keep the pin's own idea of the
-                // size current for any later reconnect.
-                if (ok && selected.width > 0 && selected.height > 0)
-                    pin->SetVideoInfo(selected.width, selected.height);
-                // ResetForSeek() re-arms the RAP wait, so the newly selected
-                // asset starts at an IRAP with its own parameter sets rather
-                // than mid-GOP.
-                pin->ResetForSeek();
-                if (pin->IsConnected())
-                    pin->DeliverEndFlush();
-            }
-        }
-
-        LogMsg(L"MMT/TLV StreamSelect: Enable video index=%ld flags=0x%08X ok=%d\n",
-               lIndex, dwFlags, ok ? 1 : 0);
-        return ok ? S_OK : E_INVALIDARG;
-    }
-
-    auto streams = m_handler.getAudioStreams();
-    lIndex -= static_cast<long>(videoStreams.size());
-    if (lIndex < 0 || static_cast<size_t>(lIndex) >= streams.size())
+    const auto videos = m_handler.getVideoStreams();
+    const bool video = lIndex >= 0 && static_cast<size_t>(lIndex) < videos.size();
+    const long audioIndex = lIndex - static_cast<long>(videos.size());
+    if (!video && (audioIndex < 0 || static_cast<size_t>(audioIndex) >= m_handler.getAudioStreams().size()))
         return E_INVALIDARG;
 
-    for (auto* pin : m_pins)
-        if (pin->IsAudio() && pin->IsConnected())
-            pin->DeliverBeginFlush();
-
-    bool ok = m_handler.selectAudioStreamByListIndex(static_cast<size_t>(lIndex));
-
-    for (auto* pin : m_pins) {
-        if (pin->IsAudio()) {
-            pin->ResetForSeek();
-            if (pin->IsConnected())
-                pin->DeliverEndFlush();
+    // Flush every connected branch, join the demux worker, and only then
+    // change the selection/accumulators. A downstream flush does not stop
+    // the producer from assembling another access unit.
+    bool ok = false;
+    SeekTo(m_currentPts.load(std::memory_order_acquire), [&] {
+        if (video) {
+            ok = m_handler.selectVideoStreamByListIndex(static_cast<size_t>(lIndex));
+            const auto streams = m_handler.getVideoStreams();
+            if (ok && static_cast<size_t>(lIndex) < streams.size()) {
+                const auto& selected = streams[static_cast<size_t>(lIndex)];
+                if (selected.width > 0 && selected.height > 0) {
+                    m_videoWidth = selected.width;
+                    m_videoHeight = selected.height;
+                    for (auto* pin : m_pins)
+                        if (pin->IsVideo()) pin->SetVideoInfo(selected.width, selected.height);
+                }
+            }
+        } else {
+            ok = m_handler.selectAudioStreamByListIndex(static_cast<size_t>(audioIndex));
         }
-    }
-
-    LogMsg(L"MMT/TLV StreamSelect: Enable index=%ld flags=0x%08X ok=%d\n",
-           lIndex, dwFlags, ok ? 1 : 0);
+    });
+    LogMsg(L"MMT/TLV StreamSelect: Enable index=%ld flags=0x%08X ok=%d\n", lIndex, dwFlags, ok ? 1 : 0);
     return ok ? S_OK : E_INVALIDARG;
 }

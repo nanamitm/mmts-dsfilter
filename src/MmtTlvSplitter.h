@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <streams.h>
 #include <string>
 #include <vector>
@@ -76,7 +76,7 @@ private:
     void CreatePins();
     void StartThread();
     void StopThread();
-    void SeekTo(REFERENCE_TIME pos);
+    void SeekTo(REFERENCE_TIME pos, const std::function<void()>& changeStream = {});
     void PreScanFile();
     void LoadSidecarEdit(const std::wstring& editPath);
     void LoadSidecarMap();
