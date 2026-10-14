@@ -31,18 +31,6 @@ extern "C" {
 }
 
 static const WCHAR kFilterName[] = L"MMT/TLV Splitter";
-static constexpr REFERENCE_TIME kDefaultSubtitleDuration = 25 * 1000000LL; // 2.5 sec fallback
-// A cue with no end time is held on screen by repeating it in chunks until the
-// next cue arrives. Each chunk is delivered as the demux position reaches its
-// start, which is ahead of the renderer, so the chunks are contiguous and the
-// cue does not blink. A sample already handed over cannot be retracted, so the
-// chunk length is also how far a cue can overhang the cue that replaces it -
-// keep it short enough not to be seen.
-static constexpr REFERENCE_TIME kSubtitleChunkDuration = 2 * 1000000LL; // 200 ms
-// Subtitle MFUs carry no PTS. Anchor each TTML timeline to the video position
-// where that timeline is first observed, then preserve TTML spacing until a
-// clear TTML begin rollback indicates a program boundary (see
-// SubtitleTimingResolver, which owns the resync tolerance).
 static constexpr double kAssLineHeightRatio = 1.18;
 static constexpr double kAssSubtitleMargin = 20.0;
 static constexpr uint8_t kDefaultBackgroundRgb = 0x30;
@@ -1376,7 +1364,7 @@ static void AppendAssCellBackgroundEvents(const DsTtml::Paragraph& p, double fon
         const std::wstring wide = Utf8ToWide(span.text);
 
         uint8_t spanR = 0, spanG = 0, spanB = 0, spanA = 0;
-        const bool hasColor = GetAssBackgroundColor(span, settings, spanR, spanG, spanB, spanA);
+        const bool hasColor = span.visible && GetAssBackgroundColor(span, settings, spanR, spanG, spanB, spanA);
 
         for (wchar_t ch : wide) {
             if (ch == L'\r')
@@ -1467,6 +1455,10 @@ static bool AppendAssCellLayoutEvents(int streamIndex, const DsTtml::Paragraph& 
             i = next;
             if (utf8.empty())
                 continue;
+            if (!span.visible) {
+                x += cellAdvance;
+                continue;
+            }
 
             uint32_t codepoint = static_cast<uint32_t>(ch);
             if (ch >= 0xD800 && ch <= 0xDBFF && next <= wide.size() && next > current + 1) {
@@ -1596,16 +1588,11 @@ static double AssFontScaleForParagraph(const DsTtml::Paragraph& p)
     return FitAssFontScale(baseFontSize, CountAssParagraphLines(p), yPos, hasExtent, extentY);
 }
 
-static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDebugStats& stats,
+static TtmlTextCue ExtractTtmlPlainText(const DsTtml::Document& ttml, TtmlDebugStats& stats,
                                         int streamIndex = -1)
 {
     stats = {};
     TtmlTextCue cue;
-    if (!data || size == 0)
-        return cue;
-
-    std::string xml(reinterpret_cast<const char*>(data), size);
-    const DsTtml::Document ttml = DsTtml::Parse(xml);
     const MmtsCaptionSettings settings = GetMmtsCaptionSettings();
     std::ostringstream text;
 
@@ -1638,7 +1625,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, 0);
                     for (const auto& span : p.spanTags) {
                         ++stats.spans;
-                        if (!span.text.empty()) {
+                        if (span.visible && !span.text.empty()) {
                             text << span.text;
                             stats.textBytes += span.text.size();
                             wroteLine = true;
@@ -1679,7 +1666,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                     LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, extraYAss);
                     for (const auto& span : p.spanTags) {
                         ++stats.spans;
-                        if (!span.text.empty()) {
+                        if (span.visible && !span.text.empty()) {
                             text << span.text;
                             stats.textBytes += span.text.size();
                             wroteLine = true;
@@ -1709,7 +1696,7 @@ static TtmlTextCue ExtractTtmlPlainText(const uint8_t* data, size_t size, TtmlDe
                 LogAssParagraphLayout(p, cue.assEvents.size(), fontScale, extraYAss);
                 for (const auto& span : p.spanTags) {
                     ++stats.spans;
-                    if (!span.text.empty()) {
+                    if (span.visible && !span.text.empty()) {
                         text << span.text;
                         stats.textBytes += span.text.size();
                         wroteLine = true;
@@ -1951,10 +1938,10 @@ STDMETHODIMP CMmtTlvSplitter::Load(LPCOLESTR pszFileName, const AM_MEDIA_TYPE*)
     m_currentDts = -1;
     m_segmentStart = 0;
     m_segmentTimeOffset.store(0, std::memory_order_release);
-    m_subtitleResolver.Reset(false);
     m_demuxByteOffset.store(0, std::memory_order_release);
     m_waitingForVideoRap.store(false, std::memory_order_release);
-    ClearPendingSubtitleCues();
+    ClearDeferredSubtitleDocuments();
+    m_subtitleFileIndex.reset();
 
     LogMsg(L"MMT/TLV Splitter: Load called for %s\n", pszFileName);
 
@@ -3976,8 +3963,13 @@ void CMmtTlvSplitter::CreatePins()
                 m_currentDts.store(normDts, std::memory_order_relaxed);
             REFERENCE_TIME samplePts = ToSegmentTime(normPts, m_segmentStart);
             REFERENCE_TIME sampleDts = ToSegmentTime(normDts, m_segmentStart);
+            const REFERENCE_TIME subtitleClock = ToSegmentTime(decodeTime, m_segmentStart);
 
-            PumpPendingSubtitleChunks(samplePts);
+            std::erase_if(m_deferredSubtitleSamples, [&](const auto& sample) {
+                return sample.indexed.stop &&
+                    ToSegmentTime(SubtitleProgramTime(*sample.indexed.stop), m_segmentStart) <= subtitleClock;
+            });
+            PumpScheduledSubtitleSamples(subtitleClock);
             videoPin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz, preroll);
         });
 
@@ -4035,241 +4027,22 @@ void CMmtTlvSplitter::CreatePins()
             }
         });
 
-    m_handler.setProgramStartCallback(
-        [this](long long programStartRt, uint32_t programId) {
-            const REFERENCE_TIME oldStart = m_subtitleResolver.OnProgramStart(programStartRt, programId);
-            if (oldStart != programStartRt) {
-                LogMsg(L"SUBTITLE EIT program start updated: old=%I64d ms, new=%I64d ms\n",
-                       oldStart / 10000,
-                       programStartRt / 10000);
-            }
-            ProcessDeferredSubtitleSamples();
+    m_handler.setSubtitleDocumentCallback(
+        [this](const CFilterDemuxerHandler::SubtitleStreamInfo& info, long long, long long,
+               const uint8_t* data, size_t size) {
+            static volatile LONG callbacks = 0;
+            ProcessSubtitleDocument(info, data, size, InterlockedIncrement(&callbacks));
         });
-
-    m_handler.setNtpCallback(
-        [this](long long ntpRt) {
-            const REFERENCE_TIME mediaRt = SubtitleTimingAnchor();
-            m_subtitleResolver.OnNtpAnchor(ntpRt, mediaRt);
-            static volatile LONG s_ntpLogCount = 0;
-            LONG logNo = InterlockedIncrement(&s_ntpLogCount);
-            if (logNo <= 40 || m_subtitleResolver.AwaitingProgramStart()) {
-                LogDetail(L"SUBTITLE NTP anchor #%ld: ntp=%I64d ms, media=%I64d ms, current=%I64d ms\n",
-                          logNo,
-                          ntpRt / 10000,
-                          mediaRt / 10000,
-                          m_currentPts.load(std::memory_order_acquire) / 10000);
-            }
-            ProcessDeferredSubtitleSamples();
+    m_handler.setSubtitleControlCallback([this](const auto& streams) {
+        // Descriptor changes/removal invalidate waiting glyph documents too.
+        std::erase_if(m_deferredSubtitleSamples, [&](const auto& sample) {
+            const auto current = std::find_if(streams.begin(), streams.end(), [&](const auto& stream) {
+                return stream.packetId == sample.info.packetId;
+            });
+            return current == streams.end() || current->componentTag != sample.info.componentTag ||
+                !DsSubtitle::SameControl(current->control, sample.info.control);
         });
-
-    m_handler.setSubtitleCallback(
-        [this](int streamIndex, uint16_t packetId, int streamComponentTag, long long pts, long long,
-               const uint8_t* d, size_t sz) {
-            static volatile LONG s_subtitleCallbacks = 0;
-            LONG callbackNo = InterlockedIncrement(&s_subtitleCallbacks);
-
-            TtmlDebugStats stats;
-            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, streamIndex);
-            // Take the track identity from the asset the sample came from, now;
-            // a cue that gets deferred or repeated later must keep going to the
-            // pin it belongs to. The stream index is renumbered on every MPT, so
-            // it is only a fallback for an asset without a component tag.
-            const int componentTag = streamComponentTag >= 0
-                ? streamComponentTag
-                : m_handler.getSubtitleComponentTag(streamIndex);
-
-            REFERENCE_TIME normPts = (pts >= 0 && m_firstPts >= 0) ? pts - m_firstPts : pts;
-            DumpSubtitleDataIfEnabled(streamIndex, callbackNo, normPts, d, sz, cue, stats);
-
-            const bool waitingForProgramStart =
-                m_subtitleResolver.AwaitingProgramStart() &&
-                m_subtitleResolver.ProgramStart() < 0;
-            if (cue.hasBegin && waitingForProgramStart) {
-                DeferredSubtitleSample sample;
-                sample.streamIndex = streamIndex;
-                sample.componentTag = componentTag;
-                sample.pts = pts;
-                sample.callbackNo = callbackNo;
-                sample.data.assign(d, d + sz);
-                m_deferredSubtitleSamples.push_back(std::move(sample));
-                if (m_deferredSubtitleSamples.size() > 32)
-                    m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
-                LogDetail(L"SUBTITLE CALLBACK deferred for EIT: callback=%ld streamIndex=%d waitEit=%d ttmlBegin=%I64d ms size=%zu\n",
-                          callbackNo,
-                          streamIndex,
-                          waitingForProgramStart ? 1 : 0,
-                          cue.begin / 10000,
-                          sz);
-                return;
-            }
-
-            if (cue.missingGlyph && !cue.text.empty()) {
-                DeferredSubtitleSample sample;
-                sample.streamIndex = streamIndex;
-                sample.componentTag = componentTag;
-                sample.pts = pts;
-                sample.callbackNo = callbackNo;
-                sample.data.assign(d, d + sz);
-                m_deferredSubtitleSamples.push_back(std::move(sample));
-                if (m_deferredSubtitleSamples.size() > 32)
-                    m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
-                LogDetail(L"SUBTITLE CALLBACK deferred for glyph: callback=%ld streamIndex=%d pts=%I64d ms size=%zu\n",
-                          callbackNo, streamIndex, normPts / 10000, sz);
-                return;
-            }
-
-            if (callbackNo <= 120 || cue.text.empty()) {
-                std::wstring preview = Utf8Preview(cue.text);
-                LogMsg(L"SUBTITLE CALLBACK #%ld: streamIndex=%d, pts=%I64d ms, ttmlBegin=%s%I64d ms, ttmlEnd=%s%I64d ms, size=%zu, divs=%zu, p=%zu, spans=%zu, textBytes=%zu, assEvents=%zu, assTextBytes=%zu, text=\"%s\"\n",
-                       callbackNo,
-                       streamIndex,
-                       normPts / 10000,
-                       cue.hasBegin ? L"" : L"none/",
-                       cue.begin / 10000,
-                       cue.hasEnd ? L"" : L"none/",
-                       cue.end / 10000,
-                       sz,
-                       stats.divs,
-                       stats.paragraphs,
-                       stats.spans,
-                       stats.textBytes,
-                       cue.assEvents.size(),
-                       cue.assText.size(),
-                       preview.c_str());
-            }
-
-            if (cue.text.empty()) {
-                size_t previewSize = sz < 16 ? sz : 16;
-                WCHAR hex[96]{};
-                WCHAR* cursor = hex;
-                size_t remaining = ARRAYSIZE(hex);
-                for (size_t i = 0; i < previewSize && remaining > 4; ++i) {
-                    HRESULT hr = StringCchPrintfW(cursor, remaining, L"%02X ", d[i]);
-                    if (FAILED(hr))
-                        break;
-                    size_t used = wcslen(cursor);
-                    cursor += used;
-                    remaining -= used;
-                }
-                // A document that carries no text is a clear. Live captioning
-                // streams send one between utterances, so honour it: end what is
-                // on this track instead of leaving the previous cue repeating
-                // until the next utterance turns up.
-                const REFERENCE_TIME clearAt = ToSegmentTime(SubtitleTimingAnchor(), m_segmentStart);
-                FlushPendingSubtitleCue(streamIndex, componentTag, clearAt);
-                LogMsg(L"SUBTITLE CALLBACK empty text #%ld: streamIndex=%d, componentTag=%d, cleared at %I64d ms, firstBytes=%s\n",
-                       callbackNo, streamIndex, componentTag, clearAt / 10000, hex);
-                return;
-            }
-
-            REFERENCE_TIME sampleStart;
-            REFERENCE_TIME sampleStop;
-            bool repeatUntilNextCue = false;
-            // A live captioning stream stamps every document begin="00:00:00.000"
-            // and relies on the moment it arrives instead. Resolving that against
-            // the TTML timeline maps every cue to the same media time, so they
-            // all pile up on one another. Treat it as untimed and use the
-            // arrival position, which is what such a stream means.
-            const bool timedCue = cue.hasBegin && cue.begin > 0;
-            if (timedCue) {
-                const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
-                const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
-                sampleStart = sourceBegin - subtitleTimeOffset;
-                if (cue.hasEnd) {
-                    sampleStop = SubtitleSourceTime(cue.end) - subtitleTimeOffset;
-                } else {
-                    REFERENCE_TIME nextBegin = -1;
-                    const long long lookaheadOffset = m_demuxByteOffset.load(std::memory_order_acquire);
-                    // The lookahead reads ahead on the demux thread, so its
-                    // cost stalls delivery; log it to spot slow storage.
-                    const ULONGLONG lookaheadStartMs = GetTickCount64();
-                    const bool foundNext = FindNextSubtitleBegin(streamIndex, packetId, componentTag,
-                                                                 cue.begin, lookaheadOffset, nextBegin);
-                    const ULONGLONG lookaheadMs = GetTickCount64() - lookaheadStartMs;
-                    if (foundNext) {
-                        sampleStop = SubtitleSourceTime(nextBegin) - subtitleTimeOffset;
-                        LogDetail(L"SUBTITLE lookahead: streamIndex=%d, current=%I64d ms, next=%I64d ms, byte=%I64d, took=%I64u ms\n",
-                                  streamIndex,
-                                  cue.begin / 10000,
-                                  nextBegin / 10000,
-                                  lookaheadOffset,
-                                  lookaheadMs);
-                    } else {
-                        sampleStop = sampleStart + kSubtitleChunkDuration;
-                        repeatUntilNextCue = true;
-                        LogDetail(L"SUBTITLE lookahead miss, pending chunk: streamIndex=%d, current=%I64d ms, byte=%I64d, took=%I64u ms\n",
-                                  streamIndex,
-                                  cue.begin / 10000,
-                                  lookaheadOffset,
-                                  lookaheadMs);
-                    }
-                }
-
-                // A caption must not outlive the package it came from. A
-                // recording that spans a channel change carries cues whose
-                // declared end reaches well past the change (28 s is normal for
-                // a caption that is meant to stay until the next one), and the
-                // next channel's picture would otherwise come up underneath it.
-                // Only the change where this cue's asset leaves the package
-                // counts; one that merely renumbers assets does not.
-                const REFERENCE_TIME boundary = NextMptChangeMediaTime(sampleStart, packetId);
-                if (boundary > 0 && sampleStop > boundary) {
-                    LogMsg(L"SUBTITLE clipped at MPT change: streamIndex=%d, componentTag=%d, start=%I64d ms, stop=%I64d -> %I64d ms\n",
-                              streamIndex, componentTag,
-                              sampleStart / 10000, sampleStop / 10000, boundary / 10000);
-                    sampleStop = boundary;
-                    repeatUntilNextCue = false;
-                }
-
-                sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
-                sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
-            } else {
-                // Untimed cue: it starts where it arrives, and it holds until
-                // the next cue of the track or a clear, the same way a receiver
-                // keeps an ARIB caption up.
-                REFERENCE_TIME anchor = SubtitleTimingAnchor();
-                sampleStart = ToSegmentTime(anchor, m_segmentStart);
-                sampleStop = sampleStart + kSubtitleChunkDuration;
-                repeatUntilNextCue = true;
-            }
-            // Start where the cue being replaced actually ends. Its last chunk
-            // was delivered ahead of the demux position and cannot be taken
-            // back, so beginning at the nominal time would put both captions on
-            // screen for the remainder of that chunk.
-            const REFERENCE_TIME paintedTo = PendingSubtitlePaintedTo(streamIndex, componentTag);
-            if (paintedTo > sampleStart) {
-                LogDetail(L"SUBTITLE start held for the previous cue: streamIndex=%d, componentTag=%d, start=%I64d -> %I64d ms\n",
-                          streamIndex, componentTag, sampleStart / 10000, paintedTo / 10000);
-                const REFERENCE_TIME duration = sampleStop - sampleStart;
-                sampleStart = paintedTo;
-                if (duration > 0)
-                    sampleStop = sampleStart + duration;
-            }
-
-            if (sampleStop <= sampleStart)
-                sampleStop = sampleStart + kDefaultSubtitleDuration;
-
-            FlushPendingSubtitleCue(streamIndex, componentTag, sampleStart);
-
-            if (repeatUntilNextCue) {
-                PendingSubtitleCue pending;
-                pending.streamIndex = streamIndex;
-                pending.componentTag = componentTag;
-                pending.packetId = packetId;
-                pending.start = sampleStart;
-                pending.nextChunkStart = sampleStart;
-                pending.assEvents = cue.assEvents;
-                pending.assText = cue.assText;
-                m_pendingSubtitleCues.push_back(std::move(pending));
-                LogDetail(L"SUBTITLE pending open: streamIndex=%d, componentTag=%d, start=%I64d ms, chunkStop=%I64d ms\n",
-                          streamIndex,
-                          componentTag,
-                          sampleStart / 10000,
-                          sampleStop / 10000);
-            } else {
-                DeliverSubtitleCue(streamIndex, componentTag, sampleStart, sampleStop, cue.assEvents, cue.assText);
-            }
-        });
+    });
 
     m_handler.setSubtitleResourceCallback(
         [this](int streamIndex, int dataType, int subsampleNumber, int lastSubsampleNumber,
@@ -4323,374 +4096,126 @@ REFERENCE_TIME CMmtTlvSplitter::SubtitleTimingAnchor() const
     return anchor;
 }
 
-REFERENCE_TIME CMmtTlvSplitter::SubtitleSourceTime(REFERENCE_TIME ttmlTime) const
+void CMmtTlvSplitter::ClearDeferredSubtitleDocuments()
 {
-    return m_subtitleResolver.SourceTime(ttmlTime);
-}
-
-REFERENCE_TIME CMmtTlvSplitter::ResolveSubtitleOffset(REFERENCE_TIME ttmlBegin, REFERENCE_TIME sourceBegin)
-{
-    // Subtitle samples have no MFU PTS, so synthesize a source timeline from
-    // EIT program start + TTML begin when possible. If an NTP/PCR anchor is
-    // available, align the first cue of each program to the latest PCR-derived
-    // media time and keep that offset for TTML spacing. dantto4k calibrated the
-    // same way when this was written; it has since moved to per-document
-    // anchoring - see SubtitleTimingResolver.h.
-    // offset maps subtitle source time
-    // -> normalized media time:
-    //   mediaStart = sourceBegin - offset
-    // See SubtitleTimingResolver.h for the actual state machine (shared with
-    // the offline diagnostic tools under tools/).
-    return m_subtitleResolver.ResolveOffset(ttmlBegin, sourceBegin, SubtitleTimingAnchor(),
-                                            m_currentPts.load(std::memory_order_acquire),
-                                            m_currentDts.load(std::memory_order_acquire),
-                                            m_segmentStart,
-                                            m_segmentTimeOffset.load(std::memory_order_acquire));
-}
-
-bool CMmtTlvSplitter::FindNextSubtitleBegin(int streamIndex, uint16_t packetId, int componentTag,
-                                            REFERENCE_TIME currentBegin,
-                                            long long startOffset, REFERENCE_TIME& nextBegin) const
-{
-    constexpr size_t kChunk = 1024 * 1024;
-    constexpr long long kMaxLookaheadBytes = 64LL * 1024 * 1024;
-    constexpr REFERENCE_TIME kMinGap = 10 * 10000LL;
-
-    nextBegin = -1;
-    if (startOffset < 0 || m_fileSize <= 0)
-        return false;
-
-    std::ifstream ifs(m_filename, std::ios::binary);
-    if (!ifs.is_open())
-        return false;
-
-    if (startOffset > static_cast<long long>(m_fileSize))
-        startOffset = static_cast<long long>(m_fileSize);
-    ifs.seekg(static_cast<std::streamoff>(startOffset));
-    if (!ifs.good())
-        return false;
-
-    bool found = false;
-    bool trackEnded = false;
-    CFilterDemuxerHandler handler;
-    handler.setSubtitleCallback(
-        [&](int si, uint16_t siPacketId, int siTag, long long, long long, const uint8_t* d, size_t sz) {
-            if (found || trackEnded)
-                return;
-
-            const int tag = siTag >= 0 ? siTag : handler.getSubtitleComponentTag(si);
-            if (packetId != 0) {
-                // Stop at a channel change: the same track now comes from
-                // another asset, so the caption's package has ended and it
-                // must not be stretched to the next cue, which is already
-                // part of the following channel. An MPT change that only
-                // renumbers assets keeps the asset, and the search goes on.
-                if (siPacketId != packetId) {
-                    if (componentTag >= 0 && tag == componentTag)
-                        trackEnded = true;
-                    return;
-                }
-            } else {
-                // Asset unknown: the old position-based check. Once the MPT no
-                // longer places this track where it was, treat the package as
-                // ended.
-                if (componentTag >= 0 && handler.getSubtitleStreamCount() > 0 &&
-                    handler.getSubtitleComponentTag(streamIndex) != componentTag) {
-                    trackEnded = true;
-                    return;
-                }
-                const bool sameTrack = (componentTag >= 0 && tag >= 0)
-                    ? tag == componentTag
-                    : si == streamIndex;
-                if (!sameTrack)
-                    return;
-            }
-
-            TtmlDebugStats stats;
-            TtmlTextCue cue = ExtractTtmlPlainText(d, sz, stats, si);
-            if (cue.hasBegin && cue.begin > currentBegin + kMinGap) {
-                nextBegin = cue.begin;
-                found = true;
-            }
-        });
-
-    MmtTlv::MmtTlvDemuxer demuxer;
-    demuxer.setDemuxerHandler(handler);
-
-    std::vector<uint8_t> buf;
-    buf.reserve(kChunk * 2);
-    long long readBytes = 0;
-
-    while (!found && !trackEnded && readBytes < kMaxLookaheadBytes) {
-        if (buf.size() < 2 * 1024 * 1024) {
-            size_t oldSz = buf.size();
-            buf.resize(oldSz + kChunk);
-            ifs.read(reinterpret_cast<char*>(buf.data() + oldSz), kChunk);
-            std::streamsize got = ifs.gcount();
-            buf.resize(oldSz + static_cast<size_t>(got));
-            readBytes += static_cast<long long>(got);
-            if (got == 0 && buf.empty())
-                break;
-        }
-
-        MmtTlv::Common::ReadStream stream(buf);
-        while (!found && !trackEnded && !stream.isEof()) {
-            auto status = demuxer.demux(stream);
-            if (status == MmtTlv::DemuxStatus::NotEnoughBuffer)
-                break;
-        }
-
-        size_t consumed = buf.size() - stream.leftBytes();
-        if (consumed > 0) {
-            buf.erase(buf.begin(), buf.begin() + consumed);
-        } else if (ifs.eof() || !ifs.good()) {
-            break;
-        } else {
-            break;
-        }
-    }
-
-    return found;
-}
-
-void CMmtTlvSplitter::ClearPendingSubtitleCues()
-{
-    m_pendingSubtitleCues.clear();
     m_deferredSubtitleSamples.clear();
+    m_scheduledSubtitleSamples.clear();
 }
 
-// Media time of the first MPT change after `afterMediaTime` at which the
-// subtitle asset `packetId` leaves the package, or -1 when there is none (or
-// no sidecar map to read it from). A change that keeps the asset - one that
-// only renumbers assets, e.g. a commentary audio asset appearing - is not an
-// end for its captions. With packetId 0, or an asset the map does not list on
-// either side of a change, every change counts, as before. Entry 0 of the map
-// is the MPT the file starts with, not a change, so it is skipped.
-REFERENCE_TIME CMmtTlvSplitter::NextMptChangeMediaTime(REFERENCE_TIME afterMediaTime,
-                                                       uint16_t packetId) const
+REFERENCE_TIME CMmtTlvSplitter::SubtitleProgramTime(REFERENCE_TIME absoluteTime) const
 {
-    if (m_firstPts < 0)
-        return -1;
+    if (IsMultiSegment())
+        return absoluteTime - m_origFirstPts - m_editSegments[m_curSegment].start + m_curSegmentBase;
+    return absoluteTime - m_firstPts;
+}
 
-    // LoadSidecarMap already rebased the map's times onto the map's own first
-    // video PTS when it knew it; otherwise they are still absolute. Either way
-    // put them on the timeline the samples use, which is pts - m_firstPts. The
-    // two first-PTS values differ by a few hundred ms because they are measured
-    // by different passes over the file.
-    const REFERENCE_TIME base = (m_mapFirstVideoPts >= 0)
-        ? m_mapFirstVideoPts - m_firstPts
-        : -m_firstPts;
-
-    auto carriesAsset = [packetId](const SidecarMapMptChange& change) {
-        return std::any_of(change.tracks.begin(), change.tracks.end(),
-            [packetId](const SidecarMapTrack& track) {
-                return track.type == "subtitle" && track.packetId == packetId;
+bool CMmtTlvSplitter::ProcessSubtitleDocument(
+    const CFilterDemuxerHandler::SubtitleStreamInfo& info,
+    const uint8_t* data, size_t size, LONG callbackNo,
+    const SubtitleFileIndex::Record* indexed)
+{
+    try {
+        if (!m_subtitleFileIndex) return true;
+        SubtitleFileIndex::Record record;
+        if (indexed) record = *indexed;
+        else if (!m_subtitleFileIndex->Resolve(m_demuxByteOffset.load(std::memory_order_acquire),
+                                              info.packetId, DsSubtitle::Hash(data, size), record)) {
+            LogMsg(L"SUBTITLE cannot establish display interval: packetId=0x%04X callback=%ld\n", info.packetId, callbackNo);
+            return true;
+        }
+        if (record.clear) {
+            std::erase_if(m_deferredSubtitleSamples, [&](const auto& sample) {
+                return sample.info.packetId == info.packetId;
             });
-    };
-
-    REFERENCE_TIME best = -1;
-    for (size_t i = 1; i < m_sidecarMapMptChanges.size(); ++i) {
-        const REFERENCE_TIME mediaTime = m_sidecarMapMptChanges[i].time + base;
-        if (mediaTime <= afterMediaTime || (best >= 0 && mediaTime >= best))
-            continue;
-        if (packetId != 0) {
-            const bool before = carriesAsset(m_sidecarMapMptChanges[i - 1]);
-            const bool after = carriesAsset(m_sidecarMapMptChanges[i]);
-            if (after && before)
-                continue; // the asset stays: not this cue's boundary
-            if (after && !before)
-                continue; // the asset starts here: nothing of it to end
+            return true; // earlier ASS intervals were already clipped by the index
         }
-        best = mediaTime;
+        const auto document = DsTtml::Parse(std::string(reinterpret_cast<const char*>(data), size),
+                                           DsSubtitle::Synchronized(record.control));
+        if (!indexed) {
+            TtmlDebugStats stats;
+            const auto preview = ExtractTtmlPlainText(document, stats, info.streamIndex);
+            DumpSubtitleDataIfEnabled(info.streamIndex, callbackNo, SubtitleProgramTime(record.arrival),
+                                      data, size, preview, stats);
+        }
+        const auto slices = DsTtml::Slices(document);
+        struct Delivery { REFERENCE_TIME start; REFERENCE_TIME stop; TtmlTextCue cue; };
+        std::vector<Delivery> deliveries;
+        bool missingGlyph = false;
+        for (const auto& slice : slices) {
+            REFERENCE_TIME start = (std::max)(record.start, record.base + static_cast<REFERENCE_TIME>(slice.begin) * 10000);
+            start = (std::max)(start, record.arrival);
+            REFERENCE_TIME stop = record.stop.value_or(record.arrival);
+            if (slice.end) stop = (std::min)(stop, record.base + static_cast<REFERENCE_TIME>(*slice.end) * 10000);
+            if (IsMultiSegment()) {
+                const auto& segment = m_editSegments[m_curSegment];
+                start = (std::max)(start, m_origFirstPts + segment.start);
+                stop = (std::min)(stop, m_origFirstPts + segment.end);
+            }
+            start = ToSegmentTime(SubtitleProgramTime(start), m_segmentStart);
+            stop = ToSegmentTime(SubtitleProgramTime(stop), m_segmentStart);
+            // A glyph arriving after a clear/end must never resurrect its cue.
+            if (indexed) start = (std::max)(start, ToSegmentTime(SubtitleTimingAnchor(), m_segmentStart));
+            if (stop <= start || stop <= 0) continue;
+            TtmlDebugStats stats;
+            TtmlTextCue cue = ExtractTtmlPlainText(slice.document, stats, info.streamIndex);
+            missingGlyph |= cue.missingGlyph;
+            if (!cue.text.empty()) deliveries.push_back({start, stop, std::move(cue)});
+        }
+        if (missingGlyph) {
+            if (!indexed) {
+                DeferredSubtitleSample sample;
+                sample.info = info;
+                sample.info.control = record.control;
+                sample.indexed = record;
+                sample.callbackNo = callbackNo;
+                sample.data.assign(data, data + size);
+                if (m_deferredSubtitleSamples.size() >= 32) m_deferredSubtitleSamples.erase(m_deferredSubtitleSamples.begin());
+                m_deferredSubtitleSamples.push_back(std::move(sample));
+            }
+            return false;
+        }
+        for (auto& delivery : deliveries) {
+            ScheduledSubtitleSample sample;
+            sample.streamIndex = info.streamIndex;
+            sample.componentTag = info.componentTag;
+            sample.start = delivery.start;
+            sample.stop = delivery.stop;
+            sample.assEvents = std::move(delivery.cue.assEvents);
+            sample.assText = std::move(delivery.cue.assText);
+            m_scheduledSubtitleSamples.push_back(std::move(sample));
+        }
+        std::stable_sort(m_scheduledSubtitleSamples.begin(), m_scheduledSubtitleSamples.end(),
+            [](const auto& a, const auto& b) { return a.start < b.start; });
+        PumpScheduledSubtitleSamples(ToSegmentTime(SubtitleTimingAnchor(), m_segmentStart));
+    } catch (const std::exception& e) {
+        LogMsg(L"SUBTITLE rejected document: packetId=0x%04X callback=%ld error=%S\n", info.packetId, callbackNo, e.what());
     }
-    return best;
+    return true;
 }
 
-// How far the pending cue of this track has already been painted, or -1 when
-// there is none. A sample handed to the renderer cannot be retracted, so this
-// is the earliest a replacement can start without the two overlapping.
-REFERENCE_TIME CMmtTlvSplitter::PendingSubtitlePaintedTo(int streamIndex, int componentTag) const
+void CMmtTlvSplitter::PumpScheduledSubtitleSamples(REFERENCE_TIME currentTime)
 {
-    for (const auto& cue : m_pendingSubtitleCues) {
-        const bool sameTrack = (componentTag >= 0 && cue.componentTag >= 0)
-            ? cue.componentTag == componentTag
-            : cue.streamIndex == streamIndex;
-        if (sameTrack)
-            return cue.nextChunkStart;
+    auto end = m_scheduledSubtitleSamples.begin();
+    constexpr REFERENCE_TIME lead = 200 * 10000LL;
+    while (end != m_scheduledSubtitleSamples.end() && end->start <= currentTime + lead) {
+        if (end->stop > currentTime)
+            DeliverSubtitleCue(end->streamIndex, end->componentTag, (std::max)(end->start, REFERENCE_TIME{0}),
+                               end->stop, end->assEvents, end->assText);
+        ++end;
     }
-    return -1;
-}
-
-// Whether the MPT in force still carries the asset the cue came from. A change
-// that only renumbers assets keeps it; a channel change replaces it. Unknown
-// mappings count as current, so a cue is never dropped just because the
-// subtitle list has not been filled in yet. Without a packetId, fall back to
-// whether this component tag still sits at the stream index the cue arrived on.
-bool CMmtTlvSplitter::SubtitleTrackStillCurrent(int streamIndex, uint16_t packetId,
-                                                int componentTag) const
-{
-    if (m_handler.getSubtitleStreamCount() == 0)
-        return true;
-    if (packetId != 0)
-        return m_handler.hasSubtitlePacket(packetId);
-    if (componentTag < 0)
-        return true;
-    return m_handler.getSubtitleComponentTag(streamIndex) == componentTag;
-}
-
-void CMmtTlvSplitter::FlushPendingSubtitleCue(int streamIndex, int componentTag,
-                                              REFERENCE_TIME stopTime)
-{
-    for (auto it = m_pendingSubtitleCues.begin(); it != m_pendingSubtitleCues.end();) {
-        // Close the pending cue of the same track. Match on the component tag,
-        // because across a channel change the next cue of a track turns up on a
-        // different stream index and would otherwise leave the previous cue
-        // repeating forever.
-        const bool sameTrack = (componentTag >= 0 && it->componentTag >= 0)
-            ? it->componentTag == componentTag
-            : it->streamIndex == streamIndex;
-        if (!sameTrack) {
-            ++it;
-            continue;
-        }
-
-        if (stopTime > it->nextChunkStart) {
-            DeliverSubtitleCue(it->streamIndex, it->componentTag, it->nextChunkStart, stopTime,
-                               it->assEvents, it->assText);
-            LogDetail(L"SUBTITLE pending close deliver: streamIndex=%d, start=%I64d ms, stop=%I64d ms\n",
-                      streamIndex,
-                      it->nextChunkStart / 10000,
-                      stopTime / 10000);
-        } else {
-            LogDetail(L"SUBTITLE pending closed: streamIndex=%d, stop=%I64d ms, next=%I64d ms\n",
-                      streamIndex,
-                      stopTime / 10000,
-                      it->nextChunkStart / 10000);
-        }
-        it = m_pendingSubtitleCues.erase(it);
-    }
-}
-
-void CMmtTlvSplitter::FlushAllPendingSubtitleCues(REFERENCE_TIME stopTime)
-{
-    for (const auto& cue : m_pendingSubtitleCues) {
-        if (stopTime > cue.nextChunkStart) {
-            DeliverSubtitleCue(cue.streamIndex, cue.componentTag, cue.nextChunkStart, stopTime,
-                               cue.assEvents, cue.assText);
-            LogDetail(L"SUBTITLE pending final deliver: streamIndex=%d, start=%I64d ms, stop=%I64d ms\n",
-                      cue.streamIndex,
-                      cue.nextChunkStart / 10000,
-                      stopTime / 10000);
-        }
-    }
-    m_pendingSubtitleCues.clear();
+    m_scheduledSubtitleSamples.erase(m_scheduledSubtitleSamples.begin(), end);
 }
 
 void CMmtTlvSplitter::ProcessDeferredSubtitleSamples()
 {
-    if (m_deferredSubtitleSamples.empty())
-        return;
-
-    std::vector<DeferredSubtitleSample> remaining;
-    for (const auto& sample : m_deferredSubtitleSamples) {
-        TtmlDebugStats stats;
-        TtmlTextCue cue = ExtractTtmlPlainText(sample.data.data(), sample.data.size(), stats, sample.streamIndex);
-        if (cue.hasBegin) {
-            const bool waitingForProgramStart =
-                m_subtitleResolver.AwaitingProgramStart() &&
-                m_subtitleResolver.ProgramStart() < 0;
-            if (waitingForProgramStart) {
-                remaining.push_back(sample);
-                continue;
-            }
-        }
-        if (cue.missingGlyph) {
-            remaining.push_back(sample);
-            continue;
-        }
-        if (cue.text.empty())
-            continue;
-
-        REFERENCE_TIME sampleStart = 0;
-        REFERENCE_TIME sampleStop = 0;
-        if (cue.hasBegin) {
-            const REFERENCE_TIME sourceBegin = SubtitleSourceTime(cue.begin);
-            const REFERENCE_TIME subtitleTimeOffset = ResolveSubtitleOffset(cue.begin, sourceBegin);
-            sampleStart = sourceBegin - subtitleTimeOffset;
-            sampleStop = cue.hasEnd ? SubtitleSourceTime(cue.end) - subtitleTimeOffset
-                                    : sampleStart + kDefaultSubtitleDuration;
-            sampleStart = ToSegmentTime(sampleStart, m_segmentStart);
-            sampleStop = ToSegmentTime(sampleStop, m_segmentStart);
-        } else {
-            // No TTML begin: use the same stable anchor as timed cues.
-            REFERENCE_TIME anchor = SubtitleTimingAnchor();
-            sampleStart = ToSegmentTime(anchor, m_segmentStart);
-            sampleStop = sampleStart + kDefaultSubtitleDuration;
-        }
-
-        if (sampleStop <= sampleStart)
-            sampleStop = sampleStart + kDefaultSubtitleDuration;
-
-        FlushPendingSubtitleCue(sample.streamIndex, sample.componentTag, sampleStart);
-        DeliverSubtitleCue(sample.streamIndex, sample.componentTag, sampleStart, sampleStop, cue.assEvents, cue.assText);
-        LogDetail(L"SUBTITLE deferred delivered: callback=%ld streamIndex=%d start=%I64d ms stop=%I64d ms\n",
-                  sample.callbackNo, sample.streamIndex, sampleStart / 10000, sampleStop / 10000);
-    }
-
-    m_deferredSubtitleSamples.swap(remaining);
-}
-
-void CMmtTlvSplitter::PumpPendingSubtitleChunks(REFERENCE_TIME currentTime)
-{
-    if (currentTime < 0 || m_pendingSubtitleCues.empty())
-        return;
-
-    for (auto it = m_pendingSubtitleCues.begin(); it != m_pendingSubtitleCues.end();) {
-        auto& cue = *it;
-
-        // A cue with no end time repeats until the next cue of the same track
-        // arrives. When the recording spans a channel change that next cue can
-        // be a long way off, so also stop repeating as soon as the MPT no
-        // longer carries the asset the cue came from - otherwise the last
-        // caption of the previous channel keeps showing over the new one.
-        if (!SubtitleTrackStillCurrent(cue.streamIndex, cue.packetId, cue.componentTag)) {
-            if (currentTime > cue.nextChunkStart) {
-                DeliverSubtitleCue(cue.streamIndex, cue.componentTag, cue.nextChunkStart,
-                                   currentTime, cue.assEvents, cue.assText);
-            }
-            LogDetail(L"SUBTITLE pending dropped after MPT change: streamIndex=%d, componentTag=%d, stop=%I64d ms\n",
-                      cue.streamIndex, cue.componentTag, currentTime / 10000);
-            it = m_pendingSubtitleCues.erase(it);
-            continue;
-        }
-
-        // A cue whose start ended up behind the demux position would otherwise
-        // be walked forward one chunk at a time, emitting hundreds of samples
-        // that are all in the past. Skip to where it can still be seen.
-        if (cue.nextChunkStart + kSubtitleChunkDuration < currentTime) {
-            LogDetail(L"SUBTITLE pending skipped forward: streamIndex=%d, next=%I64d -> %I64d ms\n",
-                      cue.streamIndex, cue.nextChunkStart / 10000, currentTime / 10000);
-            cue.nextChunkStart = currentTime;
-        }
-
-        // Deliver a chunk as the demux position reaches its start. Waiting for
-        // its end (nextChunkStart + duration <= currentTime) handed the renderer
-        // every chunk after its display window had already passed, so the cue
-        // blinked instead of staying up. The first chunk is no different: its
-        // own delay used to be longer than a chunk now is.
-        while (cue.nextChunkStart <= currentTime) {
-            REFERENCE_TIME chunkStart = cue.nextChunkStart;
-            REFERENCE_TIME chunkStop = chunkStart + kSubtitleChunkDuration;
-            DeliverSubtitleCue(cue.streamIndex, cue.componentTag, chunkStart, chunkStop, cue.assEvents, cue.assText);
-            cue.nextChunkStart = chunkStop;
-            LogDetail(L"SUBTITLE pending repeat: streamIndex=%d, start=%I64d ms, stop=%I64d ms, current=%I64d ms\n",
-                      cue.streamIndex,
-                      chunkStart / 10000,
-                      chunkStop / 10000,
-                      currentTime / 10000);
-        }
-
-        ++it;
+    // Move the list aside: delivery can invalidate a sample, and waiting ones
+    // are returned explicitly rather than mutating a vector during iteration.
+    auto samples = std::move(m_deferredSubtitleSamples);
+    m_deferredSubtitleSamples.clear();
+    for (auto& sample : samples) {
+        if (!sample.indexed.stop || SubtitleProgramTime(*sample.indexed.stop) <= SubtitleTimingAnchor()) continue;
+        if (!ProcessSubtitleDocument(sample.info, sample.data.data(), sample.data.size(), sample.callbackNo, &sample.indexed))
+            m_deferredSubtitleSamples.push_back(std::move(sample));
     }
 }
 
@@ -4877,8 +4402,7 @@ void CMmtTlvSplitter::SeekTo(REFERENCE_TIME pos)
     m_seekTarget = pos;
     m_currentPts = pos;   // normalised position (0-based)
     m_currentDts = -1;
-    m_subtitleResolver.Reset(pos > 0);
-    ClearPendingSubtitleCues();
+    ClearDeferredSubtitleDocuments();
 
     // Keep stream registration intact across seek so video starts faster.
     m_demuxer.resetStreams();
@@ -4907,6 +4431,10 @@ void CMmtTlvSplitter::DemuxLoop()
         return;
     }
 
+    if (!m_subtitleFileIndex) {
+        m_subtitleFileIndex = std::make_unique<SubtitleFileIndex>(m_filename, m_origFirstPts,
+            [this] { return !m_active.load() || WaitForSingleObject(m_hStop, 0) == WAIT_OBJECT_0; });
+    }
     REFERENCE_TIME seekTarget = m_seekTarget;
     REFERENCE_TIME sourceSeekTarget;
     if (IsMultiSegment()) {
@@ -4923,8 +4451,7 @@ void CMmtTlvSplitter::DemuxLoop()
     }
     m_segmentStart = seekTarget;
     m_segmentTimeOffset.store(0, std::memory_order_release);
-    m_subtitleResolver.Reset(sourceSeekTarget > 0);
-    ClearPendingSubtitleCues();
+    ClearDeferredSubtitleDocuments();
     const bool waitForRap = sourceSeekTarget > 0;
     m_waitingForVideoRap.store(waitForRap, std::memory_order_release);
     for (auto* pin : m_pins) {
@@ -5026,6 +4553,7 @@ void CMmtTlvSplitter::DemuxLoop()
                 break; // -> EOS below
             }
             if (jump >= 0 && jump < static_cast<int>(m_editSegments.size())) {
+                ClearDeferredSubtitleDocuments();
                 m_curSegment = jump;
                 m_curSegmentBase = SegmentBase(jump);
                 const REFERENCE_TIME srcRel = m_editSegments[jump].start;
@@ -5061,7 +4589,7 @@ void CMmtTlvSplitter::DemuxLoop()
     }
 
     if (!m_isSeeking) {
-        FlushAllPendingSubtitleCues(m_currentPts.load(std::memory_order_relaxed));
+        ProcessDeferredSubtitleSamples();
         for (auto* pin : m_pins)
             pin->DeliverEOS();
     }

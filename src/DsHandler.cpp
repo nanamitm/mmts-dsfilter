@@ -1,5 +1,6 @@
 #include "DsHandler.h"
 #include "DebugLog.h"
+#include "SubtitleDocumentState.h"
 #include "mmtStream.h"
 #include "mpt.h"
 #include "mhEit.h"
@@ -725,7 +726,8 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 if (discoveredSubtitles[i].streamIndex != m_subtitleStreams[i].streamIndex ||
                     discoveredSubtitles[i].packetId != m_subtitleStreams[i].packetId ||
                     discoveredSubtitles[i].componentTag != m_subtitleStreams[i].componentTag ||
-                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData) {
+                    discoveredSubtitles[i].hasData != m_subtitleStreams[i].hasData ||
+                    !DsSubtitle::SameControl(discoveredSubtitles[i].control, m_subtitleStreams[i].control)) {
                     changed = true;
                     break;
                 }
