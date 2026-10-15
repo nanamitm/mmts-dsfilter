@@ -79,6 +79,8 @@ The filter is produced as:
 msvc\x64\<Configuration>\mmts-dsfilter.ax
 ```
 
+Before building, `tools/generate-version-header.ps1` writes the version this build comes from (`git describe --tags --always --dirty`, e.g. `v20261015-6-gc8a6086`) to `src/MmtsDsfilterVersion.h`, which is not committed (like TVTest's `TVTestVersionHashGen.bat`). It shows in the file properties of `mmts-dsfilter.ax` (Details tab) and in the debug log. Without git it is `unknown`.
+
 ## Debug Helper Tools
 
 `tools/mmts_audio_split.exe` scans MPT audio layout changes and reports whether
