@@ -37,6 +37,19 @@ jobs:
         working-directory: mmts-dsfilter
         run: ./build.ps1 -Configuration Release
 
+      # Regression tests against the Release objects just built and the pinned
+      # dantto4k checkout beside this repository. Fixtures are generated.
+      - name: Run regression tests
+        shell: pwsh
+        working-directory: mmts-dsfilter
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & .\tools\run_subtitle_state_test.cmd
+          if ($LASTEXITCODE -ne 0) { throw "subtitle_state_test failed with exit code $LASTEXITCODE" }
+          foreach ($test in 'subtitle_file_index_test', 'subtitle_render_test', 'playback_state_test') {
+            ./tools/run_subtitle_file_index_test.ps1 -Test $test
+          }
+
       - name: Verify debug file logging is disabled by default
         shell: pwsh
         working-directory: mmts-dsfilter
