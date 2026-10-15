@@ -90,6 +90,11 @@
         %(AdditionalDependencies)
       </AdditionalDependencies>
     </Link>
+    <!-- The version this build comes from (git describe), like TVTest's TVTestVersionHashGen.bat -->
+    <PreBuildEvent>
+      <Command>powershell -NoProfile -ExecutionPolicy Bypass -File "$(ProjectDir)..\tools\generate-version-header.ps1" -OutFile "$(ProjectDir)..\src\MmtsDsfilterVersion.h" -Name MMTS_DSFILTER</Command>
+      <Message>Generating MmtsDsfilterVersion.h</Message>
+    </PreBuildEvent>
   </ItemDefinitionGroup>
 
   <!-- ==================== Debug ==================== -->
@@ -115,6 +120,11 @@
       <OutputFile>$(TargetPath)</OutputFile>
     </Link>
   </ItemDefinitionGroup>
+
+  <!-- ==================== Version resource ==================== -->
+  <ItemGroup>
+    <ResourceCompile Include="mmts-dsfilter.rc" />
+  </ItemGroup>
 
   <!-- ==================== Filter source ==================== -->
   <ItemGroup>

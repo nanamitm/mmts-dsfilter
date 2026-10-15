@@ -4,6 +4,15 @@
 #include "stream.h"     // MmtTlv::Common::ReadStream
 #include "TtmlModel.h"
 #include "ttml/drcs.h"
+// The version this build comes from. The Visual Studio project writes the
+// header before building (tools/generate-version-header.ps1), the way
+// TVTest's TVTestVersionHashGen.bat does; other builds do without it.
+#if __has_include("MmtsDsfilterVersion.h")
+#include "MmtsDsfilterVersion.h"
+#endif
+#ifndef MMTS_DSFILTER_VERSION_STRING_W
+#define MMTS_DSFILTER_VERSION_STRING_W L"unknown"
+#endif
 #include <fstream>
 #include <strmif.h>
 #include <cwchar>
@@ -376,6 +385,7 @@ static void ConfigureMmtsDebugLoggingFromIni()
         playbackTraceWindowMs = _wtoi64(traceWindow);
 
     MmtTlvConfigureDebugLog(debugLogPath, verboseLog, playbackTraceCenterMs, playbackTraceWindowMs);
+    MmtTlvLogInfo(L"mmts-dsfilter %s\n", MMTS_DSFILTER_VERSION_STRING_W);
 }
 
 static MmtsCaptionSettings GetMmtsCaptionSettings()
