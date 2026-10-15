@@ -13,7 +13,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # build.ps1 and the test runners use the v143 (Visual Studio 2022)
+    # toolset; windows-latest moves to newer Visual Studio images that need
+    # not carry it.
+    runs-on: windows-2022
 
     steps:
       - name: Checkout mmts-dsfilter
