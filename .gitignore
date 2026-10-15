@@ -52,3 +52,6 @@ tools/*.exe
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# Written before each build by tools/generate-version-header.ps1
+src/MmtsDsfilterVersion.h
