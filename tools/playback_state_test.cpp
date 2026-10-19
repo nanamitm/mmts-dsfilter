@@ -1,5 +1,6 @@
 // Exercises production callbacks and queued DirectShow samples without a decoder.
 #include <streams.h>
+#include <dvdmedia.h>
 #include "DsHandler.h"
 #include "MmtTlvOutputPin.h"
 #include "SubtitleFileIndex.h"
@@ -21,7 +22,10 @@ static bool waitFor(const std::function<bool()>& condition) {
     do { if (condition()) return true; Sleep(1); } while (GetTickCount64() < end);
     return false;
 }
-struct Captured { REFERENCE_TIME pts; bool preroll; bool discontinuity; };
+struct Captured {
+    REFERENCE_TIME pts; bool preroll; bool discontinuity;
+    REFERENCE_TIME stop; REFERENCE_TIME framePeriod; DWORD aspectX; DWORD aspectY;
+};
 class CapturePin : public CBaseInputPin {
 public:
     CapturePin(CBaseFilter* filter, CCritSec* lock, HRESULT* hr)
@@ -34,7 +38,17 @@ public:
         const HRESULT hr = sample->GetTime(&start, &stop);
         if (FAILED(hr)) return hr;
         std::lock_guard<std::mutex> guard(mutex);
-        samples.push_back({start, sample->IsPreroll() == S_OK, sample->IsDiscontinuity() == S_OK});
+        REFERENCE_TIME period=0; DWORD aspectX=0, aspectY=0;
+        AM_MEDIA_TYPE* updated=nullptr;
+        if (sample->GetMediaType(&updated)==S_OK && updated) {
+            if (updated->formattype==FORMAT_VideoInfo2 && updated->cbFormat>=sizeof(VIDEOINFOHEADER2)) {
+                const auto* video=reinterpret_cast<const VIDEOINFOHEADER2*>(updated->pbFormat);
+                period=video->AvgTimePerFrame; aspectX=video->dwPictAspectRatioX; aspectY=video->dwPictAspectRatioY;
+            }
+            DeleteMediaType(updated);
+        }
+        samples.push_back({start, sample->IsPreroll() == S_OK, sample->IsDiscontinuity() == S_OK,
+                           stop, period, aspectX, aspectY});
         return S_OK;
     }
     std::vector<Captured> snapshot() {
@@ -125,6 +139,33 @@ int wmain(int argc, wchar_t** argv) {
     try {
         require(SUCCEEDED(com), "COM startup");
         constexpr REFERENCE_TIME sec = 10000000;
+        {
+            // A 4:3/50fps service must carry its attributes through connection
+            // negotiation and real queued IMediaSample delivery.
+            HRESULT hr=S_OK; CMmtTlvSplitter metadata(nullptr,&hr);
+            CFilterDemuxerHandler::VideoStreamInfo info{0,0x100,0,1440,1080,true,50,1,4,3};
+            metadata.m_videoWidth=1440; metadata.m_videoHeight=1080;
+            metadata.m_handler.setKnownVideoStreams({info}); metadata.CreatePins(); CMediaType mt;
+            require(SUCCEEDED(metadata.m_pins[0]->GetMediaType(0,&mt)),"get descriptor-based video format");
+            const auto* format=reinterpret_cast<const VIDEOINFOHEADER2*>(mt.Format());
+            require(format->AvgTimePerFrame==200000 && format->dwPictAspectRatioX==4 && format->dwPictAspectRatioY==3,
+                    "initial connection must advertise 50fps and 4:3");
+            Fixture fixture; fixture.filter->m_firstPts=0; fixture.filter->m_videoWidth=1440; fixture.filter->m_videoHeight=1080;
+            fixture.filter->m_handler.setKnownVideoStreams({info}); fixture.feed(0,0,true); fixture.feed(.02,.02,false); fixture.count(2);
+            auto delivered=fixture.sink->pin->snapshot();
+            require(delivered[1].pts-delivered[0].pts==200000 && delivered[0].stop-delivered[0].pts==200000 &&
+                    delivered[1].stop-delivered[1].pts==200000,"50fps sample duration must agree with PTS spacing");
+            require(delivered[0].framePeriod==200000 && delivered[0].aspectX==4 && delivered[0].aspectY==3,
+                    "connected pin must notify changed attributes on the sample");
+            info.frameRateNumerator=60000; info.frameRateDenominator=1001; info.aspectX=16; info.aspectY=9;
+            fixture.filter->m_handler.setKnownVideoStreams({info}); fixture.feed(.04,.04,false); fixture.count(3);
+            delivered=fixture.sink->pin->snapshot();
+            require(delivered[2].stop-delivered[2].pts==166833 && delivered[2].framePeriod==166833 &&
+                    delivered[2].aspectX==16 && delivered[2].aspectY==9,"59.94fps/16:9 update must reach downstream");
+            info.frameRateNumerator=24000; fixture.filter->m_handler.setKnownVideoStreams({info});
+            fixture.feed(.08,.08,false); fixture.count(4); delivered=fixture.sink->pin->snapshot();
+            require(delivered[3].stop-delivered[3].pts==417083,"23.976fps must retain the /1001 denominator");
+        }
         {
             HRESULT hr = S_OK; CMmtTlvSplitter filter(nullptr, &hr);
             filter.m_filename = std::wstring(argv[1]) + L"\\playback_fixture.mmts";

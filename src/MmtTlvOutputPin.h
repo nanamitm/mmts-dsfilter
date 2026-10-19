@@ -51,7 +51,8 @@ public:
     HRESULT DeliverEOS();
 
     // Called by the filter to set stream metadata before connection.
-    void SetVideoInfo(int width, int height) { m_width = width; m_height = height; }
+    void SetVideoInfo(int width, int height, uint32_t frameRateNumerator = 0,
+                      uint32_t frameRateDenominator = 1, uint32_t aspectX = 0, uint32_t aspectY = 0);
     void SetAudioInfo(int sampleRate, int channels, int bitdepth = 16, bool latm = false,
                       const std::vector<uint8_t>& extraData = {})
         { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; m_audioLatm = latm; m_audioPcm = false; m_audioExtraData = extraData; }
@@ -116,6 +117,10 @@ private:
     // Video
     int m_width{3840};
     int m_height{2160};
+    REFERENCE_TIME m_videoFrameDuration{166667};
+    uint32_t m_videoAspectX{16};
+    uint32_t m_videoAspectY{9};
+    bool m_videoFormatChanged{false};
     std::vector<uint8_t> m_hevcExtradata;
 
     // Audio

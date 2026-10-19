@@ -3955,13 +3955,24 @@ void CMmtTlvSplitter::CreatePins()
 
     auto videoPin = m_pins[0];
 
-    videoPin->SetVideoInfo(m_videoWidth, m_videoHeight);
+    if (const auto info = m_handler.getSelectedVideoStream()) {
+        videoPin->SetVideoInfo(m_videoWidth, m_videoHeight, info->frameRateNumerator,
+                              info->frameRateDenominator, info->aspectX, info->aspectY);
+    } else {
+        videoPin->SetVideoInfo(m_videoWidth, m_videoHeight);
+    }
     if (!m_hevcExtradata.empty())
         videoPin->SetHevcExtradata(m_hevcExtradata);
 
     m_handler.setVideoCallback(
         [videoPin, this](int, bool key, long long pts, long long dts,
                          bool first, bool last, const uint8_t* d, size_t sz) {
+            if (first) {
+                if (const auto info = m_handler.getSelectedVideoStream()) {
+                    videoPin->SetVideoInfo(m_videoWidth, m_videoHeight, info->frameRateNumerator,
+                                          info->frameRateDenominator, info->aspectX, info->aspectY);
+                }
+            }
             REFERENCE_TIME normPts, normDts;
             bool editPreroll = false;
             if (IsMultiSegment()) {
@@ -4971,7 +4982,8 @@ STDMETHODIMP CMmtTlvSplitter::Enable(long lIndex, DWORD dwFlags)
                     m_videoWidth = selected.width;
                     m_videoHeight = selected.height;
                     for (auto* pin : m_pins)
-                        if (pin->IsVideo()) pin->SetVideoInfo(selected.width, selected.height);
+                        if (pin->IsVideo()) pin->SetVideoInfo(selected.width, selected.height,
+                            selected.frameRateNumerator, selected.frameRateDenominator, selected.aspectX, selected.aspectY);
                 }
             }
         } else {

@@ -75,6 +75,28 @@ static void VideoResolutionSize(uint8_t videoResolution, uint8_t videoAspectRati
         *height = h;
 }
 
+static void ApplyVideoDescriptor(CFilterDemuxerHandler::VideoStreamInfo& info,
+                                 const MmtTlv::VideoComponentDescriptor& descriptor)
+{
+    VideoResolutionSize(descriptor.videoResolution, descriptor.videoAspectRatio, &info.width, &info.height);
+    // STD-B60 Table 7-50; preserve the rational rate (including /1.001).
+    static constexpr uint32_t rates[][2] = {
+        {0,1}, {15,1}, {24000,1001}, {24,1}, {25,1}, {30000,1001}, {30,1},
+        {50,1}, {60000,1001}, {60,1}, {100,1}, {120000,1001}, {120,1}
+    };
+    if (descriptor.videoFrameRate < std::size(rates)) {
+        info.frameRateNumerator = rates[descriptor.videoFrameRate][0];
+        info.frameRateDenominator = rates[descriptor.videoFrameRate][1];
+    }
+    if (descriptor.videoAspectRatio == 1) { info.aspectX = 4; info.aspectY = 3; }
+    else if (descriptor.videoAspectRatio == 2 || descriptor.videoAspectRatio == 3) {
+        info.aspectX = 16; info.aspectY = 9;
+    }
+    // Unspecified/wider-than-16:9 needs the coded dimensions/SAR; do not
+    // advertise an invented 4:3 width from this descriptor alone.
+    else { info.width = 0; }
+}
+
 static bool SameVideoIdentity(const CFilterDemuxerHandler::VideoStreamInfo& a,
                               const CFilterDemuxerHandler::VideoStreamInfo& b)
 {
@@ -212,8 +234,7 @@ void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
     info.componentTag = stream.getComponentTag();
     info.hasData = true;
     if (auto desc = stream.getVideoComponentDescriptor()) {
-        VideoResolutionSize(desc->get().videoResolution, desc->get().videoAspectRatio,
-                            &info.width, &info.height);
+        ApplyVideoDescriptor(info, desc->get());
     }
 
     auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
@@ -223,7 +244,12 @@ void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
     if (it != m_videoStreams.end()) {
         it->streamIndex = info.streamIndex;
         it->hasData = true;
-        if (info.height > 0) {
+        if (info.frameRateNumerator > 0) {
+            it->frameRateNumerator = info.frameRateNumerator;
+            it->frameRateDenominator = info.frameRateDenominator;
+        }
+        if (info.aspectX > 0) { it->aspectX = info.aspectX; it->aspectY = info.aspectY; }
+        if (info.width > 0 && info.height > 0) {
             it->width = info.width;
             it->height = info.height;
         }
@@ -268,6 +294,16 @@ int CFilterDemuxerHandler::getSelectedVideoStreamIndex() const
         }
     }
     return -1;
+}
+
+std::optional<CFilterDemuxerHandler::VideoStreamInfo> CFilterDemuxerHandler::getSelectedVideoStream() const
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    if (!m_hasSelectedVideoStream) return std::nullopt;
+    const auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(), [this](const auto& stream) {
+        return stream.packetId == m_selectedVideoPacketId;
+    });
+    return it == m_videoStreams.end() ? std::nullopt : std::optional<VideoStreamInfo>(*it);
 }
 
 bool CFilterDemuxerHandler::isSelectedVideoStream(size_t listIndex) const
@@ -657,8 +693,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 {
                     const auto* video = static_cast<const MmtTlv::VideoComponentDescriptor*>(descriptor.get());
                     info.componentTag = video->componentTag;
-                    VideoResolutionSize(video->videoResolution, video->videoAspectRatio,
-                                        &info.width, &info.height);
+                    ApplyVideoDescriptor(info, *video);
                     break;
                 }
                 }
@@ -738,7 +773,11 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                     discoveredVideos[i].packetId != m_videoStreams[i].packetId ||
                     discoveredVideos[i].componentTag != m_videoStreams[i].componentTag ||
                     discoveredVideos[i].width != m_videoStreams[i].width ||
-                    discoveredVideos[i].height != m_videoStreams[i].height) {
+                    discoveredVideos[i].height != m_videoStreams[i].height ||
+                    discoveredVideos[i].frameRateNumerator != m_videoStreams[i].frameRateNumerator ||
+                    discoveredVideos[i].frameRateDenominator != m_videoStreams[i].frameRateDenominator ||
+                    discoveredVideos[i].aspectX != m_videoStreams[i].aspectX ||
+                    discoveredVideos[i].aspectY != m_videoStreams[i].aspectY) {
                     changed = true;
                     break;
                 }

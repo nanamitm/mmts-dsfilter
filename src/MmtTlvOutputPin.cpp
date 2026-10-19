@@ -5,6 +5,7 @@
 #include <dvdmedia.h>   // VIDEOINFOHEADER2
 #include <algorithm>
 #include <atomic>
+#include <numeric>
 
 struct SUBTITLEINFO {
     DWORD dwOffset;
@@ -165,6 +166,25 @@ void CMmtTlvOutputPin::SetWaitForVideoRap(bool wait)
     LogPinMsg(L"MMT/TLV Video wait for RAP %s\n", wait ? L"enabled" : L"disabled");
 }
 
+void CMmtTlvOutputPin::SetVideoInfo(int width, int height, uint32_t numerator,
+                                   uint32_t denominator, uint32_t aspectX, uint32_t aspectY)
+{
+    const REFERENCE_TIME duration = numerator && denominator
+        ? (10000000LL * denominator + numerator / 2) / numerator : 166667;
+    if (!aspectX || !aspectY) {
+        if (width > 0 && height > 0) {
+            const int divisor = std::gcd(width, height);
+            aspectX = width / divisor; aspectY = height / divisor;
+        } else { aspectX = 16; aspectY = 9; }
+    }
+    const bool changed = width != m_width || height != m_height || duration != m_videoFrameDuration ||
+        aspectX != m_videoAspectX || aspectY != m_videoAspectY;
+    m_width = width; m_height = height; m_videoFrameDuration = duration;
+    m_videoAspectX = aspectX; m_videoAspectY = aspectY;
+    // Notify an already connected decoder with the next complete sample.
+    if (changed && IsConnected()) m_videoFormatChanged = true;
+}
+
 HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
 {
     if (iPosition < 0) return E_INVALIDARG;
@@ -183,7 +203,7 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
         if (!vih) return E_OUTOFMEMORY;
         ZeroMemory(vih, fmtSize);
 
-        vih->AvgTimePerFrame         = 166667; // default 60fps in 100ns units
+        vih->AvgTimePerFrame         = m_videoFrameDuration;
         vih->bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
         vih->bmiHeader.biWidth       = m_width;
         vih->bmiHeader.biHeight      = m_height;
@@ -191,8 +211,8 @@ HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
         vih->bmiHeader.biBitCount    = 24;
         vih->bmiHeader.biCompression = MAKEFOURCC('H','E','V','C');
         vih->bmiHeader.biSizeImage   = m_width * m_height * 3 / 2;
-        vih->dwPictAspectRatioX      = 16;
-        vih->dwPictAspectRatioY      = 9;
+        vih->dwPictAspectRatioX      = m_videoAspectX;
+        vih->dwPictAspectRatioY      = m_videoAspectY;
         SetRect(&vih->rcSource, 0, 0, m_width, m_height);
         SetRect(&vih->rcTarget, 0, 0, m_width, m_height);
 
@@ -559,6 +579,14 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         return S_OK;
     }
 
+    if (m_isVideo && m_videoFormatChanged) {
+        CMediaType updated;
+        hr = GetMediaType(0, &updated);
+        if (SUCCEEDED(hr)) hr = pSample->SetMediaType(&updated);
+        if (SUCCEEDED(hr)) hr = CBaseOutputPin::SetMediaType(&updated);
+        if (FAILED(hr)) { pSample->Release(); return hr; }
+        m_videoFormatChanged = false;
+    }
     memcpy(pBuf, m_accum.data(), m_accum.size());
     pSample->SetActualDataLength(static_cast<LONG>(m_accum.size()));
 
@@ -566,7 +594,7 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         REFERENCE_TIME rtStart = m_accumPts;
         REFERENCE_TIME rtEnd;
         if (m_isVideo) {
-            rtEnd = rtStart + 166667; // 60fps duration in 100ns units
+            rtEnd = rtStart + m_videoFrameDuration;
         } else if (m_audioPcm) {
             const int blockAlign = (std::max)(1, (m_channels * m_bitdepth) / 8);
             const size_t samples = m_accum.size() / static_cast<size_t>(blockAlign);

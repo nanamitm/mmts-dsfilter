@@ -32,6 +32,10 @@ public:
         int width{0};
         int height{0};
         bool hasData{false};
+        uint32_t frameRateNumerator{0};
+        uint32_t frameRateDenominator{1};
+        uint32_t aspectX{0};
+        uint32_t aspectY{0};
     };
 
     struct SubtitleStreamInfo {
@@ -118,6 +122,7 @@ public:
     void resetAudioSelection();
     std::vector<VideoStreamInfo> getVideoStreams() const;
     int getSelectedVideoStreamIndex() const;
+    std::optional<VideoStreamInfo> getSelectedVideoStream() const;
     bool isSelectedVideoStream(size_t listIndex) const;
     bool selectVideoStreamByListIndex(size_t listIndex);
     bool selectVideoStreamByStreamIndex(int streamIndex);

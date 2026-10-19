@@ -11,6 +11,11 @@
 static void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
+// Directly constructed descriptors still need the tags normally set by unpack().
+template<class T> class TestDescriptor : public T {
+public:
+    TestDescriptor() : T() { this->descriptorTag = T::kDescriptorTag; this->descriptorLength = 0; }
+};
 class PresentEvent : public MmtTlv::MhEit {
 public:
     PresentEvent(uint16_t service) {
@@ -37,7 +42,7 @@ static void addAsset(MmtTlv::Mpt& m, uint32_t type, uint16_t pid, uint16_t tag) 
     MmtTlv::Mpt::Asset asset{}; asset.assetType = type;
     MmtTlv::MmtGeneralLocationInfo location{}; location.locationType = 0; location.packetId = pid;
     asset.locationInfos.push_back(location);
-    auto id = std::make_unique<MmtTlv::MhStreamIdentificationDescriptor>(); id->componentTag = tag;
+    auto id = std::make_unique<TestDescriptor<MmtTlv::MhStreamIdentificationDescriptor>>(); id->componentTag = tag;
     asset.descriptors.list.push_back(std::move(id)); m.assets.push_back(std::move(asset));
 }
 static void fillPackage(MmtTlv::Mpt& m, uint16_t service, uint16_t base) {
@@ -95,11 +100,29 @@ static void testPackages() {
     require(handler.getVideoStreams().empty() && handler.getSubtitleStreams().empty(),"selected-service removal must clear video and caption declarations");
     handler.resetAudioSelection(); handler.onMpt(b); feedVideo(handler,0x200); require(video == 4,"new file must reset service ownership");
 }
+static void testVideoAttributes() {
+    static constexpr uint32_t expected[][2] = {
+        {0,1},{15,1},{24000,1001},{24,1},{25,1},{30000,1001},{30,1},
+        {50,1},{60000,1001},{60,1},{100,1},{120000,1001},{120,1}
+    };
+    for (uint8_t code = 1; code <= 12; ++code) {
+        CFilterDemuxerHandler handler; MmtTlv::Mpt mpt{}; mpt.mmtPackageIdByte = {0,1};
+        addAsset(mpt,MmtTlv::AssetType::hev1,0x100,0);
+        auto descriptor = std::make_unique<TestDescriptor<MmtTlv::VideoComponentDescriptor>>();
+        descriptor->componentTag=0; descriptor->videoResolution=5; descriptor->videoAspectRatio=1; descriptor->videoFrameRate=code;
+        auto* changed=descriptor.get(); mpt.assets.back().descriptors.list.push_back(std::move(descriptor)); handler.onMpt(mpt);
+        auto info=handler.getSelectedVideoStream();
+        require(info && info->frameRateNumerator==expected[code][0] && info->frameRateDenominator==expected[code][1],"preserve all defined rational video rates");
+        require(info->width==1440 && info->height==1080 && info->aspectX==4 && info->aspectY==3,"preserve 4:3 display aspect separately from resolution");
+        changed->videoFrameRate=9; changed->videoAspectRatio=3; handler.onMpt(mpt); info=handler.getSelectedVideoStream();
+        require(info && info->frameRateNumerator==60 && info->aspectX==16 && info->aspectY==9,"periodic MPT must update video attributes");
+    }
+}
 int main() {
     try {
         testServiceId({0,2}, 2); testServiceId({1,0,2}, 2);
         testServiceId({0,1,0,2}, 2); testServiceId({1,2,3,4,0x12,0x34}, 0x1234);
-        testPackages();
+        testPackages(); testVideoAttributes();
         std::cout << "Transport state tests passed: package identity, service isolation, PLT transitions and seek selection\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

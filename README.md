@@ -133,6 +133,15 @@ tools\mmts_pin_probe.exe <input.mmts> [--seek SEC] [--run SEC] [--ax PATH] [--ex
 - Demuxer-only probes miss routing bugs: the filter locks its stream lists
   once pins exist, which only a real graph reproduces.
 
+## Service selection
+
+The filter keeps the selected MMT package when another service's MPT arrives.
+A PLT-confirmed removal of that package selects the first remaining local
+package, so recordings with a channel change can continue without mixing
+simultaneously multiplexed services. Without a PLT, the first MPT chooses the
+package; an unrelated MPT alone does not switch it. Seeking preserves the
+selection, and opening a new file resets it.
+
 ## Regression Tests
 
 Build Release first, then run from the repository root:
@@ -142,7 +151,13 @@ Build Release first, then run from the repository root:
 ./tools/run_subtitle_file_index_test.ps1
 ./tools/run_subtitle_file_index_test.ps1 -Test subtitle_render_test
 ./tools/run_subtitle_file_index_test.ps1 -Test playback_state_test
+./tools/run_subtitle_file_index_test.ps1 -Test transport_state_test
 ```
+
+The transport state test checks long package IDs, isolation of video/audio/
+subtitle/event callbacks across services, PLT transitions, seek selection and
+all defined rational video frame rates. Playback tests also verify negotiated
+video aspect/rate, sample durations and dynamic format changes on queued samples.
 
 The playback state test exercises production EDL seek logic, video callbacks,
 queued DirectShow output samples, and video/audio track changes. It checks
