@@ -2987,6 +2987,7 @@ void CMmtTlvSplitter::PreScanFile()
             }
         });
 
+    handler.setDemuxer(demuxer);
     demuxer.setDemuxerHandler(handler);
 
     constexpr size_t kChunk   = 65536;
@@ -3039,6 +3040,7 @@ void CMmtTlvSplitter::PreScanFile()
     }
     m_handler.setKnownVideoStreams(handler.getVideoStreams());
     m_handler.setKnownSubtitleStreams(handler.getSubtitleStreams());
+    m_handler.copyServiceSelectionFrom(handler);
     {
         auto streams = m_handler.getAudioStreams();
         LogMsg(L"MMT/TLV Splitter: PreScan audio stream count=%zu\n", streams.size());
@@ -4086,6 +4088,7 @@ void CMmtTlvSplitter::CreatePins()
             }
         });
 
+    m_handler.setDemuxer(m_demuxer);
     m_demuxer.setDemuxerHandler(m_handler);
 }
 

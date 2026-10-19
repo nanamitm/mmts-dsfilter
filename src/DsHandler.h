@@ -2,12 +2,14 @@
 #include <functional>
 #include <vector>
 #include <mutex>
+#include <map>
+#include <set>
 #include <cstdint>
 #include "demuxerHandler.h"
 #include "adtsConverter.h"
 #include "additionalAribSubtitleInfo.h"
 
-namespace MmtTlv { class MmtStream; struct MfuData; class MhEit; class NTPv4; }
+namespace MmtTlv { class MmtStream; struct MfuData; class MhEit; class NTPv4; class MmtTlvDemuxer; }
 
 // Bridges dantto4k demuxer callbacks to DirectShow sample delivery.
 // Uses long long (= REFERENCE_TIME = 100ns units) to avoid windows.h dependency here.
@@ -99,6 +101,11 @@ public:
     void onMhEit(const MmtTlv::MhEit& mhEit) override;
     void onNtp(const MmtTlv::NTPv4& ntp) override;
     void onMpt(const MmtTlv::Mpt& mpt) override;
+    void onPlt(const MmtTlv::Plt& plt) override;
+    void setDemuxer(MmtTlv::MmtTlvDemuxer& demuxer) { m_demuxer = &demuxer; }
+    // Pre-scan and playback must use the same package, including after a seek.
+    void copyServiceSelectionFrom(const CFilterDemuxerHandler& source);
+
 
     void reset()
     {
@@ -106,8 +113,7 @@ public:
         m_programStartTimeSec = -1;
         m_programId = 0;
         m_hasProgramId = false;
-        m_serviceId = 0;
-        m_hasServiceId = false;
+        // Keep the selected service across seek/reset; Load clears it separately.
     }
     void resetAudioSelection();
     std::vector<VideoStreamInfo> getVideoStreams() const;
@@ -136,6 +142,7 @@ public:
     bool selectAudioStreamByStreamIndex(int streamIndex);
 
 private:
+    bool acceptsPacket(uint16_t packetId) const;
     long long toRefTime(int64_t pts, const MmtTlv::MmtStream& stream);
     void rememberVideoStream(const MmtTlv::MmtStream& stream);
     bool shouldProcessVideoStream(uint16_t packetId) const;
@@ -150,6 +157,10 @@ private:
     void rememberSubtitleStream(const MmtTlv::MmtStream& stream);
     bool shouldProcessAudioStream(int streamIndex) const;
 
+    MmtTlv::MmtTlvDemuxer* m_demuxer{nullptr};
+    std::optional<std::vector<uint8_t>> m_selectedPackage;
+    std::optional<std::set<std::vector<uint8_t>>> m_availablePackages;
+    std::map<std::vector<uint8_t>, std::set<uint16_t>> m_packagePackets;
     SampleCallback m_videoCallback;
     SampleCallback m_audioCallback;
     SubtitleCallback m_subtitleCallback;
