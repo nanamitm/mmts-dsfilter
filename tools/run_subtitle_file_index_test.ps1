@@ -1,4 +1,4 @@
-param([ValidateSet('subtitle_file_index_test', 'subtitle_render_test', 'playback_state_test')][string]$Test = 'subtitle_file_index_test')
+param([ValidateSet('subtitle_file_index_test', 'subtitle_render_test', 'playback_state_test', 'transport_state_test')][string]$Test = 'subtitle_file_index_test')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"

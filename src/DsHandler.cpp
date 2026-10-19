@@ -3,6 +3,8 @@
 #include "SubtitleDocumentState.h"
 #include "mmtStream.h"
 #include "mpt.h"
+#include "plt.h"
+#include "mmtTlvDemuxer.h"
 #include "mhEit.h"
 #include "ntp.h"
 #include "mmtDescriptors.h"
@@ -71,6 +73,28 @@ static void VideoResolutionSize(uint8_t videoResolution, uint8_t videoAspectRati
         *width = static_cast<int>(h * (wide ? 16.0 / 9.0 : 4.0 / 3.0));
     if (height)
         *height = h;
+}
+
+static void ApplyVideoDescriptor(CFilterDemuxerHandler::VideoStreamInfo& info,
+                                 const MmtTlv::VideoComponentDescriptor& descriptor)
+{
+    VideoResolutionSize(descriptor.videoResolution, descriptor.videoAspectRatio, &info.width, &info.height);
+    // STD-B60 Table 7-50; preserve the rational rate (including /1.001).
+    static constexpr uint32_t rates[][2] = {
+        {0,1}, {15,1}, {24000,1001}, {24,1}, {25,1}, {30000,1001}, {30,1},
+        {50,1}, {60000,1001}, {60,1}, {100,1}, {120000,1001}, {120,1}
+    };
+    if (descriptor.videoFrameRate < std::size(rates)) {
+        info.frameRateNumerator = rates[descriptor.videoFrameRate][0];
+        info.frameRateDenominator = rates[descriptor.videoFrameRate][1];
+    }
+    if (descriptor.videoAspectRatio == 1) { info.aspectX = 4; info.aspectY = 3; }
+    else if (descriptor.videoAspectRatio == 2 || descriptor.videoAspectRatio == 3) {
+        info.aspectX = 16; info.aspectY = 9;
+    }
+    // Unspecified/wider-than-16:9 needs the coded dimensions/SAR; do not
+    // advertise an invented 4:3 width from this descriptor alone.
+    else { info.width = 0; }
 }
 
 static bool SameVideoIdentity(const CFilterDemuxerHandler::VideoStreamInfo& a,
@@ -210,8 +234,7 @@ void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
     info.componentTag = stream.getComponentTag();
     info.hasData = true;
     if (auto desc = stream.getVideoComponentDescriptor()) {
-        VideoResolutionSize(desc->get().videoResolution, desc->get().videoAspectRatio,
-                            &info.width, &info.height);
+        ApplyVideoDescriptor(info, desc->get());
     }
 
     auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
@@ -221,7 +244,12 @@ void CFilterDemuxerHandler::rememberVideoStream(const MmtTlv::MmtStream& stream)
     if (it != m_videoStreams.end()) {
         it->streamIndex = info.streamIndex;
         it->hasData = true;
-        if (info.height > 0) {
+        if (info.frameRateNumerator > 0) {
+            it->frameRateNumerator = info.frameRateNumerator;
+            it->frameRateDenominator = info.frameRateDenominator;
+        }
+        if (info.aspectX > 0) { it->aspectX = info.aspectX; it->aspectY = info.aspectY; }
+        if (info.width > 0 && info.height > 0) {
             it->width = info.width;
             it->height = info.height;
         }
@@ -266,6 +294,16 @@ int CFilterDemuxerHandler::getSelectedVideoStreamIndex() const
         }
     }
     return -1;
+}
+
+std::optional<CFilterDemuxerHandler::VideoStreamInfo> CFilterDemuxerHandler::getSelectedVideoStream() const
+{
+    std::lock_guard<std::mutex> lock(m_videoMutex);
+    if (!m_hasSelectedVideoStream) return std::nullopt;
+    const auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(), [this](const auto& stream) {
+        return stream.packetId == m_selectedVideoPacketId;
+    });
+    return it == m_videoStreams.end() ? std::nullopt : std::optional<VideoStreamInfo>(*it);
 }
 
 bool CFilterDemuxerHandler::isSelectedVideoStream(size_t listIndex) const
@@ -539,11 +577,68 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
            info.streamIndex, info.packetId, info.componentTag);
 }
 
+bool CFilterDemuxerHandler::acceptsPacket(uint16_t packetId) const
+{
+    if (!m_selectedPackage)
+        return !m_availablePackages; // Legacy/test callbacks before any SI.
+    const auto it = m_packagePackets.find(*m_selectedPackage);
+    return it != m_packagePackets.end() && it->second.contains(packetId);
+}
+
+void CFilterDemuxerHandler::copyServiceSelectionFrom(const CFilterDemuxerHandler& source)
+{
+    m_selectedPackage = source.m_selectedPackage;
+    m_availablePackages = source.m_availablePackages;
+    m_packagePackets = source.m_packagePackets;
+    m_serviceId = source.m_serviceId;
+    m_hasServiceId = source.m_hasServiceId;
+}
+
+void CFilterDemuxerHandler::onPlt(const MmtTlv::Plt& plt)
+{
+    std::set<std::vector<uint8_t>> available;
+    std::optional<std::vector<uint8_t>> first;
+    for (const auto& entry : plt.entries) {
+        if (entry.locationInfos.locationType != 0 || entry.mmtPackageIdByte.size() < 2)
+            continue;
+        available.insert(entry.mmtPackageIdByte);
+        if (!first) first = entry.mmtPackageIdByte;
+    }
+    m_availablePackages = std::move(available);
+    std::erase_if(m_packagePackets, [&](const auto& entry) {
+        return !m_availablePackages->contains(entry.first);
+    });
+    if (m_selectedPackage && m_availablePackages->contains(*m_selectedPackage))
+        return;
+    if (m_selectedPackage == first)
+        return;
+    m_selectedPackage = first;
+    m_hasServiceId = first.has_value();
+    if (first) {
+        m_serviceId = static_cast<uint16_t>(((*first)[first->size() - 2] << 8) | first->back());
+    }
+    m_hasProgramId = false;
+    // A confirmed service change invalidates resources waiting for the old one.
+    if (m_subtitleControlCallback) m_subtitleControlCallback({});
+}
+
 void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 {
+    if (mpt.mmtPackageIdByte.size() < 2 ||
+        (m_availablePackages && !m_availablePackages->contains(mpt.mmtPackageIdByte)))
+        return;
+    auto& packets = m_packagePackets[mpt.mmtPackageIdByte];
+    packets.clear();
+    for (const auto& asset : mpt.assets)
+        for (const auto& location : asset.locationInfos)
+            if (location.locationType == 0) packets.insert(location.packetId);
+    if (!m_selectedPackage) m_selectedPackage = mpt.mmtPackageIdByte;
+    if (*m_selectedPackage != mpt.mmtPackageIdByte)
+        return; // Another simultaneously multiplexed service is not a channel change.
+
     if (mpt.mmtPackageIdByte.size() >= 2) {
         const uint16_t serviceId = static_cast<uint16_t>(
-            (mpt.mmtPackageIdByte[0] << 8) | mpt.mmtPackageIdByte[1]);
+            (mpt.mmtPackageIdByte[mpt.mmtPackageIdByte.size() - 2] << 8) | mpt.mmtPackageIdByte.back());
         if (!m_hasServiceId || serviceId != m_serviceId) {
             LogMsg(L"MMT/TLV MPT service: serviceId=0x%04X%s\n", serviceId,
                    m_hasServiceId ? L" (changed)" : L"");
@@ -579,9 +674,11 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
         if (!isSupportedStream)
             continue;
 
+        const auto* registered = m_demuxer ? m_demuxer->getStream(packetId) : nullptr;
+        const int assetIndex = registered ? static_cast<int>(registered->getStreamIndex()) : streamIndex;
         if (asset.assetType == MmtTlv::AssetType::hev1) {
             VideoStreamInfo info;
-            info.streamIndex = streamIndex;
+            info.streamIndex = assetIndex;
             info.packetId = packetId;
 
             for (const auto& descriptor : asset.descriptors.list) {
@@ -596,8 +693,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                 {
                     const auto* video = static_cast<const MmtTlv::VideoComponentDescriptor*>(descriptor.get());
                     info.componentTag = video->componentTag;
-                    VideoResolutionSize(video->videoResolution, video->videoAspectRatio,
-                                        &info.width, &info.height);
+                    ApplyVideoDescriptor(info, *video);
                     break;
                 }
                 }
@@ -606,7 +702,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             discoveredVideos.push_back(info);
         } else if (asset.assetType == MmtTlv::AssetType::mp4a) {
             AudioStreamInfo info;
-            info.streamIndex = streamIndex;
+            info.streamIndex = assetIndex;
             info.packetId = packetId;
 
             for (const auto& descriptor : asset.descriptors.list) {
@@ -632,7 +728,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             discovered.push_back(info);
         } else if (asset.assetType == MmtTlv::AssetType::stpp) {
             SubtitleStreamInfo info;
-            info.streamIndex = streamIndex;
+            info.streamIndex = assetIndex;
             info.packetId = packetId;
 
             for (const auto& descriptor : asset.descriptors.list) {
@@ -654,7 +750,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
         ++streamIndex;
     }
 
-    if (!discoveredVideos.empty()) {
+    {
         std::lock_guard<std::mutex> lock(m_videoMutex);
         for (auto& info : discoveredVideos) {
             auto it = std::find_if(m_videoStreams.begin(), m_videoStreams.end(),
@@ -677,7 +773,11 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                     discoveredVideos[i].packetId != m_videoStreams[i].packetId ||
                     discoveredVideos[i].componentTag != m_videoStreams[i].componentTag ||
                     discoveredVideos[i].width != m_videoStreams[i].width ||
-                    discoveredVideos[i].height != m_videoStreams[i].height) {
+                    discoveredVideos[i].height != m_videoStreams[i].height ||
+                    discoveredVideos[i].frameRateNumerator != m_videoStreams[i].frameRateNumerator ||
+                    discoveredVideos[i].frameRateDenominator != m_videoStreams[i].frameRateDenominator ||
+                    discoveredVideos[i].aspectX != m_videoStreams[i].aspectX ||
+                    discoveredVideos[i].aspectY != m_videoStreams[i].aspectY) {
                     changed = true;
                     break;
                 }
@@ -705,7 +805,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
     // audio list is locked after pin creation, and an MPT change that shifts
     // the stream indices (e.g. a commentary audio asset appearing) must still
     // reach the subtitle list, or captions get resolved to the wrong track.
-    if (!discoveredSubtitles.empty()) {
+    {
         std::lock_guard<std::mutex> lock(m_subtitleMutex);
         for (auto& info : discoveredSubtitles) {
             // Match on the packetId, which identifies one asset. The stream
@@ -873,6 +973,11 @@ bool CFilterDemuxerHandler::hasSubtitlePacket(uint16_t packetId) const
 
 void CFilterDemuxerHandler::resetAudioSelection()
 {
+    m_selectedPackage.reset();
+    m_availablePackages.reset();
+    m_packagePackets.clear();
+    m_hasServiceId = false;
+    m_serviceId = 0;
     std::lock_guard<std::mutex> lock(m_audioMutex);
     m_hasSelectedAudioStream = false;
     m_selectedAudioPacketId = 0;
@@ -1037,6 +1142,8 @@ bool CFilterDemuxerHandler::selectAudioStreamByStreamIndex(int streamIndex)
 
 void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
+    if (!acceptsPacket(stream.getPacketId())) return;
+
     if (!m_videoCallback || mfu.data.empty())
         return;
 
@@ -1058,6 +1165,8 @@ void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const M
 
 void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
+    if (!acceptsPacket(stream.getPacketId())) return;
+
     if (!m_audioCallback || mfu.data.empty())
         return;
 
@@ -1130,6 +1239,8 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
 
 void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
+    if (!acceptsPacket(stream.getPacketId())) return;
+
     if (mfu.data.empty())
         return;
 
@@ -1200,6 +1311,10 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
 
 void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
 {
+    // An authoritative empty PLT means no service is selected. Do not let
+    // a stale event restart the program timeline while media is suppressed.
+    if (m_availablePackages && !m_selectedPackage) return;
+
     if (!mhEit.isPf() || mhEit.sectionNumber != 0)
         return;
 

@@ -46,6 +46,7 @@ SubtitleFileIndex::SubtitleFileIndex(const std::wstring& filename, long long ini
             MmtTlvLogInfo(L"SUBTITLE index rejected document at byte=%I64d: %S\n", m_packetOffset, e.what());
         }
     });
+    m_handler.setDemuxer(m_demuxer);
     m_demuxer.setDemuxerHandler(m_handler);
 }
 
