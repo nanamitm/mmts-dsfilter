@@ -163,7 +163,7 @@ private:
     long long m_programStartTimeSec{-1};
     uint32_t m_programId{0};
     bool m_hasProgramId{false};
-    // Service of the package the MPT describes (the first two bytes of the
+    // Service of the package the MPT describes (the last two bytes of the
     // MMT package id). A TLV stream can carry EIT p/f for several services;
     // only this one's present event is the program being played.
     uint16_t m_serviceId{0};

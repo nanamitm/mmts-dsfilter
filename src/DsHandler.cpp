@@ -543,7 +543,7 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
 {
     if (mpt.mmtPackageIdByte.size() >= 2) {
         const uint16_t serviceId = static_cast<uint16_t>(
-            (mpt.mmtPackageIdByte[0] << 8) | mpt.mmtPackageIdByte[1]);
+            (mpt.mmtPackageIdByte[mpt.mmtPackageIdByte.size() - 2] << 8) | mpt.mmtPackageIdByte.back());
         if (!m_hasServiceId || serviceId != m_serviceId) {
             LogMsg(L"MMT/TLV MPT service: serviceId=0x%04X%s\n", serviceId,
                    m_hasServiceId ? L" (changed)" : L"");
