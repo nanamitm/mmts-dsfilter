@@ -1311,6 +1311,10 @@ void CFilterDemuxerHandler::onSubtitleData(const MmtTlv::MmtStream& stream, cons
 
 void CFilterDemuxerHandler::onMhEit(const MmtTlv::MhEit& mhEit)
 {
+    // An authoritative empty PLT means no service is selected. Do not let
+    // a stale event restart the program timeline while media is suppressed.
+    if (m_availablePackages && !m_selectedPackage) return;
+
     if (!mhEit.isPf() || mhEit.sectionNumber != 0)
         return;
 

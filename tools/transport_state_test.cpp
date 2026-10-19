@@ -3,6 +3,7 @@
 #include "mhEit.h"
 #include "plt.h"
 #include "mmtStream.h"
+#include "mmtTlvDemuxer.h"
 #include "mhStreamIdentificationDescriptor.h"
 #include "videoComponentDescriptor.h"
 #include <iostream>
@@ -95,6 +96,8 @@ static void testPackages() {
     announce(handler,{2}); handler.onMpt(b); feedVideo(handler,0x100); feedVideo(handler,0x200);
     require(video == 2 && handler.getVideoStreams()[0].packetId == 0x200,"PLT-confirmed channel change must follow the new service");
     announce(handler,{}); feedVideo(handler,0x200); handler.onMpt(b); require(video == 2,"empty PLT suppresses stale media and MPTs");
+    const auto beforeEmptyEvents = programs; handler.onMhEit(PresentEvent(2));
+    require(programs == beforeEmptyEvents,"empty PLT must suppress stale EIT as well as media");
     announce(handler,{1}); handler.onMpt(a); feedVideo(handler,0x100); require(video == 3,"new PLT/MPT restores service playback");
     MmtTlv::Mpt empty{}; empty.mmtPackageIdByte = {0,1}; handler.onMpt(empty);
     require(handler.getVideoStreams().empty() && handler.getSubtitleStreams().empty(),"selected-service removal must clear video and caption declarations");
@@ -118,11 +121,36 @@ static void testVideoAttributes() {
         require(info && info->frameRateNumerator==60 && info->aspectX==16 && info->aspectY==9,"periodic MPT must update video attributes");
     }
 }
+static void feedPackage(MmtTlv::MmtTlvDemuxer& demuxer, uint32_t sequence, bool replace) {
+    using MmtTlv::Common::WriteStream;
+    WriteStream body; body.put8U(0); body.put8U(2); body.putBe16U(1); body.putBe16U(0); body.put8U(2);
+    auto asset = [&](uint32_t type, uint16_t packetId) {
+        body.put8U(0); body.putBe32U(0); body.put8U(0); body.putBe32U(type); body.put8U(0); body.put8U(1);
+        body.put8U(0); body.putBe16U(packetId); body.putBe16U(5); body.putBe16U(0x8011); body.put8U(2); body.putBe16U(0);
+    };
+    if (replace) { asset(MmtTlv::AssetType::aapp,0x300); asset(MmtTlv::AssetType::hev1,0x101); }
+    else { asset(MmtTlv::AssetType::hev1,0x100); asset(MmtTlv::AssetType::aapp,0x300); }
+    WriteStream table; table.put8U(0x20); table.put8U(0); table.putBe16U(static_cast<uint16_t>(body.getData().size())); table.write(body.getData());
+    WriteStream pa; pa.put8U(0); pa.put8U(0); pa.putBe16U(0); pa.put8U(0);
+    pa.putBe32U(static_cast<uint32_t>(1+table.getData().size())); pa.put8U(0); pa.write(table.getData());
+    WriteStream packet; packet.putBe16U(0); packet.put8U(0x61); packet.put8U(0); packet.put8U(2); packet.putBe16U(0);
+    packet.putBe32U(0); packet.putBe32U(sequence); packet.write(pa.getData());
+    WriteStream tlv; tlv.put8U(0x7F); tlv.put8U(3); tlv.putBe16U(static_cast<uint16_t>(packet.getData().size())); tlv.write(packet.getData());
+    MmtTlv::Common::ReadStream input(tlv.getData()); require(demuxer.demux(input)==MmtTlv::DemuxStatus::Ok,"wire MPT must parse");
+}
+static void testStableCoreIndices() {
+    MmtTlv::MmtTlvDemuxer demuxer; CFilterDemuxerHandler handler;
+    handler.setDemuxer(demuxer); demuxer.setDemuxerHandler(handler);
+    feedPackage(demuxer,1,false); feedPackage(demuxer,2,true);
+    const auto* stream=demuxer.getStream(0x101); const auto info=handler.getSelectedVideoStream();
+    require(stream && info && info->packetId==0x101 && info->streamIndex==stream->getStreamIndex() && info->streamIndex==0,
+            "filter metadata must use stable core indices after MPT reordering and replacement");
+}
 int main() {
     try {
         testServiceId({0,2}, 2); testServiceId({1,0,2}, 2);
         testServiceId({0,1,0,2}, 2); testServiceId({1,2,3,4,0x12,0x34}, 0x1234);
-        testPackages(); testVideoAttributes();
+        testPackages(); testVideoAttributes(); testStableCoreIndices();
         std::cout << "Transport state tests passed: package identity, service isolation, PLT transitions and seek selection\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
