@@ -42,6 +42,11 @@ public:
     // IQualityControl
     STDMETHODIMP Notify(IBaseFilter* pSender, Quality q) override;
 
+    // False once the downstream has rejected enough samples in a row to call
+    // this connection dead. The filter checks it before decoding anything for
+    // this pin, so a pin nothing consumes costs no work on the demux thread.
+    bool AcceptsSamples();
+
     // Deliver one ES fragment. Returns S_OK or an error.
     HRESULT DeliverSample(bool keyframe, REFERENCE_TIME pts, REFERENCE_TIME dts,
                           bool isFirstFragment, bool isLastFragment,
@@ -147,6 +152,8 @@ private:
     REFERENCE_TIME m_videoFirstPts{-1};
     REFERENCE_TIME m_videoLastPts{-1};
     REFERENCE_TIME m_lastDeliveredPts{-1};
+    LONG m_consecutiveDeliveryFailures{0};
+    bool m_deliverySuppressed{false};
 
     COutputQueue* m_pQueue{nullptr};
 };

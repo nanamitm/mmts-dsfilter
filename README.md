@@ -19,6 +19,9 @@ audio, and ARIB B24 subtitle streams as DirectShow output pins.
   they coexist with a 22.2ch stream.
 - Supports DirectShow seeking through `IMediaSeeking`.
 - Queues downstream delivery to avoid renderer/decoder blocking the demuxer.
+- Stops producing for an audio pin whose downstream keeps rejecting samples, so
+  a pin the player does not play costs no decode time on the demux thread. A
+  flush, seek or new segment lets that pin try again.
 - Starts playback and seek recovery from HEVC RAP/IRAP frames.
 - Converts ARIB B24 TTML subtitles to ASS with per-character cell layout.
 - Renders cell backgrounds as merged rectangles (no edge artifacts).

@@ -32,8 +32,10 @@ public:
         : CBaseInputPin(NAME("Capture input"), filter, lock, hr, L"Input") {}
     HRESULT CheckMediaType(const CMediaType*) override { return S_OK; }
     std::atomic<unsigned> begins{0};
+    std::atomic<bool> failReceive{false}; // Stand in for a connected pin nothing plays.
     STDMETHODIMP BeginFlush() override { ++begins; return CBaseInputPin::BeginFlush(); }
     STDMETHODIMP Receive(IMediaSample* sample) override {
+        if (failReceive) return E_FAIL;
         REFERENCE_TIME start, stop;
         const HRESULT hr = sample->GetTime(&start, &stop);
         if (FAILED(hr)) return hr;
@@ -244,6 +246,43 @@ int wmain(int argc, wchar_t** argv) {
                     "audio selection joins producer before resetting pins");
             require(fixture.sink->pin->begins > flushedVideo, "audio selection flushes connected video too");
             require(filter.Enable(99, AMSTREAMSELECTENABLE_ENABLE) == E_INVALIDARG, "invalid selection rejected");
+        }
+        {
+            // A connected audio pin whose downstream rejects every sample must
+            // stop producing, so the 22.2ch LATM decode never runs for it.
+            Fixture fixture;
+            IMemAllocator* audioAllocator = nullptr;
+            ALLOCATOR_PROPERTIES audioProps{};
+            require(SUCCEEDED(fixture.audioSink->pin->GetAllocator(&audioAllocator)),
+                    "get the negotiated audio allocator");
+            const HRESULT propsHr = audioAllocator->GetProperties(&audioProps);
+            audioAllocator->Release();
+            require(SUCCEEDED(propsHr), "read the audio allocator properties");
+            // 64 AAC frames, about 1.4s. Deliberately not deeper: a downstream
+            // decoder that holds its filter lock across Deliver() holds it for
+            // as long as this lead, and a deeper queue bought nothing when it
+            // was measured.
+            require(audioProps.cBuffers == 64, "audio pin keeps its 1.4s of lead");
+            fixture.audioSink->pin->failReceive = true;
+            const uint8_t frame[] = {0xFF, 0xF1, 0x4C, 0x80, 0x00, 0x1F, 0xFC};
+            // The queue only reports the failure once its worker has tried the
+            // sample, so give it a slot between deliveries to catch up.
+            bool suppressed = false;
+            for (int i = 0; i < 400 && !suppressed; ++i) {
+                fixture.audio->DeliverSample(true, i * 213333LL, i * 213333LL, true, true,
+                                             frame, sizeof(frame));
+                suppressed = !fixture.audio->AcceptsSamples();
+                if (!suppressed) Sleep(1);
+            }
+            require(suppressed, "audio pin stops producing once its downstream keeps failing");
+            require(fixture.audio->DeliverSample(true, 0, 0, true, true, frame, sizeof(frame)) == S_FALSE,
+                    "suppressed audio pin takes no further samples");
+            require(fixture.video->AcceptsSamples(), "video pin is never suppressed");
+            fixture.audioSink->pin->failReceive = false;
+            // EndFlush waits for the queue's flush, so it needs its BeginFlush.
+            require(SUCCEEDED(fixture.audio->DeliverBeginFlush()), "begin flush the audio branch");
+            require(SUCCEEDED(fixture.audio->DeliverEndFlush()), "flush the audio branch");
+            require(fixture.audio->AcceptsSamples(), "a flush lets the audio pin try again");
         }
         CoUninitialize(); std::cout << "Playback state tests passed: " << checks << " checks\n"; return 0;
     } catch (const std::exception& e) {
