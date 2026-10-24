@@ -63,6 +63,22 @@ inline std::wstring MmtTlvDebugLogPath()
     return MmtTlvDebugLogState().filePath;
 }
 
+// Milliseconds since the first logged line, at microsecond resolution. The
+// baseline is per process, so the gap between two lines is the time spent
+// between them - the only way to tell where a slow open or a stall went.
+inline double MmtTlvElapsedMs()
+{
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER now{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    static const LONGLONG start = now.QuadPart;
+    if (frequency.QuadPart == 0)
+        return 0.0;
+    return static_cast<double>(now.QuadPart - start) * 1000.0 /
+           static_cast<double>(frequency.QuadPart);
+}
+
 inline void MmtTlvLogFileLine(const WCHAR* text)
 {
     std::wstring path = MmtTlvDebugLogPath();
@@ -74,18 +90,30 @@ inline void MmtTlvLogFileLine(const WCHAR* text)
     if (file == INVALID_HANDLE_VALUE)
         return;
 
+    // The timestamp joins the line in one buffer: a separate WriteFile could be
+    // interleaved by another thread's line and split the two apart.
+    char prefix[32] = {};
+    size_t prefixLen = 0;
+    if (SUCCEEDED(StringCchPrintfA(prefix, ARRAYSIZE(prefix), "[%11.3f] ", MmtTlvElapsedMs())))
+        prefixLen = strlen(prefix);
+
     int bytes = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
     if (bytes > 1) {
         char stackBuf[2048];
         char* out = stackBuf;
-        if (bytes > static_cast<int>(sizeof(stackBuf))) {
-            out = new (std::nothrow) char[bytes];
+        const size_t needed = prefixLen + static_cast<size_t>(bytes);
+        if (needed > sizeof(stackBuf)) {
+            out = new (std::nothrow) char[needed];
         }
         if (out) {
-            int writtenBytes = WideCharToMultiByte(CP_UTF8, 0, text, -1, out, bytes, nullptr, nullptr);
+            if (prefixLen)
+                memcpy(out, prefix, prefixLen);
+            int writtenBytes = WideCharToMultiByte(CP_UTF8, 0, text, -1, out + prefixLen, bytes,
+                                                   nullptr, nullptr);
             if (writtenBytes > 1) {
                 DWORD ignored = 0;
-                WriteFile(file, out, static_cast<DWORD>(writtenBytes - 1), &ignored, nullptr);
+                WriteFile(file, out, static_cast<DWORD>(prefixLen + writtenBytes - 1),
+                          &ignored, nullptr);
             }
             if (out != stackBuf)
                 delete[] out;
