@@ -4037,6 +4037,14 @@ void CMmtTlvSplitter::CreatePins()
             for (auto* pin : m_pins) {
                 if (pin->IsAudio() &&
                     (pin->AudioStreamIndex() == -1 || pin->AudioStreamIndex() == streamIndex)) {
+                    // A pin for this stream exists even when it cannot take the
+                    // sample, so the "no pin" diagnostic below stays meaningful.
+                    delivered = true;
+                    // Decoding 22.2ch LATM to PCM costs more than the demux
+                    // itself and runs on the thread that feeds the video pin, so
+                    // never pay it for a pin whose downstream rejects samples.
+                    if (!pin->AcceptsSamples())
+                        continue;
                     LatmPcmDecoder* decoder = nullptr;
                     for (const auto& candidate : m_latmPcmDecoders) {
                         if (candidate && candidate->StreamIndex() == streamIndex) {
@@ -4055,7 +4063,6 @@ void CMmtTlvSplitter::CreatePins()
                     } else {
                         pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
                     }
-                    delivered = true;
                 }
             }
             if (!delivered && last) {

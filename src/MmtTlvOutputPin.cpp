@@ -18,6 +18,32 @@ struct SUBTITLEINFO {
 
 static constexpr REFERENCE_TIME kDiscontinuityGap = 2 * 10000000LL;
 
+// MPC-BE leaves the audio pins it does not play connected and fails every
+// Receive() on them. Producing for such a pin is pure loss: the 22.2ch LATM to
+// PCM decode runs on the single demux thread that also feeds the video pin, so
+// it eats the read-ahead the audio queue needs. Give up after this many
+// consecutive failures and resume only on a flush/seek/new segment, which is
+// where a track switch or a recovered connection shows up.
+static constexpr LONG kMaxConsecutiveDeliveryFailures = 8;
+
+// The audio side keeps its 64 frames, about 1.4s. Raising it to 256 was tried
+// and measured over three five-minute runs: it changed nothing, because the
+// allocator never ran dry at 64 either (every logged audio GetDeliveryBuffer
+// wait was 0 ms) - the demux thread is clocked by the video allocator and
+// cannot run ahead on its own. It is not free either: a downstream decoder that
+// holds its filter lock across Deliver() then holds it for as long as the lead,
+// which is how long a player's menu blocks when it queries that decoder.
+// Right-sizing the video allocator below is what gave the demux thread its
+// read-ahead.
+// Measured over ten minutes of 8K 60p: access units average 96KB, 95% are under
+// 260KB and the largest IRAP was 1.96MB. A 16MB buffer was therefore eight times
+// the worst case, and it was the buffer size - not the committed bytes - that
+// held the pipeline to 32 frames, barely half a second. 4MB keeps twice the
+// observed headroom while the same 512MB holds 128 frames, about 2.1s, which is
+// how far the demux thread can run ahead before the video allocator stops it.
+static constexpr LONG kVideoBufferBytes = 4 * 1024 * 1024;
+static constexpr LONG kVideoBuffers = 128;
+
 static bool IsHevcRapNal(uint8_t nalType)
 {
     // HEVC IRAP NAL units: BLA(16-18), IDR(19-20), CRA(21).
@@ -147,6 +173,8 @@ void CMmtTlvOutputPin::ResetForSeek()
     m_logNextSample = true;
     m_droppedBeforeSegment = 0;
     m_lastDeliveredPts = -1;
+    m_consecutiveDeliveryFailures = 0;
+    m_deliverySuppressed = false;
     if (m_isVideo) {
         m_waitForVideoRap = true;
         m_droppedUntilRap = 0;
@@ -344,9 +372,9 @@ HRESULT CMmtTlvOutputPin::DecideBufferSize(IMemAllocator* pAlloc, ALLOCATOR_PROP
     const bool isVideo = IsVideo();
     const bool isSubtitle = IsSubtitle();
     pprop->cbBuffer = isVideo
-        ? 16 * 1024 * 1024
+        ? kVideoBufferBytes
         : (isSubtitle ? 256 * 1024 : (m_audioPcm ? 256 * 1024 : 64 * 1024));
-    pprop->cBuffers  = isVideo ? 32 : 64;
+    pprop->cBuffers  = isVideo ? kVideoBuffers : 64;
     pprop->cbAlign   = 1;
     pprop->cbPrefix  = 0;
     HRESULT hr = pAlloc->SetProperties(pprop, &actual);
@@ -375,6 +403,8 @@ HRESULT CMmtTlvOutputPin::Active()
     m_videoFirstWallMs = 0;
     m_videoFirstPts = -1;
     m_videoLastPts = -1;
+    m_consecutiveDeliveryFailures = 0;
+    m_deliverySuppressed = false;
 
     HRESULT hr = CBaseOutputPin::Active();
     if (FAILED(hr)) return hr;
@@ -430,6 +460,10 @@ HRESULT CMmtTlvOutputPin::DeliverBeginFlush()
 
 HRESULT CMmtTlvOutputPin::DeliverEndFlush()
 {
+    // The flush ends the state the failures were observed in, so let the pin
+    // prove itself again instead of staying suppressed for the whole session.
+    m_consecutiveDeliveryFailures = 0;
+    m_deliverySuppressed = false;
     if (m_pQueue) {
         m_pQueue->EndFlush();
         return S_OK;
@@ -439,6 +473,8 @@ HRESULT CMmtTlvOutputPin::DeliverEndFlush()
 
 HRESULT CMmtTlvOutputPin::DeliverNewSegment(REFERENCE_TIME tStart, REFERENCE_TIME tStop, double dRate)
 {
+    m_consecutiveDeliveryFailures = 0;
+    m_deliverySuppressed = false;
     if (m_pQueue) {
         m_pQueue->NewSegment(tStart, tStop, dRate);
         return S_OK;
@@ -446,12 +482,17 @@ HRESULT CMmtTlvOutputPin::DeliverNewSegment(REFERENCE_TIME tStart, REFERENCE_TIM
     return CBaseOutputPin::DeliverNewSegment(tStart, tStop, dRate);
 }
 
+bool CMmtTlvOutputPin::AcceptsSamples()
+{
+    return IsConnected() && !m_deliverySuppressed;
+}
+
 HRESULT CMmtTlvOutputPin::DeliverSample(
     bool keyframe, REFERENCE_TIME pts, REFERENCE_TIME dts,
     bool isFirstFragment, bool isLastFragment,
     const uint8_t* data, size_t size, bool preroll)
 {
-    if (!IsConnected()) return S_FALSE;
+    if (!AcceptsSamples()) return S_FALSE;
 
     static volatile LONG s_videoSamples = 0;
     static volatile LONG s_audioSamples = 0;
@@ -635,6 +676,26 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         pSample->Release();
     }
     const ULONGLONG tDeliverEnd = GetTickCount64();
+
+    // Audio only: a video or subtitle pin that fails transiently (a wrong-state
+    // Receive around a stop) must keep trying, or the picture would stay frozen
+    // until the next flush. An unused audio pin is the one that costs real work.
+    //
+    // A state error says the graph is stopping, not that this pin is unused: a
+    // stop raises it on every pin, the played one included, and suppressing that
+    // one would leave the next run silent until something flushed it.
+    if (IsAudio() && hr != VFW_E_WRONG_STATE && hr != VFW_E_NOT_CONNECTED) {
+        if (SUCCEEDED(hr)) {
+            m_consecutiveDeliveryFailures = 0;
+        } else if (++m_consecutiveDeliveryFailures >= kMaxConsecutiveDeliveryFailures &&
+                   !m_deliverySuppressed) {
+            m_deliverySuppressed = true;
+            LogPinMsg(L"MMT/TLV Audio pin stopped producing: %ld consecutive delivery failures, last hr=0x%08X, streamIndex=%d\n",
+                      m_consecutiveDeliveryFailures,
+                      hr,
+                      m_audioStreamIndex);
+        }
+    }
 
     const ULONGLONG bufferMs = tBufferEnd - tBufferStart;
     const ULONGLONG deliverMs = tDeliverEnd - tDeliverStart;
