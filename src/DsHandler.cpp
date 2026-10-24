@@ -275,6 +275,15 @@ bool CFilterDemuxerHandler::shouldProcessVideoStream(uint16_t packetId) const
     return packetId == m_selectedVideoPacketId;
 }
 
+std::optional<CFilterDemuxerHandler::AudioStreamInfo>
+CFilterDemuxerHandler::getAudioStream(int streamIndex) const
+{
+    std::lock_guard<std::mutex> lock(m_audioMutex);
+    const auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
+        [streamIndex](const AudioStreamInfo& info) { return info.streamIndex == streamIndex; });
+    return it == m_audioStreams.end() ? std::nullopt : std::optional<AudioStreamInfo>(*it);
+}
+
 std::vector<CFilterDemuxerHandler::VideoStreamInfo> CFilterDemuxerHandler::getVideoStreams() const
 {
     std::lock_guard<std::mutex> lock(m_videoMutex);
@@ -878,6 +887,11 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
             return;
 
         if (m_audioStreamListLocked) {
+            // The set of streams is fixed once pins exist, but an asset can
+            // change format in place: at an ARIB channel boundary the packet
+            // that carried 22.2ch starts carrying 5.1ch and the 5.1ch one
+            // stereo. That has to reach the pin, or it keeps announcing the
+            // channel count the pre-scan saw.
             bool missing = false;
             for (const auto& info : discovered) {
                 auto it = std::find_if(m_audioStreams.begin(), m_audioStreams.end(),
@@ -886,8 +900,22 @@ void CFilterDemuxerHandler::onMpt(const MmtTlv::Mpt& mpt)
                     });
                 if (it == m_audioStreams.end()) {
                     missing = true;
-                    break;
+                    continue;
                 }
+                const bool formatChanged = it->samplingRate != info.samplingRate ||
+                    it->channels != info.channels || it->latm != info.latm ||
+                    (!info.extraData.empty() && it->extraData != info.extraData);
+                if (!formatChanged)
+                    continue;
+                LogMsg(L"MMT/TLV Audio format changed in place: streamIndex=%d, packetId=0x%04X, %s %uch %uHz -> %s %uch %uHz\n",
+                       it->streamIndex, it->packetId,
+                       it->latm ? L"LATM" : L"ADTS", it->channels, it->samplingRate,
+                       info.latm ? L"LATM" : L"ADTS", info.channels, info.samplingRate);
+                it->samplingRate = info.samplingRate;
+                it->channels = info.channels;
+                it->latm = info.latm;
+                if (!info.extraData.empty())
+                    it->extraData = info.extraData;
             }
             if (missing) {
                 LogDetail(L"MMT/TLV Audio MPT changed after pin creation; keeping PreScan audio list (%zu stream(s))\n",

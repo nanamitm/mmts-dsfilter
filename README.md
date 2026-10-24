@@ -17,6 +17,10 @@ audio, and ARIB B24 subtitle streams as DirectShow output pins.
 - Converts AAC LATM 22.2ch audio streams to stereo PCM output for playback.
 - Preserves ordinary AAC 2ch/5.1ch streams as separate ADTS output pins when
   they coexist with a 22.2ch stream.
+- Follows an audio format change in place: an ARIB channel boundary can hand the
+  same asset a different format (the packet carrying 22.2ch starts carrying
+  5.1ch, the 5.1ch one stereo), and the pin's media type is updated on the next
+  sample. A decoder that refuses the new type keeps the old one.
 - Supports DirectShow seeking through `IMediaSeeking`.
 - Queues downstream delivery to avoid renderer/decoder blocking the demuxer.
 - Stops producing for an audio pin whose downstream keeps rejecting samples, so
