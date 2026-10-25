@@ -119,6 +119,34 @@ static uint16_t AudioDescriptorChannels(const MmtTlv::MhAudioComponentDescriptor
     return AudioModeToChannels(audio.getAudioMode());
 }
 
+// The demuxer's per-stream drop counters live in dantto4k, which this filter
+// builds against as a pinned checkout. Read them only where they exist, so a
+// pin that predates them still compiles; the reporting starts by itself once
+// the pin moves past them.
+struct UpstreamDrops {
+    unsigned long long total{};
+    unsigned long long noTimestamp{};
+    unsigned long long auIndexRange{};
+    unsigned long long badFrame{};
+    unsigned long long fragment{};
+    unsigned long long malformed{};
+    bool available{false};
+};
+
+template <class Stream>
+    requires requires(const Stream& s) { s.droppedTotal(); }
+static UpstreamDrops ReadUpstreamDrops(const Stream& stream)
+{
+    return {stream.droppedTotal(), stream.droppedNoTimestamp, stream.droppedAuIndexRange,
+            stream.droppedBadFrame, stream.droppedFragment, stream.droppedMalformed, true};
+}
+
+template <class Stream>
+static UpstreamDrops ReadUpstreamDrops(const Stream&)
+{
+    return {};
+}
+
 static bool SameAudioIdentity(const CFilterDemuxerHandler::AudioStreamInfo& a,
                               const CFilterDemuxerHandler::AudioStreamInfo& b)
 {
@@ -1222,16 +1250,15 @@ void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const M
     // caught up with a new MPU sequence, which is what a channel boundary
     // produces. It cannot report that itself - this frame is the first one
     // after the hole - so read its counters and name the reason here.
-    {
-        const unsigned long long dropped = stream.droppedTotal();
+    if (const UpstreamDrops drops = ReadUpstreamDrops(stream); drops.available) {
         auto& seen = m_audioUpstreamDrops[stream.getPacketId()];
-        if (dropped > seen) {
+        if (drops.total > seen) {
             LogMsg(L"MMT/TLV Audio AUs dropped upstream: packetId=0x%04X, +%I64u (no timestamp=%I64u, au index=%I64u, bad frame=%I64u, fragment=%I64u, malformed=%I64u)\n",
-                   stream.getPacketId(), dropped - seen,
-                   stream.droppedNoTimestamp, stream.droppedAuIndexRange, stream.droppedBadFrame,
-                   stream.droppedFragment, stream.droppedMalformed);
+                   stream.getPacketId(), drops.total - seen,
+                   drops.noTimestamp, drops.auIndexRange, drops.badFrame,
+                   drops.fragment, drops.malformed);
         }
-        seen = dropped;
+        seen = drops.total;
     }
 
     if (!acceptsPacket(stream.getPacketId())) return;
