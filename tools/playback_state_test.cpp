@@ -138,6 +138,46 @@ static DWORD WINAPI waitingWorker(LPVOID context) {
     auto& state = *static_cast<WorkerState*>(context);
     WaitForSingleObject(state.stop, INFINITE); state.exited = true; return 0;
 }
+// A superimpose is an overlay over the running captions, not an alternative to
+// them, but a text subtitle track is exclusive downstream. These lock in that
+// its cues reach the caption pin rather than a track of their own.
+static void testSuperimposeRouting() {
+    require(IsCaptionComponentTag(0x30) && IsCaptionComponentTag(0x37),
+            "0x30-0x37 is the caption range");
+    require(!IsCaptionComponentTag(0x2F) && !IsCaptionComponentTag(0x38),
+            "the caption range stops at 0x37");
+    require(IsSuperimposeComponentTag(0x38) && IsSuperimposeComponentTag(0x3F),
+            "0x38-0x3F is the superimpose range");
+    require(!IsSuperimposeComponentTag(0x37) && !IsSuperimposeComponentTag(0x40),
+            "the superimpose range is 0x38-0x3F only");
+
+    // Merged: the superimpose cue lands on the caption pin and nowhere else.
+    require(SubtitleCueMatchesPin(0x38, 3, 0x30, 2, true),
+            "a merged superimpose cue goes to the caption pin");
+    require(!SubtitleCueMatchesPin(0x38, 3, 0x38, 3, true),
+            "a merged superimpose cue does not also go to a superimpose pin");
+
+    // Not merged: the tag identifies the track, both ways.
+    require(SubtitleCueMatchesPin(0x38, 3, 0x38, 3, false),
+            "an unmerged superimpose cue keeps its own pin");
+    require(!SubtitleCueMatchesPin(0x38, 3, 0x30, 2, false),
+            "an unmerged superimpose cue stays off the caption pin");
+    require(SubtitleCueMatchesPin(0x30, 2, 0x30, 2, false),
+            "a caption cue goes to the caption pin");
+    require(!SubtitleCueMatchesPin(0x30, 2, 0x38, 3, false),
+            "a caption cue never goes to the superimpose pin");
+
+    // Merging never diverts a caption cue, whatever the setting.
+    require(SubtitleCueMatchesPin(0x30, 2, 0x30, 2, false) &&
+            !SubtitleCueMatchesPin(0x30, 2, 0x38, 3, false),
+            "merging leaves caption routing alone");
+
+    // No tag on either side: fall back to the stream index.
+    require(SubtitleCueMatchesPin(-1, 5, -1, 5, false),
+            "an untagged cue falls back to the stream index");
+    require(!SubtitleCueMatchesPin(-1, 5, -1, 6, false),
+            "the index fallback still distinguishes streams");
+}
 int wmain(int argc, wchar_t** argv) {
     if (argc != 2) { std::cerr << "Pass the fixture output directory\n"; return 2; }
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -308,6 +348,7 @@ int wmain(int argc, wchar_t** argv) {
             require(SUCCEEDED(fixture.audio->DeliverEndFlush()), "flush the audio branch");
             require(fixture.audio->AcceptsSamples(), "a flush lets the audio pin try again");
         }
+        testSuperimposeRouting();
         CoUninitialize(); std::cout << "Playback state tests passed: " << checks << " checks\n"; return 0;
     } catch (const std::exception& e) {
         if (SUCCEEDED(com)) CoUninitialize(); std::cerr << e.what() << '\n'; return 1;

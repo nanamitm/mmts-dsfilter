@@ -79,6 +79,30 @@ static bool IsCaptionComponentTag(int componentTag)
     return componentTag >= 0x30 && componentTag <= 0x37;
 }
 
+// A superimpose is an overlay the broadcaster puts over the running captions -
+// an earthquake bulletin, say - not an alternative to them. It arrives as its
+// own stpp asset with its own packet id, which is why it would otherwise get a
+// pin, and therefore a subtitle track, of its own.
+static bool IsSuperimposeComponentTag(int componentTag)
+{
+    return componentTag >= 0x38 && componentTag <= 0x3F;
+}
+
+// Which subtitle pin a cue belongs on. A merged superimpose goes to the caption
+// pin; otherwise the tag identifies the track, and the stream index is the
+// fallback for an asset that declared no tag. The index alone cannot identify a
+// track across a channel change, because the next channel's assets reuse it.
+static bool SubtitleCueMatchesPin(int cueComponentTag, int cueStreamIndex,
+                                  int pinComponentTag, int pinStreamIndex,
+                                  bool mergeThisCue)
+{
+    if (mergeThisCue)
+        return IsCaptionComponentTag(pinComponentTag);
+    if (cueComponentTag >= 0 && pinComponentTag >= 0)
+        return pinComponentTag == cueComponentTag;
+    return pinStreamIndex == cueStreamIndex;
+}
+
 static bool ShouldDecodeLatmToPcm(bool latm, uint32_t channels)
 {
     return latm && channels == 24;
@@ -186,6 +210,11 @@ struct MmtsCaptionSettings {
     int outlineWidth = 0;
     int delayMs = 0;
     bool dumpSubtitleData = false;
+    // Put superimpose cues on the caption track instead of giving them one of
+    // their own. Read once per graph when the pins are built: the pin topology
+    // cannot change while a graph is running, so a later edit of the ini takes
+    // effect on the next playback.
+    bool mergeSuperimpose = true;
     int dumpSubtitleMaxFiles = 200;
     std::string fontName = "MS Gothic";
     std::wstring dumpSubtitleDir;
@@ -422,6 +451,8 @@ static MmtsCaptionSettings GetMmtsCaptionSettings()
         s.outlineWidth = (std::max)(0, (std::min)(10, _wtoi(buf)));
     if (ReadIniValue(iniPath, L"MMTS", L"DelayMs", buf, ARRAYSIZE(buf)))
         s.delayMs = (std::max)(-30000, (std::min)(30000, _wtoi(buf)));
+    if (ReadIniValue(iniPath, L"MMTS", L"MergeSuperimpose", buf, ARRAYSIZE(buf)))
+        s.mergeSuperimpose = _wtoi(buf) != 0;
     if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleData", buf, ARRAYSIZE(buf)))
         s.dumpSubtitleData = _wtoi(buf) != 0;
     if (ReadIniValue(iniPath, L"MMTS", L"DumpSubtitleMaxFiles", buf, ARRAYSIZE(buf)))
@@ -3899,6 +3930,34 @@ void CMmtTlvSplitter::CreatePins()
         }
     }
 
+    // A superimpose rides over the captions rather than replacing them, but a
+    // pin of its own becomes a second subtitle track, and a text subtitle track
+    // is exclusive downstream - selecting one hides the other, so the overlay
+    // never shows. Drop its pin and let DeliverSubtitleCue route its cues to the
+    // caption pin instead. Only when a caption pin will exist to carry them:
+    // with no caption asset the superimpose keeps its own pin, or it would have
+    // nowhere to go.
+    const bool mergeSuperimpose = GetMmtsCaptionSettings().mergeSuperimpose;
+    if (mergeSuperimpose) {
+        const bool haveCaption = std::any_of(subtitleStreams.begin(), subtitleStreams.end(),
+            [](const CFilterDemuxerHandler::SubtitleStreamInfo& info) {
+                return IsCaptionComponentTag(info.componentTag);
+            });
+        if (haveCaption) {
+            const size_t before = subtitleStreams.size();
+            subtitleStreams.erase(
+                std::remove_if(subtitleStreams.begin(), subtitleStreams.end(),
+                    [](const CFilterDemuxerHandler::SubtitleStreamInfo& info) {
+                        return IsSuperimposeComponentTag(info.componentTag);
+                    }),
+                subtitleStreams.end());
+            if (subtitleStreams.size() != before) {
+                LogMsg(L"MMT/TLV Splitter: CreatePins merged %zu superimpose stream(s) into the caption pin\n",
+                       before - subtitleStreams.size());
+            }
+        }
+    }
+
     if (kEnableSubtitlePins) {
         const CFilterDemuxerHandler::SubtitleStreamInfo* primarySubtitle = nullptr;
         for (const auto& info : subtitleStreams) {
@@ -3930,6 +3989,10 @@ void CMmtTlvSplitter::CreatePins()
             WCHAR trackName[128];
             if (&subtitleStreams[i] == primarySubtitle) {
                 StringCchCopyW(trackName, ARRAYSIZE(trackName), L"\x4E3B\x5B57\x5E55");
+            } else if (IsSuperimposeComponentTag(subtitleStreams[i].componentTag)) {
+                // Only reached with MergeSuperimpose off, or with no caption
+                // asset to merge into. Name it for what it is.
+                StringCchCopyW(trackName, ARRAYSIZE(trackName), L"\x5B57\x5E55\x30B9\x30FC\x30D1\x30FC");
             } else {
                 StringCchPrintfW(trackName, ARRAYSIZE(trackName),
                                  L"Subtitle (componentTag %d)",
@@ -4316,17 +4379,25 @@ void CMmtTlvSplitter::DeliverSubtitleCue(int streamIndex, int componentTag,
         delivered = true;
     };
 
-    // Route by component tag (0x30 = main caption, 0x38 = its management
-    // stream). The stream index is assigned per asset position and the next
-    // channel's assets reuse it, so it stops identifying a track once a
-    // recording spans a channel change: the cue would land on whichever pin
-    // happens to sit at that index. Fall back to the index when no tag is known.
+    // Route by component tag (0x30-0x37 = caption, 0x38-0x3F = superimpose).
+    // The stream index is assigned per asset position and the next channel's
+    // assets reuse it, so it stops identifying a track once a recording spans a
+    // channel change: the cue would land on whichever pin happens to sit at that
+    // index. Fall back to the index when no tag is known.
+    //
+    // With MergeSuperimpose the superimpose has no pin of its own, so send its
+    // cues to the caption pin. Both then play out as ASS events on one track,
+    // which is what the broadcaster means: cues carry their own start and stop,
+    // nothing clears the screen wholesale, and the TTML region keeps a
+    // superimpose off the caption's lines.
+    const bool mergeThisCue = GetMmtsCaptionSettings().mergeSuperimpose &&
+        IsSuperimposeComponentTag(componentTag);
     for (auto* pin : m_pins) {
         if (!pin->IsSubtitle())
             continue;
-        const bool matched = (componentTag >= 0 && pin->SubtitleComponentTag() >= 0)
-            ? pin->SubtitleComponentTag() == componentTag
-            : pin->StreamIndex() == streamIndex;
+        const bool matched = SubtitleCueMatchesPin(componentTag, streamIndex,
+                                                   pin->SubtitleComponentTag(),
+                                                   pin->StreamIndex(), mergeThisCue);
         if (matched)
             deliverToPin(pin);
     }
