@@ -117,6 +117,8 @@ public:
         m_programStartTimeSec = -1;
         m_programId = 0;
         m_hasProgramId = false;
+        m_audioArrivalPts.clear(); // a seek is not an arrival gap
+        m_audioUpstreamDrops.clear();
         // Keep the selected service across seek/reset; Load clears it separately.
     }
     void resetAudioSelection();
@@ -149,7 +151,18 @@ public:
     bool selectAudioStreamByStreamIndex(int streamIndex);
 
 private:
-    bool acceptsPacket(uint16_t packetId) const;
+    // Not const: it counts what it drops. A packet the selected service does
+    // not list used to disappear silently, which is indistinguishable from a
+    // gap the demuxer handed us.
+    bool acceptsPacket(uint16_t packetId);
+    // The PTS last handed to us per audio packet, before this filter does
+    // anything with the frame. A gap here is upstream; a gap only at delivery
+    // is ours.
+    std::map<uint16_t, long long> m_audioArrivalPts;
+    std::map<uint16_t, long long> m_rejectedPackets;
+    // The demuxer's per-stream drop counters as of the last AU we saw, so the
+    // next arrival reports how many it threw away in between and why.
+    std::map<uint16_t, unsigned long long> m_audioUpstreamDrops;
     long long toRefTime(int64_t pts, const MmtTlv::MmtStream& stream);
     void rememberVideoStream(const MmtTlv::MmtStream& stream);
     bool shouldProcessVideoStream(uint16_t packetId) const;

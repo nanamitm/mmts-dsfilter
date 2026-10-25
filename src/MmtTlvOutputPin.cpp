@@ -762,6 +762,17 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
     if (previousDeliveredPts >= 0 && m_accumPts >= 0)
         sampleStepMs = (m_accumPts - previousDeliveredPts) / 10000;
     m_lastDeliveredPts = m_accumPts;
+    // One AAC frame is 21.3ms at 48kHz, so a step past 32ms is a hole the
+    // renderer hears. Pair this with the handler's arrival gap: a gap in both
+    // came from upstream, a gap only here was lost inside this filter.
+    if (IsAudio() && previousDeliveredPts >= 0 && sampleStepMs > 32) {
+        LogPinMsg(L"MMT/TLV Audio delivery gap: streamIndex=%d, %I64d ms -> %I64d ms (step %I64d ms), disc=%d\n",
+                  m_audioStreamIndex,
+                  previousDeliveredPts / 10000,
+                  m_accumPts / 10000,
+                  sampleStepMs,
+                  sampleDiscontinuity);
+    }
     if (m_isVideo && m_accumPts >= 0) {
         if (m_videoFirstWallMs == 0) {
             m_videoFirstWallMs = tDeliverEnd;
