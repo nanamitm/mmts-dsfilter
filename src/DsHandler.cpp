@@ -119,6 +119,34 @@ static uint16_t AudioDescriptorChannels(const MmtTlv::MhAudioComponentDescriptor
     return AudioModeToChannels(audio.getAudioMode());
 }
 
+// The demuxer's per-stream drop counters live in dantto4k, which this filter
+// builds against as a pinned checkout. Read them only where they exist, so a
+// pin that predates them still compiles; the reporting starts by itself once
+// the pin moves past them.
+struct UpstreamDrops {
+    unsigned long long total{};
+    unsigned long long noTimestamp{};
+    unsigned long long auIndexRange{};
+    unsigned long long badFrame{};
+    unsigned long long fragment{};
+    unsigned long long malformed{};
+    bool available{false};
+};
+
+template <class Stream>
+    requires requires(const Stream& s) { s.droppedTotal(); }
+static UpstreamDrops ReadUpstreamDrops(const Stream& stream)
+{
+    return {stream.droppedTotal(), stream.droppedNoTimestamp, stream.droppedAuIndexRange,
+            stream.droppedBadFrame, stream.droppedFragment, stream.droppedMalformed, true};
+}
+
+template <class Stream>
+static UpstreamDrops ReadUpstreamDrops(const Stream&)
+{
+    return {};
+}
+
 static bool SameAudioIdentity(const CFilterDemuxerHandler::AudioStreamInfo& a,
                               const CFilterDemuxerHandler::AudioStreamInfo& b)
 {
@@ -586,12 +614,20 @@ void CFilterDemuxerHandler::rememberSubtitleStream(const MmtTlv::MmtStream& stre
            info.streamIndex, info.packetId, info.componentTag);
 }
 
-bool CFilterDemuxerHandler::acceptsPacket(uint16_t packetId) const
+bool CFilterDemuxerHandler::acceptsPacket(uint16_t packetId)
 {
     if (!m_selectedPackage)
         return !m_availablePackages; // Legacy/test callbacks before any SI.
     const auto it = m_packagePackets.find(*m_selectedPackage);
-    return it != m_packagePackets.end() && it->second.contains(packetId);
+    if (it != m_packagePackets.end() && it->second.contains(packetId))
+        return true;
+
+    const long long dropped = ++m_rejectedPackets[packetId];
+    if (dropped <= 5 || (dropped % 500) == 0) {
+        LogMsg(L"MMT/TLV packet 0x%04X is not in the selected service: dropped #%I64d\n",
+               packetId, dropped);
+    }
+    return false;
 }
 
 void CFilterDemuxerHandler::copyServiceSelectionFrom(const CFilterDemuxerHandler& source)
@@ -1193,6 +1229,38 @@ void CFilterDemuxerHandler::onVideoData(const MmtTlv::MmtStream& stream, const M
 
 void CFilterDemuxerHandler::onAudioData(const MmtTlv::MmtStream& stream, const MmtTlv::MfuData& mfu)
 {
+    // Probe the arrival side before anything else touches the frame: one AAC
+    // frame is 21.3ms at 48kHz, so a step past 32ms means the demuxer handed us
+    // a hole. Compare with the delivery gap the pin logs to tell the two apart.
+    if (mfu.isLastFragment) {
+        const long long arrival = toRefTime(static_cast<int64_t>(mfu.pts), stream);
+        if (arrival >= 0) {
+            auto& last = m_audioArrivalPts[stream.getPacketId()];
+            if (last > 0 && arrival - last > 320000LL) {
+                LogMsg(L"MMT/TLV Audio arrival gap: packetId=0x%04X, %I64d ms -> %I64d ms (step %I64d ms)\n",
+                       stream.getPacketId(), last / 10000, arrival / 10000,
+                       (arrival - last) / 10000);
+            }
+            if (arrival > last)
+                last = arrival;
+        }
+    }
+
+    // The demuxer drops an access unit whose MPU timestamp descriptor has not
+    // caught up with a new MPU sequence, which is what a channel boundary
+    // produces. It cannot report that itself - this frame is the first one
+    // after the hole - so read its counters and name the reason here.
+    if (const UpstreamDrops drops = ReadUpstreamDrops(stream); drops.available) {
+        auto& seen = m_audioUpstreamDrops[stream.getPacketId()];
+        if (drops.total > seen) {
+            LogMsg(L"MMT/TLV Audio AUs dropped upstream: packetId=0x%04X, +%I64u (no timestamp=%I64u, au index=%I64u, bad frame=%I64u, fragment=%I64u, malformed=%I64u)\n",
+                   stream.getPacketId(), drops.total - seen,
+                   drops.noTimestamp, drops.auIndexRange, drops.badFrame,
+                   drops.fragment, drops.malformed);
+        }
+        seen = drops.total;
+    }
+
     if (!acceptsPacket(stream.getPacketId())) return;
 
     if (!m_audioCallback || mfu.data.empty())
