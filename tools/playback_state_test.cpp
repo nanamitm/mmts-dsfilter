@@ -25,6 +25,7 @@ static bool waitFor(const std::function<bool()>& condition) {
 struct Captured {
     REFERENCE_TIME pts; bool preroll; bool discontinuity;
     REFERENCE_TIME stop; REFERENCE_TIME framePeriod; DWORD aspectX; DWORD aspectY;
+    WORD channels; // from an attached WAVEFORMATEX, 0 when the sample carried none
 };
 class CapturePin : public CBaseInputPin {
 public:
@@ -40,17 +41,19 @@ public:
         const HRESULT hr = sample->GetTime(&start, &stop);
         if (FAILED(hr)) return hr;
         std::lock_guard<std::mutex> guard(mutex);
-        REFERENCE_TIME period=0; DWORD aspectX=0, aspectY=0;
+        REFERENCE_TIME period=0; DWORD aspectX=0, aspectY=0; WORD channels=0;
         AM_MEDIA_TYPE* updated=nullptr;
         if (sample->GetMediaType(&updated)==S_OK && updated) {
             if (updated->formattype==FORMAT_VideoInfo2 && updated->cbFormat>=sizeof(VIDEOINFOHEADER2)) {
                 const auto* video=reinterpret_cast<const VIDEOINFOHEADER2*>(updated->pbFormat);
                 period=video->AvgTimePerFrame; aspectX=video->dwPictAspectRatioX; aspectY=video->dwPictAspectRatioY;
+            } else if (updated->formattype==FORMAT_WaveFormatEx && updated->cbFormat>=sizeof(WAVEFORMATEX)) {
+                channels=reinterpret_cast<const WAVEFORMATEX*>(updated->pbFormat)->nChannels;
             }
             DeleteMediaType(updated);
         }
         samples.push_back({start, sample->IsPreroll() == S_OK, sample->IsDiscontinuity() == S_OK,
-                           stop, period, aspectX, aspectY});
+                           stop, period, aspectX, aspectY, channels});
         return S_OK;
     }
     std::vector<Captured> snapshot() {
@@ -263,6 +266,27 @@ int wmain(int argc, wchar_t** argv) {
             // as long as this lead, and a deeper queue bought nothing when it
             // was measured.
             require(audioProps.cBuffers == 64, "audio pin keeps its 1.4s of lead");
+            // A channel boundary can change an asset's format under a connected
+            // pin. The new media type must reach the next sample.
+            const uint8_t adts[] = {0xFF, 0xF1, 0x4C, 0x80, 0x00, 0x1F, 0xFC};
+            fixture.audio->DeliverSample(true, 0, 0, true, true, adts, sizeof(adts));
+            require(waitFor([&] { return fixture.audioSink->pin->snapshot().size() == 1; }),
+                    "first audio sample delivered");
+            require(fixture.audioSink->pin->snapshot()[0].channels == 0,
+                    "an unchanged format attaches no media type");
+            fixture.audio->SetAudioInfo(48000, 6);
+            fixture.audio->DeliverSample(true, 213333, 213333, true, true, adts, sizeof(adts));
+            require(waitFor([&] { return fixture.audioSink->pin->snapshot().size() == 2; }),
+                    "second audio sample delivered");
+            require(fixture.audioSink->pin->snapshot()[1].channels == 6,
+                    "the changed channel count reaches the decoder");
+            fixture.audio->SetAudioInfo(48000, 6);
+            fixture.audio->DeliverSample(true, 426666, 426666, true, true, adts, sizeof(adts));
+            require(waitFor([&] { return fixture.audioSink->pin->snapshot().size() == 3; }),
+                    "third audio sample delivered");
+            require(fixture.audioSink->pin->snapshot()[2].channels == 0,
+                    "setting the same format again attaches nothing");
+
             fixture.audioSink->pin->failReceive = true;
             const uint8_t frame[] = {0xFF, 0xF1, 0x4C, 0x80, 0x00, 0x1F, 0xFC};
             // The queue only reports the failure once its worker has tried the

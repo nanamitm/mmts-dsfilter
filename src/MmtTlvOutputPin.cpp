@@ -213,6 +213,36 @@ void CMmtTlvOutputPin::SetVideoInfo(int width, int height, uint32_t numerator,
     if (changed && IsConnected()) m_videoFormatChanged = true;
 }
 
+void CMmtTlvOutputPin::SetAudioInfo(int sampleRate, int channels, int bitdepth, bool latm,
+                                   const std::vector<uint8_t>& extraData)
+{
+    const bool changed = m_audioPcm || sampleRate != m_sampleRate || channels != m_channels ||
+        bitdepth != m_bitdepth || latm != m_audioLatm || extraData != m_audioExtraData;
+    m_sampleRate = sampleRate;
+    m_channels = channels;
+    m_bitdepth = bitdepth;
+    m_audioLatm = latm;
+    m_audioPcm = false;
+    m_audioExtraData = extraData;
+    // An ARIB channel boundary can hand the same asset a different format (the
+    // packet carrying 22.2ch becomes 5.1ch, the 5.1ch one becomes stereo), so
+    // an already connected decoder has to be told.
+    if (changed && IsConnected()) m_audioFormatChanged = true;
+}
+
+void CMmtTlvOutputPin::SetPcmAudioInfo(int sampleRate, int channels, int bitdepth)
+{
+    const bool changed = !m_audioPcm || sampleRate != m_sampleRate || channels != m_channels ||
+        bitdepth != m_bitdepth;
+    m_sampleRate = sampleRate;
+    m_channels = channels;
+    m_bitdepth = bitdepth;
+    m_audioLatm = false;
+    m_audioPcm = true;
+    m_audioExtraData.clear();
+    if (changed && IsConnected()) m_audioFormatChanged = true;
+}
+
 HRESULT CMmtTlvOutputPin::GetMediaType(int iPosition, CMediaType* pmt)
 {
     if (iPosition < 0) return E_INVALIDARG;
@@ -627,6 +657,28 @@ HRESULT CMmtTlvOutputPin::DeliverSample(
         if (SUCCEEDED(hr)) hr = CBaseOutputPin::SetMediaType(&updated);
         if (FAILED(hr)) { pSample->Release(); return hr; }
         m_videoFormatChanged = false;
+    }
+    if (IsAudio() && m_audioFormatChanged) {
+        m_audioFormatChanged = false;
+        CMediaType updated;
+        if (SUCCEEDED(GetMediaType(0, &updated))) {
+            // Ask before attaching, and keep the old type when the decoder says
+            // no: the ADTS headers carry the real configuration anyway, so a
+            // stale channel count is better than a silenced track. This is why
+            // the sample is not dropped the way the video path drops it.
+            const HRESULT accept = m_Connected ? m_Connected->QueryAccept(&updated) : E_FAIL;
+            if (accept == S_OK) {
+                pSample->SetMediaType(&updated);
+                CBaseOutputPin::SetMediaType(&updated);
+            }
+            LogPinMsg(L"MMT/TLV Audio format change: streamIndex=%d, format=%s, channels=%d, rate=%d, extra=%zu, QueryAccept=0x%08X\n",
+                      m_audioStreamIndex,
+                      m_audioPcm ? L"PCM" : (m_audioLatm ? L"LATM" : L"ADTS"),
+                      m_channels,
+                      m_sampleRate,
+                      m_audioExtraData.size(),
+                      accept);
+        }
     }
     memcpy(pBuf, m_accum.data(), m_accum.size());
     pSample->SetActualDataLength(static_cast<LONG>(m_accum.size()));

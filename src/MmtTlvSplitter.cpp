@@ -4061,6 +4061,16 @@ void CMmtTlvSplitter::CreatePins()
                             }
                         }
                     } else {
+                        // The PCM pins above always output 48000/2/16, but a
+                        // pass-through pin announces the asset's own format,
+                        // which a channel boundary can change under it.
+                        if (first) {
+                            if (const auto info = m_handler.getAudioStream(streamIndex)) {
+                                pin->SetAudioInfo(static_cast<int>(info->samplingRate),
+                                                  static_cast<int>(info->channels), 16,
+                                                  info->latm, info->extraData);
+                            }
+                        }
                         pin->DeliverSample(key, samplePts, sampleDts, first, last, d, sz);
                     }
                 }

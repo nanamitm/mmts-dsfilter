@@ -120,6 +120,8 @@ public:
         // Keep the selected service across seek/reset; Load clears it separately.
     }
     void resetAudioSelection();
+    // One audio stream by its index, for pushing a format change to its pin.
+    std::optional<AudioStreamInfo> getAudioStream(int streamIndex) const;
     std::vector<VideoStreamInfo> getVideoStreams() const;
     int getSelectedVideoStreamIndex() const;
     std::optional<VideoStreamInfo> getSelectedVideoStream() const;

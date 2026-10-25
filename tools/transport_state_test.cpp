@@ -121,6 +121,22 @@ static void testVideoAttributes() {
         require(info && info->frameRateNumerator==60 && info->aspectX==16 && info->aspectY==9,"periodic MPT must update video attributes");
     }
 }
+static void testAudioFormatInPlace() {
+    CFilterDemuxerHandler handler; MmtTlv::Mpt mpt{}; mpt.mmtPackageIdByte = {0,1};
+    addAsset(mpt,MmtTlv::AssetType::mp4a,0x110,16);
+    auto descriptor = std::make_unique<TestDescriptor<MmtTlv::MhAudioComponentDescriptor>>();
+    descriptor->componentTag=16; descriptor->samplingRate=0b111; descriptor->componentType=0b01001;
+    auto* changed=descriptor.get(); mpt.assets.back().descriptors.list.push_back(std::move(descriptor)); handler.onMpt(mpt);
+    auto info=handler.getAudioStream(0);
+    require(info && info->channels==6 && info->samplingRate==48000 && !info->latm,"audio component descriptor gives the asset format");
+    // A channel boundary swaps what each packet carries. The stream set is
+    // locked once pins exist, but the format behind one still has to get out.
+    handler.setAudioStreamListLocked(true);
+    changed->componentType=0b00011; handler.onMpt(mpt); info=handler.getAudioStream(0);
+    require(info && info->channels==2,"a locked audio list still follows a format change in place");
+    changed->componentType=0b10001; handler.onMpt(mpt); info=handler.getAudioStream(0);
+    require(info && info->latm && info->channels==24,"a locked audio list follows a switch to 22.2ch LATM");
+}
 static void feedPackage(MmtTlv::MmtTlvDemuxer& demuxer, uint32_t sequence, bool replace) {
     using MmtTlv::Common::WriteStream;
     WriteStream body; body.put8U(0); body.put8U(2); body.putBe16U(1); body.putBe16U(0); body.put8U(2);
@@ -150,7 +166,7 @@ int main() {
     try {
         testServiceId({0,2}, 2); testServiceId({1,0,2}, 2);
         testServiceId({0,1,0,2}, 2); testServiceId({1,2,3,4,0x12,0x34}, 0x1234);
-        testPackages(); testVideoAttributes(); testStableCoreIndices();
-        std::cout << "Transport state tests passed: package identity, service isolation, PLT transitions and seek selection\n"; return 0;
+        testPackages(); testVideoAttributes(); testAudioFormatInPlace(); testStableCoreIndices();
+        std::cout << "Transport state tests passed: package identity, service isolation, PLT transitions, audio format changes and seek selection\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

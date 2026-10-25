@@ -58,11 +58,11 @@ public:
     // Called by the filter to set stream metadata before connection.
     void SetVideoInfo(int width, int height, uint32_t frameRateNumerator = 0,
                       uint32_t frameRateDenominator = 1, uint32_t aspectX = 0, uint32_t aspectY = 0);
+    // Safe to call per access unit: both only record, and only a real change on
+    // a connected pin schedules the media type for the next sample.
     void SetAudioInfo(int sampleRate, int channels, int bitdepth = 16, bool latm = false,
-                      const std::vector<uint8_t>& extraData = {})
-        { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; m_audioLatm = latm; m_audioPcm = false; m_audioExtraData = extraData; }
-    void SetPcmAudioInfo(int sampleRate, int channels, int bitdepth = 16)
-        { m_sampleRate = sampleRate; m_channels = channels; m_bitdepth = bitdepth; m_audioLatm = false; m_audioPcm = true; m_audioExtraData.clear(); }
+                      const std::vector<uint8_t>& extraData = {});
+    void SetPcmAudioInfo(int sampleRate, int channels, int bitdepth = 16);
     void SetHevcExtradata(const std::vector<uint8_t>& extra) { m_hevcExtradata = extra; }
     void SetTrackName(const std::wstring& name) { m_trackName = name; }
     void SetSubtitleComponentTag(int tag) { m_subtitleComponentTag = tag; }
@@ -134,6 +134,7 @@ private:
     int m_bitdepth{16};
     bool m_audioLatm{false};
     bool m_audioPcm{false};
+    bool m_audioFormatChanged{false};
     std::vector<uint8_t> m_audioExtraData;
     std::wstring m_trackName;
 
