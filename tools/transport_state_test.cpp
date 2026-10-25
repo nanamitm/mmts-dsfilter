@@ -1,3 +1,10 @@
+#include <optional>
+#include <vector>
+// MmtStream keeps its descriptor tables private to MmtTlvDemuxer, and the
+// extrapolation test has to plant them. Same idiom as playback_state_test.
+#define private public
+#include "mmtStream.h"
+#undef private
 #include "DsHandler.h"
 #include "mpt.h"
 #include "mhEit.h"
@@ -6,7 +13,9 @@
 #include "mmtTlvDemuxer.h"
 #include "mhStreamIdentificationDescriptor.h"
 #include "videoComponentDescriptor.h"
+#include "timebase.h"
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 
 static void require(bool condition, const char* message) {
@@ -162,11 +171,88 @@ static void testStableCoreIndices() {
     require(stream && info && info->packetId==0x101 && info->streamIndex==stream->getStreamIndex() && info->streamIndex==0,
             "filter metadata must use stable core indices after MPT reordering and replacement");
 }
+static void testTimingExtrapolation() {
+    // A stream whose descriptors only cover an MPU further on: what the start of
+    // a file and the first read after a seek both look like, because the entry
+    // for the MPU being decoded went by before any asset was mapped.
+    constexpr uint32_t kSeq = 1000;
+    constexpr uint32_t kNumOfAu = 4;
+    constexpr uint16_t kStep = 3840;        // 21.33 ms at a 180000 timescale
+    constexpr uint64_t kAnchorPresentation = 1000000;  // microseconds
+
+    auto makeStream = [](uint32_t anchorSeq, uint16_t step, uint32_t numOfAu) {
+        auto stream = std::make_unique<MmtTlv::MmtStream>(0x110);
+        stream->timeBase = {1, 180000};
+        stream->lastMpuSequenceNumber = kSeq;
+        MmtTlv::MpuTimestampDescriptor::Entry ts{};
+        ts.mpuSequenceNumber = anchorSeq;
+        ts.mpuPresentationTime = kAnchorPresentation;
+        stream->mpuTimestamps.push_back(ts);
+        MmtTlv::MpuExtendedTimestampDescriptor::Entry ext{};
+        ext.mpuSequenceNumber = anchorSeq;
+        ext.mpuDecodingTimeOffset = 0;
+        ext.numOfAu = static_cast<uint8_t>(numOfAu);
+        ext.ptsOffsets.assign(numOfAu, step);
+        ext.dtsPtsOffsets.assign(numOfAu, 0);
+        stream->mpuExtendedTimestamps.push_back(ext);
+        return stream;
+    };
+
+    // The anchor sits 4 MPUs ahead, so the AUs being timed are 4 * 4 * kStep
+    // earlier, and each one a step after the last.
+    const int64_t anchorDts = av_rescale(kAnchorPresentation, 180000, 1000000ll);
+    const int64_t expectedFirst = anchorDts - 4 * static_cast<int64_t>(kNumOfAu) * kStep;
+    {
+        auto stream = makeStream(kSeq + 4, kStep, kNumOfAu);
+        for (uint32_t i = 0; i < kNumOfAu; ++i) {
+            const auto timing = stream->getNextPtsDts();
+            require(timing.second == expectedFirst + static_cast<int64_t>(i) * kStep,
+                    "a late timestamp descriptor must place the AU, not drop it");
+            require(timing.first == timing.second, "no reorder delay means pts equals dts");
+        }
+        require(stream->extrapolated == kNumOfAu, "every placed AU must be counted");
+        require(stream->droppedNoTimestamp == 0, "a placed AU is not a dropped one");
+    }
+    // An anchor behind works the same way, walking forwards.
+    {
+        auto stream = makeStream(kSeq - 2, kStep, kNumOfAu);
+        const auto timing = stream->getNextPtsDts();
+        require(timing.second == anchorDts + 2 * static_cast<int64_t>(kNumOfAu) * kStep,
+                "an earlier MPU's entry must place the AU by walking forwards");
+    }
+    // The guards. A varying offset means the MPU duration is not predictable,
+    // and a distant anchor could have a channel boundary in between, where
+    // presentation time restarts and the arithmetic would be confidently wrong.
+    {
+        auto stream = makeStream(kSeq + 4, kStep, kNumOfAu);
+        stream->mpuExtendedTimestamps[0].ptsOffsets[2] = kStep * 2;
+        bool threw = false;
+        try { stream->getNextPtsDts(); } catch (const std::out_of_range&) { threw = true; }
+        require(threw && stream->extrapolationRefusedShape == 1,
+                "a varying AU offset must refuse extrapolation");
+    }
+    {
+        auto stream = makeStream(kSeq + 64, kStep, kNumOfAu);
+        bool threw = false;
+        try { stream->getNextPtsDts(); } catch (const std::out_of_range&) { threw = true; }
+        require(threw && stream->extrapolationRefusedDistance == 1,
+                "a distant anchor must refuse extrapolation");
+    }
+    {
+        auto stream = std::make_unique<MmtTlv::MmtStream>(0x110);
+        stream->timeBase = {1, 180000};
+        stream->lastMpuSequenceNumber = kSeq;
+        bool threw = false;
+        try { stream->getNextPtsDts(); } catch (const std::out_of_range&) { threw = true; }
+        require(threw && stream->extrapolationRefusedNoAnchor == 1,
+                "no descriptor at all must still drop the AU");
+    }
+}
 int main() {
     try {
         testServiceId({0,2}, 2); testServiceId({1,0,2}, 2);
         testServiceId({0,1,0,2}, 2); testServiceId({1,2,3,4,0x12,0x34}, 0x1234);
-        testPackages(); testVideoAttributes(); testAudioFormatInPlace(); testStableCoreIndices();
-        std::cout << "Transport state tests passed: package identity, service isolation, PLT transitions, audio format changes and seek selection\n"; return 0;
+        testPackages(); testVideoAttributes(); testAudioFormatInPlace(); testStableCoreIndices(); testTimingExtrapolation();
+        std::cout << "Transport state tests passed: package identity, service isolation, PLT transitions, audio format changes, seek selection and timing extrapolation\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
