@@ -34,7 +34,7 @@ jobs:
           # unpinned default branch can break this build without warning
           # (e.g. a renamed source file invalidates the vcxproj file list).
           # Bump deliberately after verifying against a dantto4k release.
-          ref: v20261019
+          ref: v20261025
           path: dantto4k
 
       - name: Build Release
@@ -51,7 +51,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & .\tools\run_subtitle_state_test.cmd
           if ($LASTEXITCODE -ne 0) { throw "subtitle_state_test failed with exit code $LASTEXITCODE" }
-          foreach ($test in 'subtitle_file_index_test', 'subtitle_render_test', 'playback_state_test') {
+          foreach ($test in 'subtitle_file_index_test', 'subtitle_render_test', 'playback_state_test', 'transport_state_test') {
             ./tools/run_subtitle_file_index_test.ps1 -Test $test
           }
 
