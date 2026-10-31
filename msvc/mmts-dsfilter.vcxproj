@@ -176,6 +176,7 @@
     <ClCompile Include="..\..\dantto4k\src\dcct.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ddmt.cpp" />
     <ClCompile Include="..\..\dantto4k\src\ecm.cpp" />
+    <ClCompile Include="..\..\dantto4k\src\emm.cpp" />
     <ClCompile Include="..\..\dantto4k\src\emt.cpp" />
     <ClCompile Include="..\..\dantto4k\src\eventPackageDescriptor.cpp" />
     <ClCompile Include="..\..\dantto4k\src\extensionHeaderScrambling.cpp" />
