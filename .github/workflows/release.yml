@@ -34,7 +34,7 @@ jobs:
           # unpinned default branch can break this build without warning
           # (e.g. a renamed source file invalidates the vcxproj file list).
           # Bump deliberately after verifying against a dantto4k release.
-          ref: v20261025
+          ref: v20261031
           path: dantto4k
 
       - name: Build Release
