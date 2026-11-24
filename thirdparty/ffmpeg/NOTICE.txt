@@ -1,9 +1,9 @@
-mmts-dsfilter links static FFmpeg 9.0.1 (x64-windows) libraries, limited
+mmts-dsfilter links static FFmpeg 9.1 (x64-windows) libraries, limited
 to the avcodec, avutil, and swresample components that MmtTlvSplitter uses
 to decode AAC LATM 22.2ch audio to stereo PCM. The libraries are linked
 into mmts-dsfilter.ax, so no FFmpeg DLLs are needed at run time.
 
-FFmpeg source for this version: https://github.com/FFmpeg/FFmpeg/releases/tag/n9.0.1
+FFmpeg source for this version: https://github.com/FFmpeg/FFmpeg/releases/tag/n9.1
 
 Build: build_static_msvc.cmd (build_static_msvc.sh) in this directory,
 with Visual Studio 2022 (v143) and MSYS (bash, make, nasm). Only the aac
@@ -21,9 +21,9 @@ itself is available at https://github.com/nanamitm/mmts-dsfilter, so it
 can be rebuilt against a modified FFmpeg.
 
 Bundled library versions:
-- libavcodec 63.1.101
-- libavutil 61.1.101
-- libswresample 7.1.101
+- libavcodec 63.24.100
+- libavutil 61.19.100
+- libswresample 7.6.100
 
 License text: COPYING.LGPLv2.1 (this directory)
 FFmpeg source and legal info: https://ffmpeg.org/legal.html
