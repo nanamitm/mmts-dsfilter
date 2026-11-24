@@ -64,7 +64,7 @@ The Visual Studio project currently references `..\..\dantto4k` from
 FFmpeg (AAC LATM decoding for 22.2ch audio) is linked statically from
 `thirdparty/ffmpeg`, so neither vcpkg nor FFmpeg DLLs are needed. To rebuild
 those libraries, run `thirdparty\ffmpeg\build_static_msvc.cmd <ffmpeg-source>`
-with an FFmpeg n9.0.1 checkout; see `thirdparty/ffmpeg/NOTICE.txt`.
+with an FFmpeg n9.1 checkout; see `thirdparty/ffmpeg/NOTICE.txt`.
 
 ## Build
 
